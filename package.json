@@ -1,0 +1,50 @@
+{
+  "name": "dsh-novel",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "小说助手 —— DeepSeekRuntime (DSH) 插件：面向长篇小说的创作工作台（资料库、章节推进、风格约束）。",
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "dshhub": {
+    "schemaVersion": 1,
+    "displayName": "小说助手",
+    "summary": "长篇小说创作工作台：人物/设定资料库、章节大纲推进、文风约束与续写。",
+    "categories": [
+      "创作",
+      "Web UI"
+    ],
+    "surfaces": [
+      "host",
+      "web"
+    ]
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "docs",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "novel",
+    "writing"
+  ]
+}

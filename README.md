@@ -1,0 +1,220 @@
+# 小说助手 · dsh-novel
+
+
+DSH（DeepSeekRuntime）插件：把「写长篇小说」变成一条模型能稳定接管的流水线——
+章节结构、资料连续性、续写时的上下文装配、进度与字数反馈。
+
+- 包名 / 目录：`dsh-novel` ｜ 插件短名（cordis row id）：`novel` ｜ 显示名：小说助手
+- 两个半边：`index.js`（宿主 / Node 进程）、`client.js`（Web 壳 / 浏览器）
+- **路线图与数据契约见 [docs/功能规划.md](docs/功能规划.md)**（写代码前先读它）
+- 历史决策考古见 [docs/design.md](docs/design.md)
+
+> 一句话定位：**一个工作区 = 一本书**。插件不存正文，正文永远是工作区里的 `chapters/NNNN.md`。
+
+## 目标字数：book.json 说了算
+
+每章目标字数的唯一真相是 `book.json` 的 `targetChars`。**没写**时插件用默认 3000，只在状态里标「默认值」，不会替你写进文件；要定下来就调 `novel_book({ targetChars })`。作者在大纲里写的「4 章 × 1000 字」只是散文，需要被翻译成 `targetChars: 1000` 才算数——否则会出现「大纲说 1000、自查按 3000 报偏短」的假警报。
+
+## 目录结构
+
+```
+dsh-novel/
+  package.json        # manifest：main + dsh.bundle.patch + dsh.client.platform=web + exports "./client"
+  cordis.patch.yml    # 插件层：insert 一行 { id: novel, name: dsh-novel }
+  index.js            # 宿主半边：书模型 + 十八个工具 + /novel-api 路由（只读 + 十二个写接口）
+  client.js           # 客户端半边：状态条 + 右栏一格「小说」，页内十个分区（章节 / 章纲 / 事件 / 人物 / 设定 / 伏笔 / 文风 / 版本 / 大纲）
+  docs/功能规划.md     # 路线图 / 数据契约 / 技术红线（唯一真相）
+  docs/design.md      # 最初的切面草案（保留作决策记录）
+  README.md
+```
+
+## 它现在能干什么（v0.2 宿主 + 界面）
+
+工作区里有一本书时（`book.json` + `chapters/*.md` + 可选 `outline.md`、`beats.md`、`events.md`、`characters/`、`threads.md`、`settings/`、`styles/`）：
+
+> 没有 `book.json` 也能读：章 id 从文件名里认（`0003 第三章 湖心亭.md` → id `0003`、标题「第三章 湖心亭」），第一次 `novel_write` 时会自动补出 `book.json`。
+
+- 输入框下方一条状态：`《雾港旧事》 2/3 章 · 597 字 · 伏笔 4`
+- 右栏「小说章节」页：按**目标字数**的总进度条 + 章节行（`已写/目标`，`planned` 灰显「未写 +」，**点一下即建章并打开**）+ 点开读正文
+- 右栏「小说人物」页：**列表 / 关系图**切换。列表是卡片（摘要 + 关系数），关系图是 SVG 环形布局，边取自人物卡 `## 关系` 小节的 `- 目标：说明` 行；没建卡的人物画成空心虚线点
+- 关系图按时间回放：人物卡 `## 关系` 的行可以写 `- 老周 @0007：开始怀疑她`（自第 7 章起；不写就是从开篇就有，只记起点不记终点），图上选「关系截至 第 N 章」就能看关系网怎么长出来的网怎么长出来的；不写标记＝一直成立
+- 人物生死时间线：人物卡加一节 ## 状态，写 - @0003 去世（雾港码头失足）、- @0004 现身（其实没死）；关系图把「截至第 N 章已死」的人画成灰色 + 名字带 †，跟死人相连的线变虚线，切章节能看到「死了又活」
+- 新建一本书时，把 templates/AGENTS.md 拷到书目录根并改书名——它是给 AI 的作业规范（人物卡 ## 关系 / ## 状态 怎么写、设定首行 - 分类：、章纲 ## 0003 开头），DSH 会把它当项目指令自动注入，模型不用猜格式
+- 右栏正文按 Markdown 渲染：标题、列表、粗体、行内码、引用、代码块、表格、分割线都能显示（渲染器是自带的 120 行实现，因为平台没把官方 Markdown 组件暴露给第三方插件）；**中文正文的单个换行当硬换行**（段落不粘连），行首全角缩进保留
+- **手机返回键先退右栏一步**：章节正文 / 人物详情 / 展开的设定或文风 / 某一版历史，各占一格浏览器历史；按返回先回上一层（比如「正文 → 章节列表」），退到页面顶层才真的离开。实现在 `client.js` 的 `useBackStep` + `popstate`
+- 右栏「小说大纲」页：按 `##` 分节显示，「编辑」可就地改并保存；底部「问 AI」把大纲全文 + 你的问题写进主对话输入框，回车即发
+- 右栏「小说章纲」页：**单独一页**，按章节顺序列出每章要拍的场景清单（`beats.md` 每章一节），没写就「写章纲」，有就就地编辑保存；顶部显示覆盖进度，还有一行**节奏台账**（`爽点 N / 计划 M · 有爽点的章 X/Y · 钩子 K 章 · 最长断档 G 章`），每章标题右侧一个 `爽×2 钩` 徽标。台账是**从章纲标记现算的，不存盘**——所以不会和章纲打架
+- 右栏「小说事件」页：**事件线台账**（`events.md`，一条线一节：`## 主线：远离与反扑` + `### 主线-1 真相落地（1–3）`，每个事件写 `- 因为：` / `- 所以：` / `- 不可替代：`）。一条线跨多章，一章也可以推好几条线；章纲里用 `- 事件：主线-1、感情-1` 锚定，区间只是默认值、锚点做修正。页面上按线分组，事件展开显示因果与覆盖章（`0001✓` 已写 / `0003○` 只有章纲）。**章纲页右缘还有一排窄泳道**，与每一章逐行对齐，一条线一列点，一眼看出「哪一章推了哪几条线、哪条线断了」
+- 右栏「小说设定」页：世界观条目（`settings/` 一条一文件，地点/规矩/物品/术语），一行一条带分类徽标，点开读全文、可就地编辑保存
+- 右栏「小说伏笔」页：未回收 / 已回收两段，每行「伏笔名 + 埋设章 · 计划回收章」，到期的标「到期」并给一条橙色提醒，「收回 / 重开」一键改状态（写回 `threads.md`）
+- **每一页底部都有「问 AI」条**（章节列表 / 章节正文 / 章纲 / 人物列表 / 人物卡 / 设定 / 伏笔 / 大纲）：把这一屏的内容 + 你的问题写进主对话输入框，留空则问该页的默认问题；只填不发，回车由人按
+- 右栏「小说文风」页：一套文风一行（名字 + 在用徽标 + 字数 + 一句话），点开读全卡，「编辑」就地改，「用这套」写进 book.json 的 style；底部可新建空卡。启用后 
+ovel_context 会把文风卡一起装配给 AI，
+ovel_check 会按卡里的 ## 禁忌 查禁用词（style-banned）。
+ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮嘱。
+
+- 对话里我可以用十八个工具替你写书：
+
+| 工具 | 作用 |
+|---|---|
+| `novel_status` | 看整体：书名、章数、总字数/目标、人物卡张数、未回收伏笔、每章 `字数/目标 · 状态` |
+| `novel_book` | 书的元信息：书名 / 作者 / 类型 / 一句话简介 / **每章目标字数**；`targetChars` 是全书默认（每章可单独覆盖），写章自查按它判长短 |
+| `novel_read` | 读某一章正文 |
+| `novel_write` | 写正文（`mode: append` 默认 / `replace`，可带 `status`；省略 `chapter` 自动建下一章并登记进 `book.json`） |
+| `novel_outline` | 读 / 写 `outline.md` |
+| `novel_context` | **续写前的标准动作**：一次拿到本章大纲 + 上一章末 + 出场人物卡 + 该惦记的伏笔（默认 ≤ 2000 字） |
+| `novel_card` | 人物卡：无参列清单 / 给 `name` 读 / 再加 `content` 写 |
+| `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 相对目标字数偏长偏短 / **章纲写的场次没落到正文（`beats-gap`）** / **这一章没有爽点（`no-payoff`，会带「已连续 N 章没有」）/ 章末没有钩子（`no-hook`）** |
+| `novel_beats` | 章纲：无参看全书覆盖 / 给 `chapter` 读这一章的拍摄清单 / 给 `content` 覆盖写（只动这一节） |
+| `novel_events` | 事件线：无参看全书事件线与推进情况 / 给 `line` 读那条线（含覆盖章、已写数）/ 给 `line` + `content` 整段替换这一条线（别的线不动） |
+| `novel_threads` | 伏笔：无参看清单（未回收 / 已回收 / 到期未收）/ 给 `thread` + `planted`/`payoff`/`status` 登记或改状态 |
+| `novel_style` | 文风：无参列卡 / **`clone: true` + `source`（原文路径）＝一键克隆**（读原文→算节奏→切 3–5 段连续锚点→写卡→存原文→设为当前，缺的只有「视角与时态」）/ 给 `source` 或 `text` 只做**量化分析**（句长、段长、对话占比、标点密度、高频词 + 均匀采样 5 段原文锚点）/ 给 `name` 读卡或写卡（`content`）/ `active: true` 顺手启用 |
+| `novel_audit` | 全书巡检：`{ level?, limit? }`。把逐章检查横向扫一遍（空章 / 字数偏差 / 章纲漏写 / 伏笔到期 / 配角欠场 / 事件未锚 / 断爽），按严重度排序。**只报能算出来的事实，不给评语**；写完一批章跑一次，比逐章 `novel_check` 省事。 |
+| `novel_export` | 导出正文：`{ from?, to?, format?, mode?, out? }`。全书或区间 → `export/` 下一个 txt/md，或按章拆开；返回章数、字数、落盘文件名。 |
+| `novel_history` | 历史版本：`{ chapter }` 列这一章的时间线（时间 / 字数 / 来源 / 被什么替换 / 用的是哪套文风），`{ chapter, version }` 读那一版全文 |
+| `novel_restore` | 恢复到某一版（`{ chapter, version }`）；**恢复前先把当前内容也留一版**，所以恢复本身能撤销 |
+
+只读接口（供界面取数）：`/novel-api/state`、`/novel-api/chapter?id=`、`/novel-api/characters?chapter=`（含关系图 `graph`、人物 `states`）、`/novel-api/character?name=`、`/novel-api/threads`、`/novel-api/outline`、`/novel-api/beats?chapter=`、`/novel-api/settings`、`/novel-api/setting?name=`、`/novel-api/events?chapter=`、`/novel-api/event?line=`、`/novel-api/history?chapter=`、`/novel-api/history-all`、`/novel-api/version?chapter=&version=`、`/novel-api/styles`、`/novel-api/style?name=`、`/novel-api/style-sample?name=`、`/novel-api/audit`。
+十二个写接口（都要求头 `x-novel-action: 1`，其余方法一律 405）：
+`POST /novel-api/start-chapter`（`{ id }`，右栏点 `planned` 章节时建章）、`POST /novel-api/outline`（`{ content }`，大纲页保存）、`POST /novel-api/beats`（`{ chapter, content }`，章纲页保存）、`POST /novel-api/setting`（`{ name, content }`，设定页保存）、`POST /novel-api/thread`（`{ thread, planted?, payoff?, status? }`，伏笔页「收回 / 重开」与登记）、`POST /novel-api/style`（`{ name, content }`，文风页保存）、`POST /novel-api/style-active`（`{ name }`，切换在用文风，空名字＝取消）、`POST /novel-api/style-clone`（`{ source, name? }`，文风页「克隆文风」一键从原文起卡）、`POST /novel-api/style-delete`（`{ name }`，删一张文风卡：卡和参考原文一起挪进 `styles/.trash/`，删的正好是在用的那套就顺手取消启用）、`POST /novel-api/event`（`{ line, content }`，整段替换一条事件线）、`POST /novel-api/export`（`{ from?, to?, format?, mode? }`，把全书或区间导出到 `export/`）、`POST /novel-api/restore`（`{ chapter, version }`，恢复到某一版，先给当前内容留一版）。
+
+**写入时会做格式校验，但只警告不拒绝**：`novel_card` / `novel_setting` / `novel_beats` / `novel_write` / `novel_threads` 的返回里都带 `warnings`，渲染成「⚠ 格式提醒（已写入，但下面这些位置读不到）」——比如关系小节写成了散文、状态小节没写 `@0003`、设定首行没写 `- 分类：`、章纲里手打了 `## 0003` 标题、正文里混进了 `## 关系`。写歪的内容照样落盘，只是不会被关系图/时间线读到。
+
+书库根目录解析顺序：`config.root`（钉死）→ **会话自己的工作目录** → 环境变量 `DSH_NOVEL_ROOT` → 进程 `cwd`（兜底）。
+
+## 安装（本机实测过的两条命令）
+
+```powershell
+# 装进试验 profile（独立进程，不碰桌面 App 里正在跑的会话）
+dsh plugin --profile web add link:E:\workspace\idea-workspace\dsh-novel
+# → 会自动往 web profile 的 dsh.profile.bundles 里追加 "dsh-novel"
+```
+
+`link:` 是跨盘符号链接，改源码 = 改已装包，不用重装。
+
+> `desktop` profile **CLI 管不了**：`error: profile "desktop" is managed exclusively by the Electron application`。
+> 装进桌面版要走 设置 → 插件 → 添加插件（填本地绝对路径），或 agent 侧的 `plugin_manager` 工具。
+
+## 开发闭环
+
+```powershell
+# 起服务（工作目录 = 那本书）
+cd E:\workspace\idea-workspace\novel-demo
+dsh web --port 18080 --no-open        # 打印带 token 的 URL，例如 http://127.0.0.1:18080/?token=...
+
+# 自检：插件有没有进启动图
+$t = "<token>"
+(Invoke-WebRequest "http://127.0.0.1:18080/?token=$t").Content | Select-String 'dsh-novel'
+# 看 rev 有没有变：变了 = 新代码已生效
+
+# 接口自检
+curl.exe -s "http://127.0.0.1:18080/novel-api/state"
+```
+
+生效速度（实测）：
+
+| 改什么 | 多久 |
+|---|---|
+| `client.js` | **保存即热替换**（dsh-client-hmr 500ms 轮询，SSE 推送），不用刷新 |
+| `index.js` | 下一次「重组合」生效（动一下 profile 的 `cordis.patch.yml`，或在插件页开关一次），**不用重启 App** |
+| `cordis.patch.yml` | 立即（`patchReload: live`） |
+
+## 踩过的坑（都写进 功能规划.md 第八节了）
+
+1. 客户端 `exports.inject` 只认**字符串数组**；写 `{required, optional}` 会被当成两个服务名，插件永远 pending。
+2. 可选服务不要写进 `inject` 数组，用 `ctx.inject(['sidebarRightTabs'], inner => ...)`。
+3. 右栏 `guide` 卡片的 `title` / `description` 必须是**函数**。
+4. 宿主侧不要 import `@deepseek-ai/dsh-tools`（link: 装的插件解析不到），手写等价对象，但必须带 `output.render`。
+5. 端口被占先查归属：`Get-NetTCPConnection -LocalPort 18080`；**54081 是桌面 App，别杀**。
+
+## 占位梗概不算正文
+
+`chapters/0001.md` 里只写一行 `（待写）重生在 1998 年…` 时，它只是结构，不是章节：
+
+- `novel_status` 把它标成「待写（占位）」，不计入「已写 N 章」，另起一行告诉你「有 N 章还是占位」；
+- `novel_check` 只报一条 `[placeholder]`，不再拿字数和章纲去制造噪音；
+- `novel_write` 写入这种内容也不会把章节状态转成 `draft`。
+
+## 设定为 0 时会主动喊
+
+`novel_status` 与 `novel_context` 在 `settings/` 为空时都会提醒：世界规则只写在 `outline.md` 里等于没建，先用 `novel_setting` 建 3–8 条（地点 / 规矩 / 物品 / 术语）。这不是提示词，是宿主代码里的判断，模型绕不过去。
+
+## 爽点 / 钩子：写在章纲里，不另建表
+
+章纲的每一场末尾可以标三种东西：
+
+```markdown
+- 场景：江野 → 把批条推过去 → 柜员脸色变了 → 爽点（信息压制）
+- 落点：出门时有人叫住他。钩子：王厂长在车里等着。
+```
+
+- `→ 爽点（类型）`：这一场给了读者情绪回报（打脸 / 翻盘 / 揭秘 / 情感兑现 / 强强对话 / 信息压制）。
+- `→ 钩子`：章末留翻页理由，每章至少一个。老写法 `钩子：…` 也认。
+- `→ 转折`：这一场把方向拐了个弯。
+
+**没有 `爽点.md`，也不需要。** 爽点只有一个端点（发生在哪一场），是场景属性；单独建表必然和章纲形成双份真相，而且模型写正文时装配的是章纲，表在写作路径上看不见。所以台账由宿主现算：
+
+| 看哪里 | 显示什么 |
+|---|---|
+| 章纲页顶部 | `爽点 12 / 计划 15 · 有爽点的章 8/12 · 钩子 11 章 · 最长断档 3 章`，断档 ≥2 章时变红 |
+| 章纲页每章 | `爽×2 钩` 徽标 |
+| 输入框上方状态条 | `· ⚠ 断爽 3 章` |
+| `novel_status` | 全书节奏一行 + 断档提醒 |
+| `novel_check` | `no-payoff` / `no-hook` |
+| `novel_context` | 装配包里一段「## 节奏（这一章怎么给读者回报）」 |
+
+预算（`打脸×3` 这种）写在 `outline.md` 的 `## 爽点节奏` 里，属于计划层；实际有几处永远以章纲标记为准。
+
+## 导入旧稿：读文件的能力归插件，判断边界归 AI
+
+不另设「导入」工具 —— 它无非是现有工具的编排。插件只负责 AI 做不好的那件事：**编码和分页**。
+
+```js
+novel_read({ source: 'D:\\books\\旧稿.txt', limit: 4000 })            // 自动认 UTF-8 / GBK / UTF-16
+novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // 接着读
+```
+
+返回里带 `encoding` / `chars` / `nextOffset` / `done`，所以不分页也不会读漏。剩下的交给会话里的 AI：
+
+1. `novel_read({ source })` 扫几屏，看清章节标题长什么样（有没有「第N章」、有没有目录页）
+2. **它自己判断边界** —— 插件不猜，猜错一次要重导
+3. 逐章 `novel_write({ chapter, title, content })` 落盘（自动留历史版本）
+4. `novel_status` 核对章数与字数
+5. 需要的话再逆向提炼：`novel_outline` / `novel_card` / `novel_setting` / `novel_style({ clone: true, source })`
+
+长篇别让它一口气读完：每 8–10 章派一个 subagent 只读原文、只返回摘要，主上下文负责汇总。
+
+## 去 AI 味（`novel_check({ aiTone: true })` / `pass: "deai"`）
+
+规则抽自 [qu-ai-wei](https://github.com/)（MIT，中文改写 skill），**只抽了三样**，不搬它 11.6KB 的正文（那会挤掉章纲和人物卡）：
+
+1. **可指认的 AI 腔检测** → `novel_check({ chapter, aiTone: true })`，默认关。报的是套话（「在…的背景下」「不仅…而且」「值得一提的是」）、段落长度过于整齐、连续三句字数齐平、对话全是完整的一口气、有对话却没有破折号和省略号。每条都附原文片段。
+2. **改写纪律** → `novel_context({ chapter, mode: "rewrite", pass: "deai" })`。装配包末尾多一段「改写纪律」：事实优先（人名/数字/设定名不动）、不许补写、不许把「可能是」改成「就是」、引号里的对话原样保留、优先级是 事实 > 声口 > 表达 > 句式。
+3. **右栏章节页的「去AI味」按钮** → 先调 `GET /novel-api/ai-tone?chapter=`，把命中清单 + 纪律拼成一句话塞进输入框（**只填不发**，覆盖写之前你自己确认）。
+
+它是检测，不是审判：`ai-tone` 报 0 类不代表写得像人，报 3 类也不代表要重写——判断哪句该换还是你（或会话里的 AI）的事。
+
+## 节奏与戏份：规格写在数据里，不是写死在代码里
+
+- **爽点断档阈值**取 `outline.md` 里的「三章一爽点」/「每 3 章至少一次爽点」，中文数字也认；读不到才退回默认 2。状态条的「断爽 N 章」、章纲页红字、`novel_check` 的 `no-payoff` 都按这个数。
+- **戏份承诺**写在人物卡：`- 戏份：每 8 章至少出场一次`。插件按正文统计出场（含卡里的「旧称」），超期报 `absent-role`，人物页挂「欠场」徽标，`/novel-api/characters` 的 `appearance` 字段带 `{last, gap, cadence, due}`。
+- 出场统计按「书的内容指纹」缓存，轮询不会把几十章反复读一遍；只看「有正文的章」，占位梗概不算出场。
+## 右栏只有一个 tab
+
+平台 tab 条每个 chip 最小 80px、不换行、手机上还滑不动，十页放不下（试过合并、试过「更多」页、试过改 CSS 让条子能横滑，都被裁）。现在是**一格「小说」+ 页内九个分区**，分区按钮在页内自动换行，小屏也点得到。
+## 文风闸门：写完当场比一次节奏（`style-fit`）
+
+文风卡只在开头注入一次是不够的：实测一本 80 章的书，句均字数从 17 掉到 10.1、含对话段占比从 26% 涨到 64.5%、每千字句号从 46.8 涨到 89.7 —— **漂移是单调累积的**，写歪一章，下一章会照着歪掉的稿子继续歪。
+
+所以插件在三个地方替他盯着（基准是文风卡的 `.sample.md` 原文，没有样本就退回卡里的 `## 锚点原文`）：
+
+| 位置 | 行为 |
+| --- | --- |
+| `novel_write` | 写完自动比一次节奏，偏离就在返回的 `warnings` 里点名 |
+| `novel_check({ chapter, aiTone: true })` | 报 `style-drift`，写清「句均 10.5（卡上 17，偏少 0.62 倍）」 |
+| 右栏章节列表 | 偏离的章挂一个「漂」红标（数据来自 `/novel-api/audit`） |
+| `novel_audit` / `GET /novel-api/audit` | 全书一次扫，`style-drift` 与 `beats-gap` 一起列 |
+
+比的都是**可数**的东西，不判断「写得好不好」——那是 AI 的活。但只有两个指标算硬判据：**句均字数（±30%）、每千字句号（0.7–1.5 倍）**；段均字数、含对话段占比、每千字逗号、破折号/省略号只是「参考值」，会显示在 `/novel-api/style-fit` 里但**不报警**——它们测的是排版习惯，读着顺就是顺。
+
+正确用法：**出 `style-drift` 就当场重写这一章**（`novel_context({ chapter, mode: "rewrite", pass: "deai" })`），别留到下一章，也别指望子代理整章返修——它会顺手把风格换成它自己的。

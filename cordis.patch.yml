@@ -1,0 +1,7 @@
+# dsh-novel —— 小说助手
+#
+# 这一行会被 loader 合进插件图：id 是短名（事件、日志、服务冲突排查都用它），
+# name 是包名（或包名/子路径）。config 会整行替换，不是深合并。
+- insert:
+    - id: novel
+      name: dsh-novel
