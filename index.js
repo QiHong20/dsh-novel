@@ -1229,6 +1229,16 @@ function assembleNovelContext(value, budget) {
     if (body) blocks.push({ id, label, text: `## ${label}\n${body}`, required })
   }
   if (rewrite) add('chapterText', scope.partial ? `本章片段 [${scope.start}, ${scope.end})，全章 ${scope.total} 字符` : '完整本章原文', value.chapterText, true)
+  if ((value.chapter.id === '0001' || !value.prevTail.text) && !(rewrite && scope.partial)) {
+    add(
+      'openingRules',
+      '第一章开篇纪律（黄金三百字）',
+      '1. 前 300 字必须见冲突、异常或反常识奇观：禁止从日常慢热或大段背景科普开局，直接把主角放进正在发生的危机、交易或异常现场，用动作带出核心卖点或金手指。\n' +
+        '2. 爽感或筹码必须落袋：即使主角表面吃亏或受压，章末前也必须拿到实打实的回报（信息优势、暗中占到的便宜、新能力或关键筹码），避免整章纯憋屈。\n' +
+        '3. 章末留强钩子：把眼前悬念与主线/金手指咬合在一起，给出明确的翻页理由。',
+      true,
+    )
+  }
   add('beats', '本章章纲', value.beats.text, true)
   add('rewriteRules', '改写纪律', value.rewriteRules, true)
   add('style', `文风：${value.style.name}`, value.style.text, true)
