@@ -548,7 +548,10 @@ function appearanceReport(lastMap, cards, uptoId) {
   for (const card of cards) {
     if (!card.cadence) continue
     const lastId = lastMap.get(card.name) ?? ''
-    const gap = lastId ? Math.max(0, Number(uptoId) - Number(lastId)) : Math.max(1, Number(uptoId))
+    const firstState = Array.isArray(card.states) && card.states.length ? card.states[0].chapter : ''
+    if (!lastId && firstState && uptoId < firstState) continue
+    const startNum = firstState ? Number(firstState) : 1
+    const gap = lastId ? Math.max(0, Number(uptoId) - Number(lastId)) : Math.max(1, Number(uptoId) - startNum + 1)
     report[card.name] = { last: lastId, gap, cadence: card.cadence, due: gap >= card.cadence }
   }
   return report
@@ -2338,6 +2341,7 @@ async function auditBook(root) {
           add('warn', 'beats-gap', label + '：章纲 ' + cover.total + ' 场，正文只落到 ' + cover.covered + ' 场', row.id)
         }
       }
+    }
     if (styleRawAudit) {
       const chapterBody = (await readText(path.join(root, row.file))) ?? ''
       const fitSampleAudit = await readStyleSample(root, styleNameAudit)
@@ -2359,7 +2363,6 @@ async function auditBook(root) {
           add('warn', 'no-interior', label + '：内心反应 ' + act.ratio + '%（基准 ' + baselineAudit + '%）——只有动作，看不见他在想什么', row.id)
         }
       }
-    }
     }
   }
   const written = rows.filter(row => row.written)
@@ -3699,8 +3702,13 @@ export function apply(ctx, config) {
       // 相关设定：只在被正文/章纲/大纲点名时才带，避免把整本世界观灌进上下文。
       const settingItems = await listSettings(rootNow())
       const settingHits = []
+      const matchesSetting = (haystack, name) => {
+        if (mentions(haystack, name)) return true
+        const parts = String(name ?? '').split(/[·・、/／与和及\-_\s]+/u).filter(part => part.length >= 2)
+        return parts.some(part => mentions(haystack, part))
+      }
       for (const item of settingItems) {
-        if (mentions(prevTailText, item.name) || mentions(sceneText, item.name)) settingHits.push(item)
+        if (matchesSetting(prevTailText, item.name) || matchesSetting(sceneText, item.name)) settingHits.push(item)
       }
       const settings = []
       const voided = []
@@ -4218,6 +4226,20 @@ export function apply(ctx, config) {
           }
         }
       }
+      // 章纲点了名要想到什么，正文却一段内心都没有——不管有没有文风卡都要查。
+      const interiorRows = beat && beat.section && Array.isArray(beat.section.interiors) ? beat.section.interiors : []
+      if (interiorRows.length) {
+        const inner = interiorStats(text)
+        if (inner.paras >= 5 && inner.hit === 0) {
+          report.issues.push({
+            kind: 'no-interior-plan',
+            detail:
+              `章纲里写了 ${interiorRows.length} 条内心材料，正文里一段都没落到：` +
+              interiorRows.slice(0, 3).map(item => `「${item.text}」`).join('、') +
+              '。这几条不是提示，是这一章必须出现的东西——挑一处写成他看到/想到的具体画面，别写成"他很后悔"。',
+          })
+        }
+      }
       const styleName = activeStyleName(meta)
       const styleRaw = styleName ? await readStyle(rootNow(), styleName) : null
       if (styleRaw) {
@@ -4253,19 +4275,6 @@ export function apply(ctx, config) {
                 `内心/身体反应太少：这一章 ${act.hit}/${act.paras} 段（${act.ratio}%），文风基准是 ${baseline}%。` +
                 '读者只看见他在做事、看不见他在想什么——得手、被压、丢脸之后，先给他一个身体感觉或一句念头，再写下一个动作。',
             })
-          }
-        }
-        // 标了「→ 爽点 / 转折」的场：只有动作没有反应，是最典型的「像机器人」。
-        // 章纲点了名要想到什么，正文却一段内心都没有——那这一章就写成了流水线。
-        const interiorRows = beat && beat.section && Array.isArray(beat.section.interiors) ? beat.section.interiors : []
-        if (interiorRows.length) {
-          const inner = interiorStats(body)
-          if (inner.paras >= 5 && inner.hit === 0) {
-            warnings.push(
-              `章纲里写了 ${interiorRows.length} 条内心材料，正文里一段都没落到：` +
-                interiorRows.slice(0, 3).map(item => `「${item.text}」`).join('、') +
-                '。这几条不是提示，是这一章必须出现的东西——挑一处写成他看到/想到的具体画面，别写成"他很后悔"。',
-            )
           }
         }
 
@@ -4325,6 +4334,7 @@ export function apply(ctx, config) {
             name: card.name,
             file: `${CHARACTERS_DIR}/${card.name}${CHARACTER_EXT}`,
             cadence: parseCadence(card.content),
+            states: parseStates(card.content),
           }))
           const seen = await appearanceIndex(rootNow(), bookChapters, ready, bookNow.meta.targetChars)
           const report2 = appearanceReport(seen.last, ready, uptoId)
@@ -4835,6 +4845,7 @@ export function apply(ctx, config) {
                 route !== '/beats' &&
                 route !== '/event' &&
                 route !== '/setting' &&
+                route !== '/setting-delete' &&
                 route !== '/thread' &&
                 route !== '/style' &&
                 route !== '/style-active' &&
