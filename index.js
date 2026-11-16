@@ -1232,7 +1232,7 @@ function assembleNovelContext(value, budget) {
     ? scope.partial
       ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
       : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风与各角色声口。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。${voiceRule}`
-    : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule}`
+    : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule} 宁可把前几场写透细节、在接近目标字数时自然收尾留钩子并用 novel_write({ ..., carryOver: true }) 将剩余场次顺延到下一章，也不要为了塞全章纲把后半段压缩成流水账。`
   const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n目标 ${value.chapter.target} 字。预算 ${budget} Unicode 字符（含标题、空白和指令，不是 token）。\n${instructions}`
   const blocks = []
   const add = (id, label, body, required = false) => {
