@@ -169,7 +169,7 @@ chapters/0001.md   正文，一章一个文件
 1. `novel_status` —— 现在写到哪、目标多少字、缺什么（设定 0 条时会当场提醒）
 2. `novel_context({ chapter })` —— 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 未回收伏笔 + 相关设定」的装配包
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
-4. `novel_write({ chapter, content })` —— 落盘
+4. `novel_write({ chapter, content })` —— 落盘（写到接近目标字数但章纲还有场景没写完时，不要硬塞成大纲扩写，传入 `carryOver: true` 自动顺延到下一章章纲）
 5. `novel_check({ chapter })` —— 自查（长度 / 重复句 / 半角标点 / 未登记的人名 / 旧称）
 6. **文风闸门（有文风卡就必须做）**：`novel_check({ chapter, aiTone: true })` 里如果出现 `style-drift`，**当场用** `novel_context({ chapter, mode: "rewrite", pass: "deai" })` 重写这一章，再写一遍自查。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。

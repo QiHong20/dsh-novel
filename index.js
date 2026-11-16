@@ -3159,7 +3159,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_write',
     description:
-      '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。' +
+      '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。如果一章写到接近目标字数但章纲还有场景没写完，别硬塞成流水账，传 carryOver: true 可自动把未写完的场景顺延到下一章章纲。' +
       '\n改写一章的标准动作：novel_context({ chapter, mode: "rewrite" }) 拿装配包；ready=false 时先调整预算或分段。优先传 rewriteStart/rewriteLimit 局部改写，再用 novel_write({ chapter, content, mode: "patch", start, end, baseHash }) 保存，旧稿自动备份。',
     parameters: {
       type: 'object',
@@ -3173,6 +3173,7 @@ export function apply(ctx, config) {
         end: { type: 'integer', minimum: 1, description: 'patch 终点，Unicode 字符索引，不含终点' },
         status: { type: 'string', enum: CHAPTER_STATUS, description: '写完后的章节状态，默认 draft' },
         note: { type: 'string', description: '一句话说明这次改动（写进历史时间线，例如「按文风重写」「补了结尾」）' },
+        carryOver: { type: 'boolean', description: 'true = 把本章章纲里还没写完的场景/信息自动顺延到下一章章纲，避免硬塞' },
       },
       required: ['content'],
       additionalProperties: false,
@@ -3191,14 +3192,19 @@ export function apply(ctx, config) {
           created: { type: 'boolean' },
           status: { type: 'string' },
           backup: { type: 'string' },
+          carriedOver: { type: 'object', additionalProperties: true },
           warnings: { type: 'array', items: { type: 'string' } },
         },
       },
       render: (_args, value) => {
         const gap = value.target > 0 && value.chars < value.target ? `，距目标 ${value.target} 字还差 ${value.target - value.chars}` : ''
+        const carry = value.carriedOver
+          ? `\n已将未写完的 ${value.carriedOver.scenes} 场戏${value.carriedOver.infos ? `、${value.carriedOver.infos} 条信息` : ''}顺延至 ${value.carriedOver.nextChapter.id} ${value.carriedOver.nextChapter.title} 章纲，可直接调用 novel_context({ chapter: "${value.carriedOver.nextChapter.id}" }) 接着写。`
+          : ''
         return textRender(
           `${value.created ? '已新建' : '已写入'} ${value.id} ${value.title}，本章 ${value.chars} 字${gap}，全书 ${value.totalChars} 字。` +
             (value.backup ? `旧稿已备份到 ${value.backup}。` : '') +
+            carry +
             warnText(value.warnings),
         )
       },
@@ -3264,9 +3270,11 @@ export function apply(ctx, config) {
       await persistBook(rootNow(), { ...meta, chapters }, chapters)
 
       const after = await snapshot()
+      const chapterTarget = chapter.targetChars > 0 ? chapter.targetChars : meta.targetChars
       // 写完顺手对一遍章纲：漏掉的场景当场说出来，别等作者读完全章才发现。
       const warnings = validateChapterContent(args.content)
       const beat = await readBeats(rootNow(), chapter)
+      let carriedOver = null
       if (beat.section && beat.section.chars > 0) {
         // 章纲有「场」有「位移」，却一条「心里」都没写：正文十有八九会写成流水线。
         const interiors = Array.isArray(beat.section.interiors) ? beat.section.interiors : []
@@ -3277,16 +3285,81 @@ export function apply(ctx, config) {
           )
         }
         const gap = beatCoverage(body, beat.section.body)
-        const skipped = gap.missing.map(item => `第 ${item.index} 场「${item.snippet}…」`)
-        if (skipped.length) {
-          warnings.push(
-            `章纲里这 ${gap.total} 场，有 ${skipped.length} 场在正文里几乎找不到对应情节：${skipped.join('、')}。` +
-              '要么补写，要么把章纲改掉——别让章纲和正文各说各的。',
-          )
-        }
         const infoList = beat.section.infos ?? []
-        if (infoList.length) {
-          const infoGap = beatCoverage(body, infoList.map(item => item.text).join('\n'))
+        const infoGap = infoList.length ? beatCoverage(body, infoList.map(item => item.text).join('\n')) : { missing: [] }
+        if (args.carryOver === true && (gap.missing.length > 0 || infoGap.missing.length > 0)) {
+          const missingScenes = new Set(gap.missing.map(item => item.index))
+          const missingInfos = new Set(infoGap.missing.map(item => item.index))
+          const beatLines = beat.section.body.replace(/\r\n/gu, '\n').split('\n')
+          const hasExplicitScenes = beatLines.some(line => /^\s*[-*+]?\s*场景\s*[：:]/u.test(line))
+          const keptLines = []
+          const movedLines = []
+          let sceneIdx = 0
+          let infoIdx = 0
+          let movingScene = false
+          for (const line of beatLines) {
+            const isScene = hasExplicitScenes ? /^\s*[-*+]?\s*场景\s*[：:]/u.test(line) : (line.trim().length >= 6 && !/^\s*[-*+]?\s*(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|备注|注|事件)\s*[：:]/u.test(line))
+            const isInfo = /^\s*[-*+]?\s*信息\s*[：:]/u.test(line)
+            if (isScene) {
+              sceneIdx += 1
+              movingScene = missingScenes.has(sceneIdx)
+              if (movingScene) movedLines.push(line)
+              else keptLines.push(line)
+              continue
+            }
+            if (isInfo) {
+              infoIdx += 1
+              movingScene = false
+              if (missingInfos.has(infoIdx)) movedLines.push(line)
+              else keptLines.push(line)
+              continue
+            }
+            if (movingScene && /^\s*[-*+]?\s*(?:心里|心理|念头|回忆|反应|对方反应|位移)\s*[：:]/u.test(line)) {
+              movedLines.push(line)
+              continue
+            }
+            movingScene = false
+            keptLines.push(line)
+          }
+          if (movedLines.length) {
+            await writeBeats(rootNow(), chapter, keptLines.join('\n').trim())
+            const curIdx = chapters.findIndex(item => item.id === chapter.id)
+            let nextChapter = curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1] : null
+            if (!nextChapter) {
+              const nextId = nextChapterId(chapters)
+              nextChapter = {
+                id: nextId,
+                title: `第 ${Number(nextId)} 章`,
+                file: `${CHAPTERS_DIR}/${nextId}.md`,
+                status: 'planned',
+                targetChars: 0,
+              }
+              chapters.push(nextChapter)
+              await persistBook(rootNow(), { ...meta, chapters }, chapters)
+            }
+            const nextBeat = await readBeats(rootNow(), nextChapter)
+            const nextBody = nextBeat.section && nextBeat.section.body ? `${movedLines.join('\n')}\n${nextBeat.section.body}` : movedLines.join('\n')
+            await writeBeats(rootNow(), nextChapter, nextBody)
+            carriedOver = {
+              nextChapter: { id: nextChapter.id, title: nextChapter.title },
+              scenes: missingScenes.size,
+              infos: missingInfos.size,
+            }
+          }
+        } else {
+          const skipped = gap.missing.map(item => `第 ${item.index} 场「${item.snippet}…」`)
+          if (skipped.length) {
+            if (chapterTarget > 0 && chars >= chapterTarget * 0.85) {
+              warnings.push(
+                `本章已达 ${chars}/${chapterTarget} 字，写不完的 ${skipped.length} 场（${skipped.join('、')}）别硬塞成流水账——可传 carryOver: true 自动顺延到下一章章纲，或手动拆章。`,
+              )
+            } else {
+              warnings.push(
+                `章纲里这 ${gap.total} 场，有 ${skipped.length} 场在正文里几乎找不到对应情节：${skipped.join('、')}。` +
+                  '要么补写，要么把章纲改掉——别让章纲和正文各说各的。',
+              )
+            }
+          }
           if (infoGap.missing.length) {
             warnings.push(
               `章纲里标了 ${infoList.length} 条「信息」，有 ${infoGap.missing.length} 条在正文里没落地：` +
@@ -3321,11 +3394,12 @@ export function apply(ctx, config) {
         title: chapter.title,
         file: chapter.file,
         chars,
-        target: chapter.targetChars > 0 ? chapter.targetChars : meta.targetChars,
+        target: chapterTarget,
         totalChars: after.totals.chars,
         created,
         status: chapter.status,
         backup,
+        ...(carriedOver ? { carriedOver } : {}),
         warnings,
       }
     },
@@ -3625,8 +3699,8 @@ export function apply(ctx, config) {
         ? chapters[index]
         : { id: nextChapterId(chapters), title: `第 ${Number(nextChapterId(chapters))} 章`, chars: 0, target: meta.targetChars, status: 'planned' }
 
-      // 改写比续写更吃上下文（要带上本章原文 + 全量锚点），默认给大三倍。
-      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 6000 : 2000, 300, 20000)
+      // 续写也要完整带上文风锚点与设定细节，默认给到 5000；改写给到 6000。
+      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 6000 : 5000, 300, 20000)
       const prev = chapters.slice(0, index).reverse().find(item => item.chars > 0)
       const prevText = prev ? (await readText(path.join(rootNow(), prev.file))) ?? '' : ''
       const prevTailText = tail(prevText, Math.max(300, Math.min(800, Math.round(budget * 0.3))))
