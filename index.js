@@ -352,6 +352,15 @@ function validateCardContent(content) {
     )
   }
   if (/@\s*\d{3,4}\s*[-~]\s*\d{3,4}/u.test(body)) warnings.push('用了 `@0003-0008` 区间写法：现在只认起始章，后面的终点会被忽略。')
+  if (!/^\s*[-*+]?\s*(?:性格|表面|里子|行事|脾气|性情)\s*[：:]/mu.test(body)) {
+    warnings.push('缺「- 性格：…」行（或「- 表面/里子：…」）：可以是护短热心、讲究体面、沉稳果断或爱算小账，写清遇事第一反应、习惯性小动作与底线，别只写抽象形容词。')
+  }
+  if (!/^\s*[-*+]?\s*(?:外貌|外貌锚点|长相|体态)\s*[：:]/mu.test(body)) {
+    warnings.push('缺「- 外貌锚点：…」行：按人物出身与经历分布有度地写 1–2 个视觉特征——气质神态、标志性饰物、体态（如眼角笑纹、银色袖扣）或有来历的伤疤与职业磨损（如虎口旧疤、义体接驳痕）皆可，避免全书清一色完美脸或清一色伤疤脸，禁止堆砌五官形容词。')
+  }
+  if (!/^\s*[-*+]?\s*(?:说话|说话方式|口癖|腔调|台词|语态)\s*[：:]/mu.test(body)) {
+    warnings.push('缺「- 说话：…」行：只写性格形容词，正文里所有人说话都会变成同一个腔调。建议写明句长/用词偏好（爽朗、温吞、利落或礼貌等）与忌讳，并附 1–2 句逐字台词例句。')
+  }
   return warnings
 }
 
@@ -1218,11 +1227,12 @@ function assembleNovelContext(value, budget) {
   const size = text => Array.from(text).length
   const rewrite = value.mode === 'rewrite'
   const scope = value.rewriteScope
+  const voiceRule = '人物的临场反应与对话必须贴合各自人物卡的「性格」（遇事第一反应、小动作、底线）与「说话」习惯，并在初登场或关键对峙时顺手带出「外貌锚点」（不堆砌五官清单），禁止千人一面或直接套用叙述腔。'
   const instructions = rewrite
     ? scope.partial
-      ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。`
-      : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。`
-    : '按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。'
+      ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
+      : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风与各角色声口。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。${voiceRule}`
+    : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule}`
   const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n目标 ${value.chapter.target} 字。预算 ${budget} Unicode 字符（含标题、空白和指令，不是 token）。\n${instructions}`
   const blocks = []
   const add = (id, label, body, required = false) => {
@@ -3894,7 +3904,7 @@ export function apply(ctx, config) {
       '\n- @0003 去世（怎么死的）    ← 第 3 章起进入这个状态，一直持续到下一条状态为止' +
       '\n- @0050 现身（其实没死）    ← 不含死亡词的状态＝又活着了，这就是「复活」' +
       '\n死亡词：去世/死亡/死/殁/阵亡/身亡/牺牲/遇难/丧命/不在了；写「没死/假死/装死」不算死。' +
-      '\n外貌、性格、口癖、禁忌等随便写，`- 字段：内容` 或普通段落都行；名字带 @ 的时间标记只能出现在「关系」和「状态」这两节里。',
+      '\n【- 外貌锚点：… / - 性格：… / - 说话：…（必写，防千人一面）】不要写「剑眉星目/冷静」这类套话或抽象形容词，按角色出身与经历分布有度地拉开差异：「外貌锚点」写 1–2 个视觉特征，气质神态、标志性饰物、体态（如眼角笑纹、银色袖扣）与有来历的伤疤或职业磨损（如虎口旧疤、义体接驳痕）按人设自然分配；「性格」写明遇事第一反应、小动作与底线（热忱护短、反差幽默、讲究体面、谨慎精明等光谱分布开）；「说话」写句长偏好、语气词习惯与忌讳，附 1–2 句逐字台词例句（如爽朗直白「这事包我身上！」或客气疏离「恐怕不太合乎规矩。」）。名字带 @ 的时间标记只能出现在「关系」和「状态」这两节里。',
     parameters: {
       type: 'object',
       properties: {
