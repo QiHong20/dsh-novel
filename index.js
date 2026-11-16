@@ -447,7 +447,7 @@ function validateBeatsContent(content) {
   if (/^\s{0,3}#{1,6}\s+\d{3,4}/mu.test(body)) warnings.push('章纲里不要再写「## 数字」这种章标题：标题由插件生成（写了也会被剥掉），正文只写场景。')
   const scenes = body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s*场景\s*[：:]/u.test(line)).length
   if (!scenes) warnings.push('一条场景都没写（应为 3–6 条：`- 场景：谁 → 在哪 → 想干什么 → 撞上什么`）。')
-  else if (scenes > 8) warnings.push(`写了 ${scenes} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。`)
+  else if (scenes > 8) warnings.push(`写了 ${scenes} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。（只是提醒，内容已完整保存，回合数/行数都没有上限。）`)
   return warnings
 }
 
