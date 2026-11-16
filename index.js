@@ -1585,7 +1585,10 @@ function parseBeatSections(text) {
 const INTERIOR_RE = /(心里|心头|心中|暗自|心底|脑子里|觉得|想着|想起|后悔|不甘|发狠|喉咙|喉结|嗓子|咽了口|咽下|胸口|手心|掌心|指尖|手指|后背|耳朵|耳根|太阳穴|胃里|鼻头|眼眶|发烫|发凉|发紧|冷汗|愣|松了口气|咬牙|手抖|腿软|呼吸|心跳|空了一块)/u
 
 function interiorStats(text) {
-  const paras = String(text ?? '').split(/\n+/).map(item => item.trim()).filter(Boolean)
+  const paras = String(text ?? '')
+    .split(/\n+/)
+    .map(item => item.trim())
+    .filter(item => item && !/^[「『"“][^」』"”]+[」』"”]$/u.test(item))
   const hit = paras.filter(item => INTERIOR_RE.test(item)).length
   return { paras: paras.length, hit, ratio: paras.length ? Math.round((hit / paras.length) * 1000) / 10 : 0 }
 }
@@ -1959,6 +1962,9 @@ async function readBeats(root, chapter) {
             marks: section.marks,
             infos: section.infos,
             events: section.events,
+            interiors: section.interiors,
+            reactions: section.reactions,
+            shifts: section.shifts,
           }
       : null,
   }
