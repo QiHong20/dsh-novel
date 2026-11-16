@@ -218,3 +218,38 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 比的都是**可数**的东西，不判断「写得好不好」——那是 AI 的活。但只有两个指标算硬判据：**句均字数（±30%）、每千字句号（0.7–1.5 倍）**；段均字数、含对话段占比、每千字逗号、破折号/省略号只是「参考值」，会显示在 `/novel-api/style-fit` 里但**不报警**——它们测的是排版习惯，读着顺就是顺。
 
 正确用法：**出 `style-drift` 就当场重写这一章**（`novel_context({ chapter, mode: "rewrite", pass: "deai" })`），别留到下一章，也别指望子代理整章返修——它会顺手把风格换成它自己的。
+
+## 文风上下文装配（2026-11-16）
+
+- [x] 顶部视角与叙述权限优先注入；规则支持 `[必选]` 标记，不再只取每节前两条。
+- [x] 按完整条目选择规则、锚点与正反例；预算不足时不截断句子。
+- [x] `novel_context` 的 `style` 增加 `included`、`omitted`、`budget`、`used`；省略项带原因，并在文本结果中展示。文风额度按含空白及标题的 Unicode 字符计，总上下文预算改造仍见 `doc/优化规划.md` 第 3 项。
+
+验证：`node --test tests/style-context.test.mjs`；`node --check index.js`。宿主联调及真实生成效果尚未验证。
+
+
+### 禁忌解析与检查（第二项）
+
+- [x] 模板一行一项：`禁用词：氤氲`、`整句：他拿起笔。`；兼容旧卡的斜杠、顿号词表，以及带空格斜杠分隔的整句列表。整句内部标点保留。
+- [x] `## 少用词` 只提醒；`## 语义禁忌` 交给会话 AI 复核。未标类型的“不要 / 不得 / 避免”等自然语言要求转入待复核，并提供格式提醒。
+- [x] `novel_check` 禁用项返回命中总数与前 20 处行列、原文片段；新增 `styleReview` 返回少用词命中、语义待复核项和格式提醒。这些提醒不单独导致 `ok: false`，`ok` 仅反映自动检查结果。
+
+验证：`node --test tests/*.test.mjs`（7 项通过）。
+
+
+### 上下文预算与局部改写（第三项）
+
+- [x] `novel_context.budget` 约束最终 `prompt`，以含空白、标题和指令的 Unicode 字符计量，不是模型 token 上限；结构化元数据与宿主封装不在此额度内。
+- [x] 必要内容放不下时返回 `ready: false`、`minimumBudget` 和后续操作，不再截取长章前 6000 字符后引导整章覆盖。
+- [x] 新增 `rewriteStart` / `rewriteLimit`，返回 `rewriteScope`（start、end、total、nextStart、baseHash）。索引按 Unicode 字符，start 包含、end 不包含。
+- [x] `novel_write` 支持 `mode: "patch"`，必须提供 chapter、start、end、baseHash，仅替换指定范围，保留其余正文并沿用整章历史备份。原文哈希不一致拒绝写入。`replace` 可提供 baseHash；旧调用保持兼容。
+
+```js
+novel_context({ chapter: '0001', mode: 'rewrite', rewriteStart: 0, rewriteLimit: 1000, budget: 6000 })
+// 仅在 ready=true 后，根据返回的 start/end/baseHash 提交修改：
+novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<返回值>', content: '<修改后的片段>' })
+```
+
+每次保存后重新读取上下文，重新确定下一段起点：修改会改变长度，旧 nextStart 和旧哈希不能直接复用。先核对事实、动作、信息点，再调整文风；这部分仍需会话 AI 复核。
+
+验证：`node --test tests/*.test.mjs`（11 项）、`node --check index.js`。宿主联调尚未完成。

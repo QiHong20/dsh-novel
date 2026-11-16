@@ -438,6 +438,7 @@ function validateStyleContent(content) {
     if (anchors < 2) warnings.push(`「锚点原文」里只有 ${anchors} 段，建议 3–5 段（每段 100–300 字）。`)
   }
   if (!/^##\s*禁忌/mu.test(text)) warnings.push('缺「## 禁忌（不要出现）」小节：novel_check 只能靠它查越界写法。')
+  warnings.push(...parseStyleRestrictions(text).warnings)
   return warnings
 }
 
@@ -804,61 +805,56 @@ const CLICHE_WORDS = [
 // 所以注入时不按「整张卡截前 N 字」，而是把这两节挑出来按预算切。
 // 手写的文风卡真正值钱的是那几条规矩（段落多长、短句怎么用、对话怎么标、过渡词用哪些）。
 // 自动克隆写不出来，但读过锚点的人会补上，所以注入时一定要带上——否则模型只看到锚点和禁忌。
-function styleRuleText(text, maxChars) {
-  const sections = String(text ?? '')
-    .split(/\n##\s+/u)
-    .slice(1)
-  const blocks = []
-  for (const chunk of sections) {
-    const lines = chunk.split(/\r?\n/u)
-    const heading = lines[0].trim()
-    if (!heading) continue
-    if (/^(锚点原文|禁忌|反例)/u.test(heading)) continue
-    const points = []
-    for (const line of lines.slice(1)) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      if (/^#{3,6}\s/u.test(trimmed)) continue
-      const plain = trimmed.replace(/^[-*+]\s*/u, '').trim()
-      if (!plain) continue
-      points.push(plain)
-      if (points.length >= 2) break
+/** 文风按完整条目装配；预算含空白和标题，以 Unicode 字符计。 */
+function assembleStylePrompt(text, maxChars) {
+  const raw = String(text ?? '').replace(/\r\n/gu, '\n').trim()
+  const sections = raw.split(/^##[ \t]+/mu)
+  const candidates = []
+  const add = (label, body, priority) => {
+    if (body.trim()) candidates.push({ id: `style-${candidates.length + 1}`, label, text: body.trim(), priority })
+  }
+  // 顶部元信息中，视角/叙述权限不能被当成摘要丢掉。
+  const prefix = sections.shift() || ''
+  for (const line of prefix.split('\n')) {
+    if (/视角|时态|叙述权限|叙述距离|叙述人称/u.test(line)) add('视角与叙述权限', line, 0)
+    else if (line.trim()) add('卡片说明', line, 5)
+  }
+  for (const section of sections) {
+    const newline = section.indexOf('\n')
+    const heading = (newline < 0 ? section : section.slice(0, newline)).trim()
+    const body = newline < 0 ? '' : section.slice(newline + 1).trim()
+    if (/^锚点原文/u.test(heading)) {
+      // 有三级标题时以整段锚点为单位；旧卡无标题时按空行分组。
+      const chunks = /^###[ \t]+/mu.test(body) ? body.split(/(?=^###[ \t]+)/mu) : body.split(/\n[ \t]*\n/u)
+      chunks.filter(chunk => chunk.trim()).forEach((chunk, i) => add(`锚点原文 ${i + 1}`, `## ${heading}\n${chunk}`, 3))
+      continue
     }
-    if (!points.length) continue
-    blocks.push(`- **${heading}**：${points.join(' ／ ')}`)
+    // 保留列表条目的续行、正例与引用，不再只拿前两条。
+    const chunks = body.split(/(?=^[-*+][ \t]+)/mu).filter(chunk => chunk.trim())
+    chunks.forEach((chunk, i) => {
+      const priority = /\[必选\]/u.test(chunk) || /核心|视角|叙述权限/u.test(heading) ? 0
+        : /禁忌/u.test(heading) ? 1
+        : /反例|正例/u.test(heading) || /^[-*+]\s*正例/u.test(chunk) ? 4 : 2
+      add(`${heading} · ${i + 1}`, `## ${heading}\n${chunk}`, priority)
+    })
   }
-  if (!blocks.length) return ''
-  const head = '## 写法规矩（这张卡里人定的规矩，照做）'
-  let out = head
-  for (const block of blocks) {
-    const next = `${out}\n${block}`
-    if (Array.from(next).length > maxChars) {
-      if (out === head) out = `${Array.from(`${head}\n${block}`).slice(0, maxChars).join('')}…`
-      break
-    }
-    out = next
-  }
-  return out
-}
-
-function stylePromptText(text, maxChars) {
-  const raw = String(text ?? '')
-  const section = name => {
-    const match = raw.match(new RegExp(`(?:^|\\n)##\\s*${name}[^\\n]*\\n([\\s\\S]*?)(?=\\n##\\s|$)`, 'u'))
-    return match ? match[1].trim() : ''
-  }
-  const anchors = section('锚点原文')
-  const banned = section('禁忌')
-  if (!anchors && !banned) return Array.from(raw.trim()).slice(0, maxChars).join('')
-  const rules = styleRuleText(raw, Math.max(700, Math.min(1400, Math.round(maxChars * 0.6))))
-  const bannedPart = banned ? Array.from(banned).slice(0, 200).join('') : ''
-  const used = countChars(rules) + (bannedPart ? countChars(bannedPart) + 20 : 0)
-  const anchorBudget = Math.max(200, maxChars - used - 40)
+  candidates.sort((a, b) => a.priority - b.priority)
+  const included = []
+  const omitted = []
   const parts = []
-  if (rules) parts.push(rules)
-  if (anchors) parts.push('## 锚点（逐字，照着这个句子长度和断句来，不要改写它）', Array.from(anchors).slice(0, anchorBudget).join(''))
-  if (bannedPart) parts.push('## 禁忌（这些词不要出现）', bannedPart)
-  return parts.join('\n')
+  const length = value => Array.from(value).length
+  const budget = Math.max(0, Math.floor(Number(maxChars) || 0))
+  for (const item of candidates) {
+    const next = [...parts, item.text].join('\n\n')
+    const entry = { id: item.id, label: item.label, priority: item.priority, chars: length(item.text) }
+    if (length(next) <= budget) {
+      parts.push(item.text)
+      included.push(entry)
+    } else {
+      omitted.push({ ...entry, reason: '文风预算不足，完整条目未截断；可增大 budget 或用 novel_style 读取完整卡片' })
+    }
+  }
+  return { text: parts.join('\n\n'), included, omitted, budget, used: length(parts.join('\n\n')) }
 }
 
 // 视角只能靠人称代词密度的粗估：第一人称满篇「我」，第三人称满篇「他/她」。
@@ -1214,23 +1210,132 @@ function sampleExcerpts(text, count = STYLE_EXCERPTS, chars = STYLE_EXCERPT_CHAR
   return picked
 }
 
-/** 文风卡「## 禁忌（不要出现）」里的词，给 novel_check 当越界清单。 */
-function styleBanned(text) {
-  const words = []
-  let inside = false
-  for (const line of String(text ?? '').split(/\r?\n/u)) {
-    const trimmed = line.trim()
-    if (/^#{2}\s/u.test(trimmed)) {
-      inside = /^#{2}\s*禁忌/u.test(trimmed)
+/** 按最终提示文本计预算；Unicode 字符含空白，不等同于 token。 */
+function assembleNovelContext(value, budget) {
+  const size = text => Array.from(text).length
+  const rewrite = value.mode === 'rewrite'
+  const scope = value.rewriteScope
+  const instructions = rewrite
+    ? scope.partial
+      ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。`
+      : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。`
+    : '按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。'
+  const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n目标 ${value.chapter.target} 字。预算 ${budget} Unicode 字符（含标题、空白和指令，不是 token）。\n${instructions}`
+  const blocks = []
+  const add = (id, label, body, required = false) => {
+    if (body) blocks.push({ id, label, text: `## ${label}\n${body}`, required })
+  }
+  if (rewrite) add('chapterText', scope.partial ? `本章片段 [${scope.start}, ${scope.end})，全章 ${scope.total} 字符` : '完整本章原文', value.chapterText, true)
+  add('beats', '本章章纲', value.beats.text, true)
+  add('rewriteRules', '改写纪律', value.rewriteRules, true)
+  add('style', `文风：${value.style.name}`, value.style.text, true)
+  if (value.rhythm && value.rhythm.present) add('rhythm', '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
+  value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content))
+  value.settings.forEach((item, i) => add(`setting-${i}`, `设定：${item.name}`, item.content))
+  value.spine.forEach((item, i) => add(`event-${i}`, `事件：${item.id} ${item.title}`, `因为：${item.because}\n所以：${item.so}`))
+  add('prevTail', '上一章结尾（节选）', value.prevTail.text)
+  add('outline', '大纲参考（节选）', value.outline)
+  value.threads.forEach((item, i) => add(`thread-${i}`, '伏笔', `${item.thread}（埋于 ${item.planted}，回收 ${item.payoff}）`))
+  value.aiTone.forEach((item, i) => add(`tone-${i}`, `AI 腔线索：${item.label}`, (item.samples || []).join('\n')))
+  value.warnings.forEach((item, i) => add(`warning-${i}`, '写作提醒', item))
+  const included = []
+  const omitted = []
+  const parts = [head]
+  // 为省略提示预留固定空间，报告明细作为元数据返回，不把原文再次塞回输出。
+  const footer = '\n\n装配清单：' + blocks.map(item => item.id + '=' + item.label).join('；') + '\n未展示的条目因总预算不足而省略；用 novel_read、novel_style、novel_card、novel_setting 等补读。' + (value.style.omitted.length ? '\n文风省略：' + value.style.omitted.map(item => item.label).join('；') + '（文风额度不足，规则仍有效；用 novel_style 读全卡）' : '')
+  const required = blocks.filter(item => item.required)
+  const minimum = size([head, ...required.map(item => item.text)].join('\n\n') + footer)
+  if (minimum > budget) {
+    const prompt = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。未提供残缺正文，不可据此覆盖整章。增大 budget（最多 20000）；长章请用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写。若片段仍放不下，缩小 rewriteLimit 或增大 budget。`
+    return { ...value, chapterText: '', prompt, budget, budgetUsed: size(prompt), ready: false, minimumBudget: minimum, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
+  }
+  for (const block of [...required, ...blocks.filter(item => !item.required)]) {
+    if (size([...parts, block.text].join('\n\n') + footer) <= budget) {
+      parts.push(block.text)
+      included.push({ id: block.id, label: block.label })
+    } else omitted.push({ id: block.id, label: block.label, reason: '总预算不足，完整条目省略' })
+  }
+  const prompt = parts.join('\n\n') + footer
+  return { ...value, prompt, budget, budgetUsed: size(prompt), budgetUnit: 'unicode-code-points', ready: true, included, omitted }
+}
+
+function rewriteSelection(text, start, limit) {
+  const chars = Array.from(text)
+  const partial = start !== undefined
+  const from = partial ? Number(start) : 0
+  if (!Number.isInteger(from) || from < 0 || from >= chars.length && chars.length > 0) throw new Error('rewriteStart 超出正文范围')
+  const length = limit === undefined ? 1000 : Number(limit)
+  if (!Number.isInteger(length) || length < 1) throw new Error('rewriteLimit 必须是正整数')
+  const end = partial ? Math.min(chars.length, from + length) : chars.length
+  return { text: chars.slice(from, end).join(''), scope: { partial, start: from, end, total: chars.length, nextStart: end < chars.length ? end : null, baseHash: createHash('sha256').update(text).digest('hex') } }
+}
+
+function applyChapterEdit(previous, args) {
+  const hash = createHash('sha256').update(previous).digest('hex')
+  if (args.baseHash !== undefined && args.baseHash !== hash) throw new Error('正文已变化，请重新获取上下文后再保存；未写入')
+  if (args.mode !== 'patch') return args.mode === 'append' && previous ? `${previous.replace(/\s+$/u, '')}\n\n${args.content}` : args.content
+  if (!args.baseHash) throw new Error('局部改写必须提供上下文返回的 baseHash')
+  const chars = Array.from(previous)
+  if (!Number.isInteger(args.start) || !Number.isInteger(args.end) || args.start < 0 || args.end <= args.start || args.end > chars.length) throw new Error('局部改写范围无效；未写入')
+  return chars.slice(0, args.start).join('') + args.content + chars.slice(args.end).join('')
+}
+
+/** 禁忌分为字面禁止、少用提醒与待语义复核；不猜测语义规则是否违反。 */
+function parseStyleRestrictions(text) {
+  const result = { banned: [], limited: [], semantic: [], warnings: [] }
+  let group = null
+  let active = null
+  const category = heading => /^语义禁忌/u.test(heading) ? 'semantic'
+    : /^少用词/u.test(heading) ? 'limited' : /^(禁忌|禁用词|禁用句)/u.test(heading) ? 'banned' : null
+  for (const [index, line] of String(text ?? '').split(/\r?\n/u).entries()) {
+    const heading = line.trim().match(/^(#{2,6})\s+(.+)$/u)
+    if (heading) {
+      if (heading[1].length === 2) group = category(heading[2])
+      active = category(heading[2]) || group
       continue
     }
-    if (/^#{3,6}\s/u.test(trimmed)) continue
-    if (!inside || !trimmed) continue
-    const plain = trimmed.replace(/^[-*+]\s*/u, '').replace(/^[「『"]|[」』"]$/gu, '').trim()
-    // 既收词，也收整句（「他拿起笔。」这种模板腔）：上限放宽到 40 字
-    if (plain && plain.length <= 40) words.push(plain)
+    if (!active || !line.trim() || /^\s*>/u.test(line)) continue
+    let plain = line.trim().replace(/^[-*+]\s*/u, '').trim()
+    let kind = active
+    const prefix = plain.match(/^(词|禁用词|少用词|语义禁忌|整句(?:（[^）]*）)?|禁用句)\s*[：:]\s*/u)
+    if (prefix) {
+      if (prefix[1] === '少用词') kind = 'limited'
+      if (prefix[1] === '语义禁忌') kind = 'semantic'
+      plain = plain.slice(prefix[0].length)
+    }
+    if (!plain || /^[（(].*[）)]$/u.test(plain)) continue
+    if (!prefix && kind !== 'semantic' && /^(不要|不得|避免|禁止|不能|不许)/u.test(plain)) {
+      kind = 'semantic'
+      result.warnings.push(`第 ${index + 1} 行是自然语言要求，已列入语义待复核；如需字面匹配请写「禁用词：…」或「整句：…」。`)
+    }
+    // 整句仅兼容旧模板的带空格斜杠分隔，不拆句内顿号、逗号或斜杠。
+    const sentence = prefix ? /整句|禁用句/u.test(prefix[1]) : /[。！？!?]/u.test(plain)
+    const values = kind === 'semantic' ? [plain] : sentence ? plain.split(/\s+\/\s+/u) : plain.split(/\s*[/、]\s*/u)
+    if (values.length > 1) result.warnings.push(`第 ${index + 1} 行已兼容拆分为 ${values.length} 项；建议一行一项。`)
+    for (let value of values) {
+      value = value.trim()
+      const pairs = { '「': '」', '『': '』', '“': '”', '"': '"' }
+      if (pairs[value[0]] === value.at(-1)) value = value.slice(1, -1).trim()
+      if (value && !result[kind].includes(value)) result[kind].push(value)
+    }
   }
-  return words
+  return result
+}
+
+function styleRestrictionMatches(text, words) {
+  const hits = []
+  const lines = String(text ?? '').split(/\r?\n/u)
+  lines.forEach((line, index) => {
+    for (const word of words) {
+      let offset = 0
+      while ((offset = line.indexOf(word, offset)) >= 0) {
+        const column = Array.from(line.slice(0, offset)).length + 1
+        hits.push(`第 ${index + 1} 行第 ${column} 列「${word}」：${line.slice(Math.max(0, offset - 20), offset + word.length + 20)}`)
+        offset += word.length
+      }
+    }
+  })
+  return hits
 }
 
 // ---- 伏笔表（threads.md，人工维护的 Markdown 表格）--------------------------
@@ -2906,7 +3011,8 @@ export function apply(ctx, config) {
           skipped.push(segment.title)
           continue
         }
-        let chapter = existing
+        if (mode === 'patch' && !existing) throw new Error('局部改写必须指定已有章节')
+      let chapter = existing
         if (!chapter) {
           const id = nextChapterId(chapters)
           chapter = {
@@ -3051,14 +3157,17 @@ export function apply(ctx, config) {
     name: 'novel_write',
     description:
       '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。' +
-      '\n改写一章的标准动作：novel_context({ chapter, mode: "rewrite" }) 拿装配包 → 按锚点重写 → novel_write({ chapter, content, mode: "replace" })，旧稿自动备份。',
+      '\n改写一章的标准动作：novel_context({ chapter, mode: "rewrite" }) 拿装配包；ready=false 时先调整预算或分段。优先传 rewriteStart/rewriteLimit 局部改写，再用 novel_write({ chapter, content, mode: "patch", start, end, baseHash }) 保存，旧稿自动备份。',
     parameters: {
       type: 'object',
       properties: {
         content: { type: 'string', description: '要写入的正文（Markdown）' },
         chapter: { type: 'string', description: '章 id 或标题；省略则新建下一章' },
         title: { type: 'string', description: '章节标题；新建时可指定，默认「第 N 章」' },
-        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace 覆盖（默认）| append 追加' },
+        mode: { type: 'string', enum: ['replace', 'append', 'patch'], description: 'replace 覆盖（默认）| append 追加 | patch 仅替换 start/end 范围' },
+        baseHash: { type: 'string', description: '上下文返回的原文 SHA-256，patch 必填；原文改变则拒绝写入' },
+        start: { type: 'integer', minimum: 0, description: 'patch 起点，Unicode 字符索引，含起点' },
+        end: { type: 'integer', minimum: 1, description: 'patch 终点，Unicode 字符索引，不含终点' },
         status: { type: 'string', enum: CHAPTER_STATUS, description: '写完后的章节状态，默认 draft' },
         note: { type: 'string', description: '一句话说明这次改动（写进历史时间线，例如「按文风重写」「补了结尾」）' },
       },
@@ -3094,7 +3203,7 @@ export function apply(ctx, config) {
     execute: async args => {
       const { meta } = await loadBook(rootNow())
       const chapters = [...meta.chapters]
-      const mode = args.mode === 'append' ? 'append' : 'replace'
+      const mode = args.mode === 'patch' ? 'patch' : args.mode === 'append' ? 'append' : 'replace'
       const existing = args.chapter ? findChapter(chapters, args.chapter) : undefined
 
       if (args.chapter && !existing) {
@@ -3126,7 +3235,7 @@ export function apply(ctx, config) {
 
       const target = path.join(rootNow(), chapter.file)
       const previous = (await readText(target)) ?? ''
-      const body = mode === 'append' && previous ? `${previous.replace(/\s+$/u, '')}\n\n${args.content}` : args.content
+      const body = applyChapterEdit(previous, { ...args, mode })
 
       // 覆盖/追加前先留一版完整快照（正文 + 元数据），改写是破坏性操作。
       let backup = ''
@@ -3199,7 +3308,7 @@ export function apply(ctx, config) {
               .map(item => `${item.label} ${item.act}（卡上 ${item.ref}）`)
             warnings.push(
               `这一章的节奏偏离文风卡「${fitStyleName}」：${worst.join('；')}。` +
-                '要纠就用 novel_context({ chapter, mode: "rewrite" }) 重写这一章，别留到下一章——漂移是累积的。',
+                '先定位问题段落，用 novel_context({ chapter, mode: "rewrite", rewriteStart: 0, rewriteLimit: 1000 }) 获取对应范围并局部修订；起点按实际问题位置调整。',
             )
           }
         }
@@ -3450,7 +3559,9 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
-        budget: { type: 'integer', description: '装配包总字数上限，默认 2000' },
+        budget: { type: 'integer', description: '最终提示文本的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 2000、改写 6000，最多 20000' },
+        rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
+        rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
           type: 'string',
           enum: ['continue', 'rewrite'],
@@ -3488,111 +3599,11 @@ export function apply(ctx, config) {
           budgetUsed: { type: 'integer' },
         },
       },
-      render: (_args, value) => {
-        const rewrite = value.mode === 'rewrite'
-        const parts = [
-          rewrite
-            ? `【改写装配包】要改写的是 ${value.chapter.id} ${value.chapter.title}（现有 ${value.chapterText.length} 字，目标 ${value.chapter.target} 字）`
-            : `【上下文装配包】目标章节 ${value.chapter.id} ${value.chapter.title}（目标 ${value.chapter.target} 字）`,
-        ]
-        if (value.beats && value.beats.present) {
-          parts.push(`\n## 本章章纲（拍摄清单，优先按这个写）\n${value.beats.text}`)
-        }
-        const infoLines = (value.beats && value.beats.infos) || []
-        if (infoLines.length) {
-          parts.push(
-            '\n## 本章要交付的信息（读者读完这一章必须知道这些）\n' +
-              infoLines.map(item => `${item.index}. ${item.text}`).join('\n') +
-              '\n（这些不是场景，是结果：写完之后读者应该已经知道了，别只暗示。）',
-          )
-        }
-        if (value.rhythm && value.rhythm.present) {
-          const labels = value.rhythm.payoff.length ? `：${value.rhythm.payoff.join('、')}` : ''
-          parts.push(
-            `\n## 节奏（这一章怎么给读者回报）\n` +
-              `爽点 ${value.rhythm.payoff.length} 处${labels} · 钩子 ${value.rhythm.hook ? '有' : '无'} · 转折 ${value.rhythm.turn} 处` +
-              (value.rhythm.payoff.length === 0
-                ? `\n⚠ 这一章没有爽点${value.rhythm.gapBefore ? `，而且前面已连续 ${value.rhythm.gapBefore} 章没有` : ''}：` +
-                  '别写成纯信息过场，挑一场把它演成情绪回报（打脸 / 翻盘 / 揭秘 / 情感兑现 / 强强对话）。'
-                : '') +
-              (value.rhythm.hook ? '' : '\n⚠ 章末没有钩子：最后一场收尾要留一个必须翻页的理由。'),
-          )
-        }
-        if (value.spine && value.spine.length) {
-          parts.push(
-            '\n## 本章推进的事件（因果链，别只填情节）\n' +
-              value.spine
-                .map(item =>
-                  '- 「' + item.id + ' ' + item.title + '」（' + item.line + '）' +
-                    (item.because ? '\n  因为：' + item.because : '') +
-                    (item.so ? '\n  所以：' + item.so : ''),
-                )
-                .join('\n'),
-          )
-        }
-        parts.push(`\n## 本章大纲\n${value.outline || '（大纲里没有这一章的段落，建议先 novel_outline 补上）'}`)
-        if (value.prevTail && value.prevTail.text) {
-          parts.push(`\n## 上一章结尾（${value.prevTail.id} ${value.prevTail.title}）\n${value.prevTail.text}`)
-        } else {
-          parts.push('\n## 上一章结尾\n（这是第一章，前面没有正文）')
-        }
-        if (rewrite) {
-          parts.push(
-            `\n## 待改写的本章原文（逐字保留情节骨架，只换句子）\n${value.chapterText}`,
-          )
-        }
-        if (value.characters.length) {
-          parts.push(
-            `\n## 出场人物（${value.characters.length}）\n` +
-              value.characters
-                .map(item =>
-                  `### ${item.name}${item.state ? `（第 ${Number(item.state.chapter)} 章${item.state.label}）` : ''}\n${item.content}`,
-                )
-                .join('\n\n'),
-          )
-        } else {
-          parts.push('\n## 出场人物\n（工作区还没有人物卡，考虑先写 characters/人物名.md）')
-        }
-        if (value.settings && value.settings.length) {
-          parts.push(
-            `\n## 相关设定（${value.settings.length}）\n` +
-              value.settings.map(item => `### ${item.name}${item.category ? `（${item.category}）` : ''}\n${item.content}`).join('\n\n'),
-          )
-        }
-        if (value.threads.length) {
-          parts.push(
-            '\n## 待回收伏笔\n' +
-              value.threads.map(item => `- ${item.thread}（埋于 ${item.planted || '未记'}${item.payoff ? `，预定回收 ${item.payoff}` : ''}）`).join('\n'),
-          )
-        }
-        if (value.style && value.style.present) {
-          parts.push(`\n## 本作文风（${value.style.name}）—— 照着这套句子写，别只把情节填满\n${value.style.text}`)
-        }
-        if (rewrite) {
-          parts.push(
-            '\n## 改写要求\n1. 情节骨架、人物动作、信息点全部保留，一个都不能少；\n2. 句子按上面的锚点重写：句长、断句、用词习惯跟着锚点走；\n3. 禁忌词一个都不许出现；\n4. 章纲里的每一条场景都要在改写稿里找得到落点；\n5. 写完后用 `novel_write({ chapter: "' +
-              value.chapter.id +
-              '", content: "<改好的正文>", mode: "replace" })` 落盘（会自动把旧稿备份到 chapters/.history/）。',
-          )
-        }
-        if (value.pass === 'deai') {
-          const toneHits = value.aiTone || []
-          const list = toneHits.length
-            ? toneHits
-                .map(item => `- ${item.label}（${item.count} 处）${item.samples && item.samples.length ? `：${item.samples[0]}` : ''}`)
-                .join('\n')
-            : '- （没检测到可指认的 AI 腔，但纪律照用）'
-          parts.push(`\n## 本章检测到的 AI 腔（${toneHits.length} 类）\n${list}`)
-          parts.push(`\n${value.rewriteRules}`)
-        }
-        if (value.warnings && value.warnings.length) {
-          parts.push('\n## ⚠ 动笔之前\n' + value.warnings.map(item => `- ${item}`).join('\n'))
-        }
-        parts.push(`\n（装配包合计 ${value.budgetUsed} 字）`)
-        return textRender(parts.join('\n'))
-      },
+      render: (_args, value) => textRender(value.prompt),
     },
     execute: async args => {
+      if (args.mode !== 'rewrite' && (args.rewriteStart !== undefined || args.rewriteLimit !== undefined)) throw new Error('分段参数仅用于 rewrite 模式')
+      if (args.rewriteLimit !== undefined && args.rewriteStart === undefined) throw new Error('rewriteLimit 需要同时提供 rewriteStart')
       const { meta } = await loadBook(rootNow())
       const chapters = []
       for (const chapter of meta.chapters) chapters.push(await chapterStats(rootNow(), chapter, meta.targetChars))
@@ -3623,7 +3634,7 @@ export function apply(ctx, config) {
       // 章纲优先：有这一章的 beats 就按清单配额给它，大纲退成背景参考。
       const beats = await readBeats(rootNow(), current)
       const beatsText = beats.section
-        ? Array.from(beats.section.body).slice(0, Math.max(200, Math.min(1200, Math.round(budget * 0.4)))).join('')
+        ? beats.section.body
         : ''
       const sceneText = `${beatsText}\n${outlinePart}`
 
@@ -3687,7 +3698,7 @@ export function apply(ctx, config) {
           characters.push({
             name: card.name,
             state: state ? { chapter: state.chapter, label: state.label, dead: state.dead } : null,
-            content: Array.from(content.trim()).slice(0, 400).join(''),
+            content: content.trim(),
           })
         }
       }
@@ -3718,7 +3729,7 @@ export function apply(ctx, config) {
           voided.push(item.name)
           continue
         }
-        if (content !== null) settings.push({ name: item.name, category: item.category, content: Array.from(content.trim()).slice(0, 300).join('') })
+        if (content !== null) settings.push({ name: item.name, category: item.category, content: content.trim() })
       }
 
       // 设定是「当下用不到」的那一类，模型最容易把它写成 outline 里的散文。这里主动拦一道。
@@ -3738,32 +3749,23 @@ export function apply(ctx, config) {
       const styleBudget = rewrite
         ? Math.max(800, Math.min(3000, Math.round(budget * 0.6)))
         : Math.max(1100, Math.min(2800, Math.round(budget * 0.6)))
-      const styleText = styleRaw ? stylePromptText(styleRaw, styleBudget) : ''
+      const styleAssembly = assembleStylePrompt(styleRaw, styleBudget)
+      const styleText = styleAssembly.text
 
       // 改写模式要带回这一章现有的正文：没有它，「按文风重写」就变成「重新写一遍」。
       let chapterText = ''
       let rawChapter = ''
-      if (current.chars > 0) {
+      if (current.file) {
         rawChapter = (await readText(path.join(rootNow(), current.file))) ?? ''
-        if (rewrite) chapterText = Array.from(rawChapter.trim()).slice(0, 6000).join('')
+        if (rewrite) chapterText = rawChapter
       }
       // 「去 AI 味」：带上改写纪律 + 本章能指认的 AI 腔清单（检测在宿主算，省得模型自己数）。
       const deai = args.pass === 'deai'
       const tone = deai && rawChapter ? detectAiTone(rawChapter) : { signals: [], total: 0 }
 
-      const budgetUsed =
-        countChars(beatsText) +
-        countChars(styleText) +
-        countChars(chapterText) +
-        countChars(outlinePart) +
-        countChars(prevTailText) +
-        characters.reduce((sum, item) => sum + countChars(item.content), 0) +
-        threadRows.reduce((sum, item) => sum + countChars(item.thread), 0) +
-        settings.reduce((sum, item) => sum + countChars(item.content), 0) +
-        spine.reduce((sum, item) => sum + countChars(item.because) + countChars(item.so), 0) +
-        (deai ? countChars(DEAI_RULES) : 0)
-
-      return {
+      const selected = rewriteSelection(rawChapter, args.rewriteStart, args.rewriteLimit)
+      if (rewrite) chapterText = selected.text
+      return assembleNovelContext({
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: { present: Boolean(beats.section), heading: beats.section ? beats.section.heading : '', text: beatsText, infos: beats.section ? beats.section.infos ?? [] : [] },
         rhythm,
@@ -3773,7 +3775,7 @@ export function apply(ctx, config) {
         characters,
         settings,
         threads: threadRows,
-        style: { name: styleName, present: Boolean(styleText), text: styleText },
+        style: { name: styleName, present: Boolean(styleText), ...styleAssembly },
         mode: rewrite ? 'rewrite' : 'continue',
         chapterText,
         settingsCount: settingItems.length,
@@ -3781,8 +3783,8 @@ export function apply(ctx, config) {
         pass: deai ? 'deai' : '',
         rewriteRules: deai ? DEAI_RULES : '',
         aiTone: deai ? tone.signals : [],
-        budgetUsed,
-      }
+        rewriteScope: selected.scope,
+      }, budget)
     },
     presentCall: args => ({ card: 'generic', title: '取上下文装配包', kind: 'read', rawInput: args }),
   })
@@ -4076,14 +4078,21 @@ export function apply(ctx, config) {
         required: ['ok', 'chars', 'issues'],
       },
       render: (_args, value) => {
+        const review = value.styleReview
+        const reviewLines = review ? [
+          ...review.warnings.map(item => `格式提醒：${item}`),
+          ...(review.limitedCount ? [`少用词命中 ${review.limitedCount} 处（仅提醒，不判违规）：`, ...review.limited] : []),
+          ...(review.semantic.length ? ['语义禁忌待会话 AI 复核（尚未判定）：', ...review.semantic] : []),
+        ] : []
         if (!value.issues.length) {
-          return textRender(`没问题。${value.chars} 字${value.target ? `（目标 ${value.target}）` : ''}。`)
+          return textRender([`自动检查未发现问题。${value.chars} 字${value.target ? `（目标 ${value.target}）` : ''}。`, ...reviewLines].join('\n'))
         }
         const lines = [`查到 ${value.issues.length} 类问题（${value.chars} 字${value.target ? `，目标 ${value.target}` : ''}）：`]
         for (const issue of value.issues) {
           lines.push(`- [${issue.kind}] ${issue.detail}`)
           for (const sample of issue.samples ?? []) lines.push(`    · ${sample}`)
         }
+        lines.push(...reviewLines)
         return textRender(lines.join('\n'))
       },
     },
@@ -4243,12 +4252,15 @@ export function apply(ctx, config) {
       const styleName = activeStyleName(meta)
       const styleRaw = styleName ? await readStyle(rootNow(), styleName) : null
       if (styleRaw) {
-        const hits = styleBanned(styleRaw).filter(word => text.includes(word))
+        const restrictions = parseStyleRestrictions(styleRaw)
+        const hits = styleRestrictionMatches(text, restrictions.banned)
         if (hits.length) {
-          report.issues.push({
-            kind: 'style-banned',
-            detail: `文风卡「${styleName}」的禁忌里写着不要出现：${hits.map(word => `「${word}」`).join('、')}`,
-          })
+          report.issues.push({ kind: 'style-banned', detail: `命中文风卡「${styleName}」的禁用词或整句，共 ${hits.length} 处。`, count: hits.length, samples: hits.slice(0, 20) })
+        }
+        const limited = styleRestrictionMatches(text, restrictions.limited)
+        report.styleReview = {
+          limited: limited.slice(0, 20), limitedCount: limited.length,
+          semantic: restrictions.semantic, warnings: restrictions.warnings,
         }
         const fitSample = await readStyleSample(rootNow(), styleName)
         const fit = styleFit(text, styleRaw, fitSample && fitSample.present ? fitSample.text : "")
