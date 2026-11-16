@@ -445,9 +445,9 @@ function validateBeatsContent(content) {
   const warnings = []
   const body = String(content ?? '')
   if (/^\s{0,3}#{1,6}\s+\d{3,4}/mu.test(body)) warnings.push('章纲里不要再写「## 数字」这种章标题：标题由插件生成（写了也会被剥掉），正文只写场景。')
-  const beats = body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s+\S/u.test(line)).length
-  if (!beats) warnings.push('一条场景都没写（应为 3–6 条：`- 场景：谁 → 在哪 → 想干什么 → 撞上什么`）。')
-  else if (beats > 8) warnings.push(`写了 ${beats} 条场景，超过 8 条：一章塞不下，考虑拆一点到下一章。`)
+  const scenes = body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s*场景\s*[：:]/u.test(line)).length
+  if (!scenes) warnings.push('一条场景都没写（应为 3–6 条：`- 场景：谁 → 在哪 → 想干什么 → 撞上什么`）。')
+  else if (scenes > 8) warnings.push(`写了 ${scenes} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。`)
   return warnings
 }
 
@@ -4356,7 +4356,7 @@ export function apply(ctx, config) {
     name: 'novel_beats',
     description:
       '章纲：每章一节写在 beats.md（二级标题 `## <章 id> <标题>`），内容是这一章要拍的场景清单。不传参 = 看全书章纲覆盖情况；给 chapter = 读这一章的章纲；给 chapter + content = 覆盖写这一章（别的章一个字都不动）。写正文前先看章纲，比只看大纲更准。' +
-      '\n\n【格式约定】`## 0003 第三章 标题` 开头，下面 3–6 条 `- 场景：谁 → 在哪 → 想干什么 → 结果撞上什么`；一章只推进一件事，不要在一章里塞三个转折。写章纲时不写对白和描写，那不是它的活。' +
+      '\n\n【格式约定】`## 0003 第三章 标题` 开头，下面 3–6 条 `- 场景：谁 → 在哪 → 想干什么 → 结果撞上什么`；一章只推进一件事，不要在一章里塞三个转折。写章纲时不写对白和描写，那不是它的活。\n\n【没有行数上限】只有「场景」数有建议值（3–6 场，超过 8 场插件会提醒拆章）；`- 心里：`/`- 反应：`/`- 信息：`/`- 落点：`/`- 钩子：` 都不算「场」，写多少都原样保存，插件不会丢弃任何一行。' +
       '\n\n【- 心里：另起一行，紧跟在它所解释的那一场下面】格式 `- 心里：他想起…`，独立成条——' +
       '塞在「场景：」那一行里不会被统计，装配包也不会单独列出来。' +
       '①写主角（视角人物）的念头，不是配角的（写配角那是人物卡的事）；' +
