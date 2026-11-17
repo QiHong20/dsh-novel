@@ -68,6 +68,12 @@ async function sessionDirectory(ctx, sessionId, exec) {
   if (agent && directories && typeof directories.ensure === 'function') {
     try {
       const cwd = await directories.ensure(agent, exec ? exec.signal : undefined)
+      // ensure() 对「没设过目录」的会话会回进程 cwd；header 另有其地时以 header 为准
+      if (typeof cwd === 'string' && cwd !== '' && agent && agent.session) {
+        const hd = agent.session.header ?? agent.session.meta
+        const hc = hd && typeof hd.cwd === 'string' ? hd.cwd : ''
+        if (hc !== '' && path.resolve(cwd) === path.resolve(process.cwd()) && path.resolve(hc) !== path.resolve(process.cwd())) return hc
+      }
       if (typeof cwd === 'string' && cwd !== '') return cwd
     } catch {}
   }
@@ -255,7 +261,8 @@ function characterSummary(text) {
 }
 
 // ---- 人物状态（生死/在场）时间线 --------------------------------------------
-const DEAD_WORDS = /(去世|死亡|死|殁|阵亡|身亡|牺牲|遇难|丧命|死去|不在了)/u
+const STATE_CODES = ['在世', '去世', '已故', '失踪', '假死', '复活', '远走']
+const DEAD_WORDS = /(去世|死亡|身亡|殁|阵亡|遇难|丧命|死去|丧生|断气|咽气|暴毙|被杀|身故)/u
 const ALIVE_CLAUSE = /(没死|未死|不死|假死|装死|没去世|未去世|没牺牲|没遇难|不是死|诈死)/gu
 
 /**
@@ -282,7 +289,10 @@ function parseStates(text) {
     if (!split) continue
     const label = split[2].trim()
     if (!label) continue
-    states.push({ chapter: split[1].padStart(4, '0'), label, dead: DEAD_WORDS.test(label.replace(ALIVE_CLAUSE, '')) })
+    // 先认状态码（唯一可靠判据），认不出才退回关键词，并标记为老格式
+    const code = STATE_CODES.find(item => label.startsWith(item)) ?? ''
+    const dead = code === '' ? DEAD_WORDS.test(label.replace(ALIVE_CLAUSE, '')) : code === '去世' || code === '已故'
+    states.push({ chapter: split[1].padStart(4, '0'), label, code, legacy: code === '', dead })
   }
   states.sort((a, b) => a.chapter.localeCompare(b.chapter))
   return states
@@ -349,6 +359,13 @@ function validateCardContent(content) {
   if (badState.length) {
     warnings.push(
       `「状态」里 ${badState.length} 行不是「@章id 状态」格式（必须以 @ 加四位章 id 开头），读不到：${badState.slice(0, 3).map(item => '「' + item.slice(0, 18) + '」').join(' / ')}`,
+    )
+  }
+  const coded = /^@\s*\d{3,4}\s*[：:，,]?\s*(在世|去世|已故|失踪|假死|复活|远走)/u
+  const legacyState = states.filter(line => /^@\s*\d{3,4}/u.test(line) && !coded.test(line))
+  if (legacyState.length) {
+    warnings.push(
+      `「时间线」里 ${legacyState.length} 行没写状态码（${legacyState.slice(0, 2).map(item => '「' + item.slice(0, 16) + '」').join(' / ')}）：改成「@章id 状态码｜说明」，状态码只有 在世/去世/已故/失踪/假死/复活/远走 七个。不写状态码插件只能靠关键词猜——「死账」「死对头」就会被当成死人。`,
     )
   }
   if (/@\s*\d{3,4}\s*[-~]\s*\d{3,4}/u.test(body)) warnings.push('用了 `@0003-0008` 区间写法：现在只认起始章，后面的终点会被忽略。')
@@ -841,10 +858,12 @@ function assembleStylePrompt(text, maxChars) {
     // 保留列表条目的续行、正例与引用，不再只拿前两条。
     const chunks = body.split(/(?=^[-*+][ \t]+)/mu).filter(chunk => chunk.trim())
     chunks.forEach((chunk, i) => {
-      const priority = /\[必选\]/u.test(chunk) || /核心|视角|叙述权限/u.test(heading) ? 0
-        : /禁忌/u.test(heading) ? 1
-        : /反例|正例/u.test(heading) || /^[-*+]\s*正例/u.test(chunk) ? 4 : 2
-      add(`${heading} · ${i + 1}`, `## ${heading}\n${chunk}`, priority)
+      const priority = /\[必选\]/u.test(chunk) || /核心|视角|叙述权限|格式|面板|模板|专有/u.test(heading) ? 0
+        : /锚点/u.test(heading) ? 1
+        : /禁忌/u.test(heading) ? 2
+        : /反例|正例/u.test(heading) || /^[-*+]\s*正例/u.test(chunk) ? 4 : 3
+      // 标题只随第一条出现：一节 27 条禁忌不该把标题刷 27 遍，那会把预算吃光
+      add(`${heading} · ${i + 1}`, i === 0 ? `## ${heading}\n${chunk}` : chunk, priority)
     })
   }
   candidates.sort((a, b) => a.priority - b.priority)
@@ -1250,6 +1269,26 @@ function assembleNovelContext(value, budget) {
     )
   }
   add('beats', '本章章纲', value.beats.text, true)
+  const interiorLines = value.beats && Array.isArray(value.beats.interiors) ? value.beats.interiors : []
+  if (interiorLines.length) {
+    add(
+      'interiors',
+      '这一章他心里的话（逐字写进正文，别改写成旁白）',
+      interiorLines.map(item => '- 情绪：' + (item.mood || '（没写情绪）') + '\n  台词：' + (item.line || item.text)).join('\n') +
+        '\n\n这些是内心台词：正文里要把台词和情绪都用上（可拆开、可夹在动作里），但别把「暗爽」写成「他心里感到一阵喜悦」这种旁白。',
+      true,
+    )
+  }
+  const cognitionRows = value.beats && Array.isArray(value.beats.cognition) ? value.beats.cognition : []
+  if (cognitionRows.length) {
+    add(
+      'cognition',
+      '本章认知起点（他此刻还不知道什么）',
+      cognitionRows.map(item => '- ' + item.text).join('\n') +
+        '\n\n写的时候守住这条边界：他知道的照常写，不知道的别让角色装懂——不知道该愣就问、该误判就误判，别一开口就像本地老手。',
+      true,
+    )
+  }
   add('rewriteRules', '改写纪律', value.rewriteRules, true)
   add('style', `文风：${value.style.name}`, value.style.text, true)
   if (value.rhythm && value.rhythm.present) add('rhythm', '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
@@ -1591,6 +1630,7 @@ function parseBeatSections(text) {
       infos: parseBeatInfos(body),
       shifts: parseBeatShifts(body),
       interiors: parseBeatInteriors(body),
+    cognition: parseBeatCognition(body),
     reactions: parseBeatReactions(body),
       events: parseBeatEventRefs(body),
     }
@@ -1644,6 +1684,26 @@ function parseBeatReactions(body) {
   return hits
 }
 
+const INTERIOR_MOODS = ['暗爽', '得意', '憋屈', '火', '慌', '心凉', '发狠', '松口气', '不耐', '恶心', '钝痛', '疑惑', '心疼', '讽刺']
+
+/**
+ * 「- 心里：情绪｜台词」：只有情绪没有台词会变成旁白复述，只有台词没有情绪读者抓不到态度。
+ */
+/**
+ * 「- 认知：…」：这一章他此刻**不知道**什么。比人物卡更有效——人物卡说身份，认知说边界。
+ */
+function parseBeatCognition(body) {
+  const rows = []
+  String(body ?? '')
+    .replace(/\r\n/gu, '\n')
+    .split('\n')
+    .forEach((line, index) => {
+      const match = /^\s*[-*+]?\s*(?:认知|知道什么|认知边界)\s*[：:]\s*(.+)$/u.exec(line)
+      if (match) rows.push({ index, text: match[1].trim().slice(0, 200) })
+    })
+  return rows
+}
+
 function parseBeatInteriors(body) {
   const rows = []
   String(body ?? '')
@@ -1651,7 +1711,12 @@ function parseBeatInteriors(body) {
     .split('\n')
     .forEach((line, index) => {
       const match = /^\s*[-*+]?\s*(?:心里|心理|念头|回忆)\s*[：:]\s*(.+)$/u.exec(line)
-      if (match) rows.push({ index, text: match[1].trim().slice(0, 160) })
+      if (!match) return
+      const raw = match[1].trim()
+      const parts = raw.split(/[｜|]/u)
+      const mood = parts.length > 1 ? parts[0].trim() : ''
+      const words = (parts.length > 1 ? parts.slice(1).join('｜').trim() : raw).slice(0, 200)
+      rows.push({ index, text: raw.slice(0, 200), mood, line: words })
     })
   return rows
 }
@@ -1983,6 +2048,7 @@ async function readBeats(root, chapter) {
             infos: section.infos,
             events: section.events,
             interiors: section.interiors,
+    cognition: section.cognition,
             reactions: section.reactions,
             shifts: section.shifts,
           }
@@ -2048,7 +2114,7 @@ async function beatsCoverage(root, chapters) {
  */
 function beatCoverage(text, beatsText) {
   const source = String(text ?? '')
-  const markerPattern = /^(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|备注|注)\s*[：:]/u
+  const markerPattern = /^(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|认知|备注|注)\s*[：:]/u
   const rawLines = String(beatsText ?? '')
     .split('\n')
     .map(line => line.replace(/^\s*[-*+]\s*/u, '').trim())
@@ -3304,6 +3370,15 @@ export function apply(ctx, config) {
       if (beat.section && beat.section.chars > 0) {
         // 章纲有「场」有「位移」，却一条「心里」都没写：正文十有八九会写成流水线。
         const interiors = Array.isArray(beat.section.interiors) ? beat.section.interiors : []
+        if (interiors.length) {
+          const flat = interiors.filter(item => !item.mood || !INTERIOR_MOODS.includes(item.mood))
+          if (flat.length) {
+            report.issues.push({
+              kind: 'flat-interior',
+              detail: `章纲有 ${flat.length} 条「心里」只写了概述，没有情绪台词：${flat.slice(0, 2).map(item => '「' + item.text.slice(0, 24) + '」').join(' / ')}。改成「情绪｜台词」，情绪取 ${INTERIOR_MOODS.join('/')} 之一，台词写能直接抄进正文的口语——「他过了一遍规矩」是案情摘要，「卧槽，穿越者的标配吧这是」才是内心。`,
+            })
+          }
+        }
         if (!interiors.length) {
           warnings.push(
             '章纲里一条「- 心里：」都没写。场景写的是"他做了什么"，心里写的是"他想到什么"——没有后者，' +
@@ -3324,7 +3399,7 @@ export function apply(ctx, config) {
           let infoIdx = 0
           let movingScene = false
           for (const line of beatLines) {
-            const isScene = hasExplicitScenes ? /^\s*[-*+]?\s*场景\s*[：:]/u.test(line) : (line.trim().length >= 6 && !/^\s*[-*+]?\s*(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|备注|注|事件)\s*[：:]/u.test(line))
+            const isScene = hasExplicitScenes ? /^\s*[-*+]?\s*场景\s*[：:]/u.test(line) : (line.trim().length >= 6 && !/^\s*[-*+]?\s*(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|认知|备注|注|事件)\s*[：:]/u.test(line))
             const isInfo = /^\s*[-*+]?\s*信息\s*[：:]/u.test(line)
             if (isScene) {
               sceneIdx += 1
