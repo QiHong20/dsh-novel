@@ -3373,10 +3373,9 @@ export function apply(ctx, config) {
         if (interiors.length) {
           const flat = interiors.filter(item => !item.mood || !INTERIOR_MOODS.includes(item.mood))
           if (flat.length) {
-            report.issues.push({
-              kind: 'flat-interior',
-              detail: `章纲有 ${flat.length} 条「心里」只写了概述，没有情绪台词：${flat.slice(0, 2).map(item => '「' + item.text.slice(0, 24) + '」').join(' / ')}。改成「情绪｜台词」，情绪取 ${INTERIOR_MOODS.join('/')} 之一，台词写能直接抄进正文的口语——「他过了一遍规矩」是案情摘要，「卧槽，穿越者的标配吧这是」才是内心。`,
-            })
+            warnings.push(
+              `章纲有 ${flat.length} 条「心里」只写了概述，没有情绪台词：${flat.slice(0, 2).map(item => '「' + item.text.slice(0, 24) + '」').join(' / ')}。改成「情绪｜台词」，情绪取 ${INTERIOR_MOODS.join('/')} 之一，台词写能直接抄进正文的口语——「他过了一遍规矩」是案情摘要，「卧槽，穿越者的标配吧这是」才是内心。`,
+            )
           }
         }
         if (!interiors.length) {
@@ -4601,8 +4600,7 @@ export function apply(ctx, config) {
           lines.push(`**待审原文**：${item.text}`)
           if (item.next) lines.push(`> [后文语境] ${item.next}`)
         }
-        return textRender(lines.join('
-'))
+        return textRender(lines.join('\n'))
       },
     },
     execute: async args => {
