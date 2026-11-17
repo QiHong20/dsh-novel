@@ -4606,7 +4606,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_deai_pack',
     description:
-      '交付前阅读全文审稿：返回全部非空段落（含普通叙述）、人物声口和完整文风卡。机械标签仅供定位；须审查时间压力、细节堆叠、人物声口、叙述与节奏、事实保留。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
+      '交付前阅读全文审稿：返回全部非空段落、当前章纲、场景对白审稿钩子、人物卡和完整文风卡。逐段结合现场、说话目的、听者与时间压力判断对白，不按固定句式替换。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
     parameters: {
       type: 'object',
       properties: {
@@ -4627,6 +4627,7 @@ export function apply(ctx, config) {
           items: { type: 'array', items: { type: 'object', additionalProperties: true } },
           rules: { type: 'string' },
           style: { type: 'object', additionalProperties: true },
+          dialogueContext: { type: 'object', additionalProperties: true },
         },
       },
       render: (_args, value) => {
@@ -4642,6 +4643,7 @@ export function apply(ctx, config) {
           }
         }
         lines.push('仅以代称出场或尚未匹配的角色，请用 novel_card 补读人物卡；不要由缺少卡片推断人物没有声口约束。')
+        lines.push('', '## 本章场景与认知约束（按对白场景钩子逐段核对）', value.dialogueContext.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
         if (value.style.text) lines.push('', `## 文风样本与约束：${value.style.name}`, value.style.text)
         lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review。')
         for (const item of value.items) {
@@ -4664,11 +4666,13 @@ export function apply(ctx, config) {
       }
       const packed = extractDeaiPack(raw, cards)
       const styleName = activeStyleName(meta)
+      const beats = await readBeats(rootNow(), chapter)
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
         rules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
         style: { name: styleName, text: styleName ? (await readStyle(rootNow(), styleName)) ?? '' : '' },
+        dialogueContext: { beats: beats.section?.body ?? '' },
       }
     },
     presentCall: args => ({ card: 'generic', title: `全文语义审稿 ${args.chapter}`, kind: 'read', rawInput: args }),
@@ -4689,7 +4693,26 @@ export function apply(ctx, config) {
         },
         paragraphs: {
           type: 'array', minItems: 1, description: '覆盖最终审稿包全部段落，每段写出结合原文的保留理由；仍有待改问题时先修改，不要登记完成。',
-          items: { type: 'object', additionalProperties: false, properties: { index: { type: 'integer', minimum: 1 }, reason: { type: 'string', minLength: 1 } }, required: ['index', 'reason'] },
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              index: { type: 'integer', minimum: 1 },
+              reason: { type: 'string', minLength: 1 },
+              dialogue: {
+                type: 'object', additionalProperties: false, description: '带对话标签的段落必填；先区分实际对白、内心、引用和无法确定。实际对白须填写说话者、听者、目的、现场压力与措辞判断；包含多轮对白时逐轮写在对应字段中。',
+                properties: {
+                  kind: { type: 'string', enum: ['speech', 'thought', 'quotation', 'uncertain'] },
+                  speaker: { type: 'string', description: '谁在说；无法确定时明确写出，不凭空指定' },
+                  listener: { type: 'string', description: '说给谁听，以及对方此刻知道什么' },
+                  intent: { type: 'string', description: '此刻想让对方知道、相信或做什么，依据正文和章纲判断' },
+                  pressure: { type: 'string', description: '剩余时间、正在进行的动作及双方关系怎样影响这句话' },
+                  assessment: { type: 'string', description: '措辞是否清楚、符合声口、能完成目的；省略或狠话是否需要读者解码，说明保留理由' },
+                },
+                required: ['kind'],
+              },
+            },
+            required: ['index', 'reason'],
+          },
         },
       },
       required: ['chapter', 'baseHash', 'checks', 'paragraphs'],
@@ -4710,7 +4733,14 @@ export function apply(ctx, config) {
       const paragraphs = args.paragraphs
       const indices = new Set(Array.isArray(paragraphs) ? paragraphs.map(item => item?.index) : [])
       if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖最终版本全文并说明保留理由，不能遗漏或重复；未登记')
-      chapter.deaiReview = { version: 1, baseHash: packed.baseHash, reviewedAt: new Date().toISOString(), checks: args.checks, paragraphs }
+      const byIndex = new Map(paragraphs.map(item => [item.index, item]))
+      for (const item of packed.items) {
+        if (!item.tags.includes('对话')) continue
+        const dialogue = byIndex.get(item.index).dialogue
+        if (!dialogue || !['speech', 'thought', 'quotation', 'uncertain'].includes(dialogue.kind)) throw new Error(`第 ${item.index} 段缺少引语类型判断；未登记`)
+        if (dialogue.kind === 'speech' && ['speaker', 'listener', 'intent', 'pressure', 'assessment'].some(key => typeof dialogue[key] !== 'string' || !dialogue[key].trim())) throw new Error(`第 ${item.index} 段必须结合实际场景填写完整对白判断；未登记`)
+      }
+      chapter.deaiReview = { version: 2, baseHash: packed.baseHash, reviewedAt: new Date().toISOString(), checks: args.checks, paragraphs }
       await persistBook(root, meta, meta.chapters)
       return { chapter: chapter.id, baseHash: packed.baseHash, reviewedParagraphs: paragraphs.length }
     },
@@ -5965,7 +5995,16 @@ function detectAiTone(text) {
   return { signals, total }
 }
 
-/** 改写纪律（从 qu-ai-wei 的仲裁顺序与禁令压缩而来）。 */
+/** 由会话模型结合完整场景审查对白，代码不推断人物意图或替换台词。 */
+const DIALOGUE_REVIEW_RULES = [
+  '对白场景钩子：先定位这句话所在的现场，再判断说法。',
+  '逐段区分实际对白、内心、引用和无法确定；实际对白逐轮核对谁对谁说、想让对方知道或做什么、对方已知什么、时间压力与手上动作，以及人物关系和说话习惯。没有明确依据时先补读，不补造人物动机。',
+  '检查表达能否当场被听懂：省略的对象、指代和后果是否清楚，是否为了狠话、金句或陌生搭配而让听者解码；正常省略、行话和人物特有表达可保留。先保留说话目的，再选择贴合现场的说法。',
+  '危机中检查解释是否有必要和时间，不一律缩成喊话；平静交涉允许完整表达、试探和绕弯。不把身份差异改成统一的日常口语，也不改变威胁程度、承诺、事实和事件结果。',
+  '最终复核的 paragraphs 中，带对话标签的段落填写 dialogue.kind；实际对白填写 speaker、listener、intent、pressure、assessment。多轮对白逐轮说明，同段混有实际对白与内心或引用时按实际对白审查；纯内心或引用在 reason 中解释分类依据。发现需要修改时先回写，再重新获取审稿包。',
+].join('\n')
+
+/** 写作约束与审稿钩子共用，避免只在改写后补救。 */
 const DEAI_RULES = [
   '写作与语义审稿纪律：',
   '1. 保留事实、情节、人物意图、数字、设定和有效信息；不补造因果、动机、动作，不把可能改成确定。台词可调整表达，不能改变其信息、承诺和人物关系。',
@@ -5974,13 +6013,14 @@ const DEAI_RULES = [
   '4. 核对场景时间：倒计时、动作、观察、回忆和交涉是否相容；删减或调整拖慢现场的说明，不擅自修改倒计时数值或事件结果。',
   '5. 检查细节是否反复证明同一标签、旁白是否重复解释已演出的意义、句段是否固定为动作—体感—总结、冲突是否只为剧情服务。保留有信息或声口价值的细节，不机械删修辞。',
   '6. 优先级：事实原意 > 作者文风与角色声口 > 场景自然度 > 原句式。只修有问题的地方；对照原稿核实信息保留，并说明保留与修改的理由。',
+  DIALOGUE_REVIEW_RULES,
 ].join('\n')
 
-const DEAI_WORKFLOW = '交付前先调用 novel_deai_pack({chapter}) 阅读全文、人物声口与文风卡；有问题才用 novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}) 一次提交多个修改。修改后重新取包，核对全文事实与表达；逐段说明保留理由，并以 timing（时间压力）、voice（角色声口）、narration（细节与解释）、rhythm（句段与冲突）、facts（事实保留）五项 checks 调用 novel_deai_review({chapter,baseHash,checks,paragraphs:[{index,reason}]}），最后运行 novel_check。正文变化后旧复核失效；机械零命中不代表自然，不为消除线索强改正常表达。本流程替代旧版强制洗稿或整章重写要求。'
+const DEAI_WORKFLOW = '交付前先调用 novel_deai_pack({chapter}) 阅读全文、章纲、人物声口与文风卡，按场景对白钩子审查台词；有问题才用 novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}) 一次提交多个修改。修改后重新取包，核对全文事实与表达；逐段说明保留理由，带对话标签的段落另填 dialogue 分类和场景判断，并以 timing（时间压力）、voice（角色声口）、narration（细节与解释）、rhythm（句段与冲突）、facts（事实保留）五项 checks 调用 novel_deai_review({chapter,baseHash,checks,paragraphs:[{index,reason,dialogue}]}），最后运行 novel_check。正文变化后旧复核失效；机械零命中不代表自然，不为消除线索强改正常表达。本流程替代旧版强制洗稿或整章重写要求。'
 
 const DEAI_REVIEW_ASPECTS = {
   timing: '核对倒计时与动作、观察、解释、交涉是否相容，指出具体段落依据；无倒计时也检查场景时间。',
-  voice: '对照人物说话方式和认知，检查角色是否雷同；未匹配人物卡时先补读，说明依据。',
+  voice: '对照场景、人物认知、关系与说话目的，检查对白是否当场听得懂、是否为了狠话而生硬压缩，检查角色是否雷同；逐段提交 dialogue 判断，未匹配人物卡时先补读。',
   narration: '检查细节堆叠、旁白解释、标签重复和过度总结，指出保留细节的作用。',
   rhythm: '对照文风锚点检查固定句段模板、重复分镜、冲突与对白是否生硬；无文风卡时明确说明。',
   facts: '与改写前原稿及设定核对事实、意图、因果、数字和信息点；未修改时说明核对范围。',
@@ -5989,7 +6029,7 @@ const DEAI_REVIEW_ASPECTS = {
 /** 复核只对登记时的正文版本有效，不把登记记录当作自动自然度认证。 */
 function hasCurrentDeaiReview(chapter, text) {
   const review = chapter.deaiReview
-  return review?.version === 1 && review.baseHash === createHash('sha256').update(text).digest('hex')
+  return review?.version === 2 && review.baseHash === createHash('sha256').update(text).digest('hex')
     && Object.keys(DEAI_REVIEW_ASPECTS).every(key => typeof review.checks?.[key] === 'string' && review.checks[key].trim())
     && Array.isArray(review.paragraphs) && review.paragraphs.length > 0
 }

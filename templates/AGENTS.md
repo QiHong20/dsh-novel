@@ -174,7 +174,7 @@ chapters/0001.md   正文，一章一个文件
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
 4. `novel_write({ chapter, content })` —— 落盘（写到接近目标字数但章纲还有场景没写完时，不要硬塞成大纲扩写，传入 `carryOver: true` 自动顺延到下一章章纲）
 5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。
-6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由，并填写 `checks` 的 `timing`（时间压力）、`voice`（角色声口）、`narration`（细节与解释）、`rhythm`（句段与冲突）、`facts`（事实保留），用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })` 登记。无须修改也要登记审稿理由。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文变化后旧复核失效，未复核不能标记 `final`。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
+6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。再填写 `checks` 的 `timing`（时间压力）、`voice`（角色声口）、`narration`（细节与解释）、`rhythm`（句段与冲突）、`facts`（事实保留），用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })` 登记。无须修改也要登记审稿理由。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文变化后旧复核失效，未复核不能标记 `final`。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。
    - `novel_write` 写完也会自动跑一次节奏比对，返回里有警告就别装没看见。
    - 右栏章节列表里挂了「漂」红标的章，就是节奏已经偏离文风卡的章。

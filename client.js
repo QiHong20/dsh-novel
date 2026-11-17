@@ -1184,7 +1184,7 @@ window.__ModuleLoader__.load({
               `【待审章节】${chapter.id} ${chapter.title}；先调用 novel_deai_pack({ chapter: ${JSON.stringify(chapter.id)} }) 阅读磁盘上的完整正文、人物声口与文风卡。\n\n` +
               `【宿主检测到的 AI 腔（${(data.signals || []).length} 类 / ${data.total || 0} 处）】\n${hits || '（没检测到可指认的套话）'}\n\n` +
               `【改写纪律】\n${data.rules || ''}`,
-            question: `审查 ${chapter.id} 全文的时间压力、人物声口、细节堆叠、旁白解释和句段模板。机械命中仅作线索，正常表达可以保留。有问题才用 novel_write({ chapter: ${JSON.stringify(chapter.id)}, mode: "patch", baseHash, patches: [{ start, end, content }] }) 一次保存多个修改。修改后重新获取 novel_deai_pack，对最终全文逐段说明保留理由，提交 novel_deai_review 的五项 checks 和全部 paragraphs，再运行 novel_check。不要根据片段覆盖整章，不改变事实和人物意图。`,
+            question: `审查 ${chapter.id} 全文的时间压力、人物声口、细节堆叠、旁白解释和句段模板。机械命中仅作线索，正常表达可以保留。有问题才用 novel_write({ chapter: ${JSON.stringify(chapter.id)}, mode: "patch", baseHash, patches: [{ start, end, content }] }) 一次保存多个修改。修改后重新获取 novel_deai_pack，对最终全文逐段说明保留理由；带对话标签的段落按场景填写 dialogue 分类与说话者、听者、目的、现场压力和措辞判断，提交 novel_deai_review 的五项 checks 和全部 paragraphs，再运行 novel_check。不要根据片段覆盖整章，不改变事实和人物意图。`,
           })
           const how = await sendToComposer(text)
           setToneNotice(

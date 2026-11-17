@@ -191,7 +191,7 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 1. **写作前约束**：普通 `novel_context({ chapter })` 和改写装配包都包含场景审稿纪律与最新交付流程，已有小说无需重建规范文件。`pass: "deai"` 额外带上机械命中线索。
 2. **阅读全文**：`novel_deai_pack({ chapter })` 返回全部非空正文段落、原文坐标、整章 `baseHash`、人物声口和完整文风卡。语义审稿覆盖时间压力、细节堆叠、过度解释、角色雷同和固定句段模板，不仅检查带标签的片段。
 3. **按需修改**：`novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次提交多个不重叠修改，所有坐标基于同一版原文。原有单片段写法仍可用；每次写入后需要重新取包，不能复用旧哈希和坐标。
-4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`，并填写 `checks` 的 `timing`、`voice`、`narration`、`rhythm`、`facts` 五项判断，再调用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })`。有待改问题先修改；无须修改也应记录具体保留理由。记录保存在 `book.json` 对应章节的 `deaiReview` 中，仅对该正文版本有效。
+4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`。带对话标签的段落另填 `dialogue.kind` 区分实际对白（`speech`）、内心（`thought`）、引用（`quotation`）或无法确定（`uncertain`）；实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，结合章纲和现场判断表达目的、听者、时间压力与措辞。再填写 `checks` 的 `timing`、`voice`、`narration`、`rhythm`、`facts` 五项判断，再调用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })`。有待改问题先修改；无须修改也应记录具体保留理由。记录保存在 `book.json` 对应章节的 `deaiReview` 中，仅对该正文版本有效。旧版未包含对白场景判断的复核记录需要重新提交。
 5. **最后自查**：`novel_check({ chapter })` 默认开启机械线索检测；`aiTone: false` 仅关闭该检测，不跳过语义复核。当前版本未复核会报 `deai-review-pending`，也不能通过 `novel_write` 标记为 `final`。修改已复核正文会使记录失效。
 6. **右栏入口与旧书**：「去AI味」按钮提示先读取完整审稿包并局部修改，不再截取 1200 字要求整章覆盖。`novel_book({ scaffold: true })` 可为旧书追加或更新插件管理的复核小节，保留原有自定义内容。
 
