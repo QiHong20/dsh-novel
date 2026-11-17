@@ -3490,6 +3490,11 @@ export function apply(ctx, config) {
           }
         }
       }
+      if (mode !== 'patch') {
+        warnings.push(
+          `【交付前必执行】在向用户交付本章前，必须调用 novel_deai_pack({ chapter: "${chapter.id}" }) 提取本章全部对话与心理/金句片段，逐条去除 AI 腔（禁止同句头接龙复读、禁止对称格言收尾、危急时短促抢话），并用 novel_write({ chapter: "${chapter.id}", mode: "patch", ... }) 局部回写后再跑 novel_check。`,
+        )
+      }
       return {
         id: chapter.id,
         title: chapter.title,
@@ -4304,7 +4309,7 @@ export function apply(ctx, config) {
         }
       }
       const report = inspectText(text, { cards, target })
-      if (args.aiTone === true) {
+      if (args.aiTone !== false) {
         const tone = detectAiTone(text)
         if (tone.signals.length > 0) {
           report.issues.push({
@@ -4549,6 +4554,75 @@ export function apply(ctx, config) {
       kind: 'read',
       rawInput: args,
     }),
+  })
+
+  registerTool({
+    name: 'novel_deai_pack',
+    description:
+      '【每章交付前必跑】提取本章全部对话（含前后1段动作语境）、心理/体感段、疑似对称金句，附上出场人物的「说话」声口与改写纪律，并给出每段精确的 start/end/baseHash 方便直接用 novel_write(mode:"patch") 局部洗稿。',
+    parameters: {
+      type: 'object',
+      properties: {
+        chapter: { type: 'string', description: '章节 id 或标题' },
+      },
+      required: ['chapter'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          chapter: { type: 'object', additionalProperties: true },
+          baseHash: { type: 'string' },
+          totalItems: { type: 'integer' },
+          voices: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          items: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          rules: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const lines = [
+          `【交付前去 AI 味切片】${value.chapter.id} ${value.chapter.title} · 共抽出 ${value.totalItems} 处（baseHash: ${value.baseHash}）`,
+          '',
+          value.rules,
+        ]
+        if (value.voices.length) {
+          lines.push('', '## 出场人物声口（改对话时必须保住）')
+          for (const v of value.voices) {
+            lines.push(`- **${v.name}**：${v.speech || '（未写说话习惯）'}${v.personality ? `｜性格：${v.personality}` : ''}`)
+          }
+        }
+        lines.push('', '## 待洗稿片段（带前后 1 段语境；改完用 novel_write({ mode: "patch", baseHash, start, end, content }) 回写）')
+        for (const item of value.items) {
+          lines.push('')
+          lines.push(`### #${item.index} [${item.tags.join(' / ')}] (start=${item.start}, end=${item.end})`)
+          if (item.prev) lines.push(`> [前文语境] ${item.prev}`)
+          lines.push(`**待审原文**：${item.text}`)
+          if (item.next) lines.push(`> [后文语境] ${item.next}`)
+        }
+        return textRender(lines.join('
+'))
+      },
+    },
+    execute: async args => {
+      const { meta } = await loadBook(rootNow())
+      const chapter = findChapter(meta.chapters, args.chapter)
+      if (!chapter) throw new Error(`没有这一章「${args.chapter}」；先 novel_status 看章节 id`)
+      const raw = (await readText(path.join(rootNow(), chapter.file))) ?? ''
+      if (!raw.trim()) throw new Error(`这一章「${chapter.id}」还是空的`)
+      const cards = []
+      for (const card of await listCharacters(rootNow())) {
+        cards.push({ name: card.name, content: (await readCharacter(rootNow(), card.name)) ?? '' })
+      }
+      const packed = extractDeaiPack(raw, cards)
+      return {
+        chapter: { id: chapter.id, title: chapter.title },
+        ...packed,
+        rules: DEAI_RULES,
+      }
+    },
+    presentCall: args => ({ card: 'generic', title: `提取去AI味切片 ${args.chapter}`, kind: 'read', rawInput: args }),
   })
 
   // ---- 章纲（大纲之下、正文之上那一层）------------------------------------
@@ -5766,21 +5840,103 @@ function detectAiTone(text) {
     }
   }
 
+  // 相邻对话同句头复读（如「现在断，…」「现在断，…」）
+  const echoHits = []
+  let prevQuoteHead = ''
+  let prevQuoteFull = ''
+  for (const para of paragraphs) {
+    const qm = /[「『"“]([^」』"”]{3,})[」』"”]/u.exec(para)
+    if (!qm) {
+      prevQuoteHead = ''
+      continue
+    }
+    const head = qm[1].replace(/[^\u4e00-\u9fff]/gu, '').slice(0, 3)
+    if (head.length >= 2 && head === prevQuoteHead) {
+      echoHits.push(`${prevQuoteFull.slice(0, 18)} ∥ ${qm[1].slice(0, 18)}`)
+    }
+    prevQuoteHead = head
+    prevQuoteFull = qm[1]
+  }
+  add('echo-dialogue', '相邻对话同句头接龙复读（真人吵架不会按同一句式对仗）', echoHits)
+
+  // 对称格言 / 镜像对比收尾（如「…看不出来。…看得出来。」「…先…，…再…」「不是…，是…」）
+  const symmetryHits = []
+  const SYMMETRY_PATTERNS = [
+    /([^。！？\n]{2,12})(?:看不出来|听不见|说不清|抓不住|管不了)。\s*[^。！？\n]{1,8}(?:看得出来|听得见|说得清|抓得住|管得了)/gu,
+    /[^。！？\n]{2,12}听得见，[^。！？\n]{2,12}听不见/gu,
+    /手上先[^，。！？\n]{1,8}，嘴上再[^，。！？\n]{1,8}/gu,
+    /不是[^，。！？\n]{2,12}，是[^。！？\n]{2,12}(?:[。！？]|$)/gu,
+  ]
+  for (const pat of SYMMETRY_PATTERNS) {
+    for (const m of body.matchAll(pat)) {
+      symmetryHits.push(aiSnippet(body, m.index ?? 0, m[0].length))
+    }
+  }
+  add('symmetry-aphorism', '对称金句/格言式收尾（去掉装深沉的工整对仗）', symmetryHits)
+
   const total = signals.reduce((sum, item) => sum + item.count, 0)
   return { signals, total }
 }
 
-/** 改写纪律（从 qu-ai-wei 的仲裁顺序与禁令压缩而来，控制在 600 字内）。 */
+/** 改写纪律（从 qu-ai-wei 的仲裁顺序与禁令压缩而来）。 */
 const DEAI_RULES = [
   '改写纪律（去 AI 味）：',
-  '1. 事实优先：情节、对话内容、人名、数字、设定名一个字都不能变，只换句子。',
-  '2. 不许补写：原文没写的因果、动机、结论，不能因为"读起来更顺"就添上。',
-  '3. 不许升级：原文是「没有证据表明」，就不能改成「证实没有」；「可能是」不能改成「就是」。',
-  '4. 受保护片段原样保留：引号里的对话、专名、数字、术语。',
-  '5. 优先级：事实原意 > 作者声口 > 自然表达 > 原来的句式（句式可以全换，声音要留住）。',
-  '6. 手法：删掉「在…的背景下」「不仅…而且」这类空转句，或把它落成具体动作；长短句交错，允许短句独立成段；对话允许打断、答非所问、省略主语。',
-  '7. 自检：如果改完比原文更整齐、更对称，那是改错了方向。',
+  '1. 事实优先：情节、人名、数字、设定名、人物口癖（如「成不成」）一个字都不能改丢。',
+  '2. 斩断同句头接龙对白：绝不允许对手用前一句相同的开头句式接龙，吵架/危机时直接抢话、粗口、反问或答非所问。',
+  '3. 删掉对称格言与升华尾音：如「表盘看不出来。他的手看得出来」「手上先知道，嘴上再说」「不是X，是Y」——改写成大白话直觉或直接删掉总结句。',
+  '4. 危急时刻不说完整科普长句：把书面的比喻和制度宣讲拆成短促喊话或动作。',
+  '5. 优先级：事实原意 > 角色声口 > 自然人话 > 原有句式。',
+  '6. 自检：如果改完比原文更整齐、更对称、更像朗诵，那是改错了方向。',
 ].join('\n')
+
+/** 提取本章全部对话（含前后1段语境）、心理/体感段与对称金句，供交付前洗稿。 */
+function extractDeaiPack(text, cards) {
+  const source = String(text ?? '')
+  const baseHash = createHash('sha256').update(source).digest('hex')
+  const lines = source.split('\n')
+  const paras = []
+  let offset = 0
+  for (const line of lines) {
+    const len = Array.from(line).length
+    if (line.trim()) {
+      paras.push({ text: line, start: offset, end: offset + len })
+    }
+    offset += len + 1
+  }
+  const symDetect = detectAiTone(source).signals.flatMap(s => s.samples ?? [])
+  const items = []
+  for (let i = 0; i < paras.length; i += 1) {
+    const cur = paras[i]
+    const tags = []
+    if (/[「『"“]/u.test(cur.text)) tags.push('对话')
+    if (INTERIOR_RE.test(cur.text) || /(他自己管这叫|他没打算|想的是|脑子里)/u.test(cur.text)) tags.push('心理/体感')
+    if (/不是[^，。！？\n]{2,12}，是|看不出来|听不见|先[^，]{1,6}，[^，]{1,6}再|像有人在/u.test(cur.text) || symDetect.some(s => cur.text.includes(s.replace(/…/g, '').slice(0, 8)))) {
+      tags.push('疑似金句/对称')
+    }
+    if (!tags.length) continue
+    items.push({
+      index: items.length + 1,
+      start: cur.start,
+      end: cur.end,
+      tags,
+      prev: i > 0 ? paras[i - 1].text.slice(0, 120) : '',
+      text: cur.text,
+      next: i + 1 < paras.length ? paras[i + 1].text.slice(0, 120) : '',
+    })
+  }
+  const voices = []
+  for (const card of cards ?? []) {
+    if (!source.includes(card.name)) continue
+    const speechHit = /^\s*[-*+]?\s*(?:说话|说话方式|口癖)\s*[：:]\s*(.+)$/mu.exec(card.content ?? '')
+    const persHit = /^\s*[-*+]?\s*(?:性格|表面)\s*[：:]\s*(.+)$/mu.exec(card.content ?? '')
+    voices.push({
+      name: card.name,
+      speech: speechHit ? speechHit[1].trim() : '',
+      personality: persHit ? persHit[1].trim() : '',
+    })
+  }
+  return { baseHash, totalItems: items.length, voices, items }
+}
 
 /** 机械自检：只做可判定的事，不做语义推断（语义那部分该由模型自己读）。 */
 function inspectText(text, { cards, target }) {
