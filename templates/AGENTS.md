@@ -23,7 +23,7 @@ chapters/0001.md   正文，一章一个文件
 | 他说 | 你要做 |
 |---|---|
 | 「拆一下这本书」「这本书帮我拆下书」 | **把它建成一本能接着写的书**：先 `novel_import({ source, dryRun: true })` 看清切出来多少章，再 `novel_import({ source, limit: N, replace: true })` 把原文**搬**进 chapters/（不要自己抄正文）→ 需要摘要时再用 `novel_write` 补 → `novel_card` 主配角 → `novel_setting` 地点/规矩/物品 → `novel_threads` 埋设与回收 → `novel_beats` 每章场景 + `→ 爽点` / `→ 钩子`。**不要交分析报告当成果** |
-| 「写第三章」/「接着写」 | `novel_context({ chapter })` 拿装配包 → 按它写 → `novel_write` → `novel_check` |
+| 「写第三章」/「接着写」 | `novel_context({ chapter })` 拿装配包 → 按它写 → `novel_write` → `novel_deai_pack` 全文审稿与必要修改 → `novel_deai_review` → `novel_check` |
 | 「这章有问题吧」/「帮我查一下」 | `novel_check({ chapter })`，然后只讲要改的三件事 |
 | 「按 XX 的风格写」 | 有文风卡就 `novel_context` 带上；没有先 `novel_style({ clone: true, source })` 克隆一张 |
 | 「加个人物」「这个人改成…」 | `novel_card`（一张一个文件，含 `## 关系` / `## 状态`） |
@@ -173,8 +173,8 @@ chapters/0001.md   正文，一章一个文件
 2. `novel_context({ chapter })` —— 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 未回收伏笔 + 相关设定」的装配包
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
 4. `novel_write({ chapter, content })` —— 落盘（写到接近目标字数但章纲还有场景没写完时，不要硬塞成大纲扩写，传入 `carryOver: true` 自动顺延到下一章章纲）
-5. **【交付前必执行】对话与心理去 AI 味洗稿**：向用户交付任何一章前，必须先调用 `novel_deai_pack({ chapter })` 提取本章**全部对话（含前后语境）、心理/体感段与对称金句**，逐条去除 AI 腔（禁止对手同句头接龙复读、禁止对称格言收尾、危急时短促抢话、保住人物卡「说话」口癖），用 `novel_write({ chapter, mode: "patch", ... })` 局部回写。
-6. `novel_check({ chapter })` —— 自查（长度 / 重复句 / 半角标点 / 未登记的人名 / 旧称 / AI 腔默认开启）；如果出现 `style-drift` 或 `ai-tone`，**当场用** `novel_context({ chapter, mode: "rewrite", pass: "deai" })` 局部修正并再自查一次。
+5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。
+6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由，并填写 `checks` 的 `timing`（时间压力）、`voice`（角色声口）、`narration`（细节与解释）、`rhythm`（句段与冲突）、`facts`（事实保留），用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })` 登记。无须修改也要登记审稿理由。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文变化后旧复核失效，未复核不能标记 `final`。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。
    - `novel_write` 写完也会自动跑一次节奏比对，返回里有警告就别装没看见。
    - 右栏章节列表里挂了「漂」红标的章，就是节奏已经偏离文风卡的章。

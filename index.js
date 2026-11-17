@@ -156,6 +156,7 @@ function normalizeChapter(entry) {
     status,
     targetChars: Number.isFinite(Number(entry.targetChars)) ? Math.max(0, Math.round(Number(entry.targetChars))) : 0,
     ...(typeof entry.note === 'string' && entry.note.trim() ? { note: entry.note } : {}),
+    ...(entry.deaiReview && typeof entry.deaiReview === 'object' ? { deaiReview: entry.deaiReview } : {}),
   }
 }
 
@@ -1289,7 +1290,7 @@ function assembleNovelContext(value, budget) {
       true,
     )
   }
-  add('rewriteRules', '改写纪律', value.rewriteRules, true)
+  add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
   add('style', `文风：${value.style.name}`, value.style.text, true)
   if (value.rhythm && value.rhythm.present) add('rhythm', '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
   value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content))
@@ -1338,8 +1339,18 @@ function applyChapterEdit(previous, args) {
   if (args.mode !== 'patch') return args.mode === 'append' && previous ? `${previous.replace(/\s+$/u, '')}\n\n${args.content}` : args.content
   if (!args.baseHash) throw new Error('局部改写必须提供上下文返回的 baseHash')
   const chars = Array.from(previous)
-  if (!Number.isInteger(args.start) || !Number.isInteger(args.end) || args.start < 0 || args.end <= args.start || args.end > chars.length) throw new Error('局部改写范围无效；未写入')
-  return chars.slice(0, args.start).join('') + args.content + chars.slice(args.end).join('')
+  const patches = args.patches ?? [{ start: args.start, end: args.end, content: args.content }]
+  if (!Array.isArray(patches) || !patches.length || patches.some(patch => !patch || typeof patch !== 'object')) throw new Error('局部改写至少需要一个有效片段；未写入')
+  const sorted = [...patches].sort((a, b) => a.start - b.start)
+  let cursor = 0
+  const parts = []
+  for (const patch of sorted) {
+    if (!patch || !Number.isInteger(patch.start) || !Number.isInteger(patch.end) || patch.start < cursor || patch.end <= patch.start || patch.end > chars.length || typeof patch.content !== 'string') throw new Error('局部改写范围无效或片段重叠；未写入')
+    parts.push(chars.slice(cursor, patch.start).join(''), patch.content)
+    cursor = patch.end
+  }
+  parts.push(chars.slice(cursor).join(''))
+  return parts.join('')
 }
 
 /** 禁忌分为字面禁止、少用提醒与待语义复核；不猜测语义规则是否违反。 */
@@ -2286,10 +2297,19 @@ async function scaffoldAgents(root) {
       '- 写正文前先 novel_context({ chapter }) 拿装配包；写完 novel_check({ chapter }) 自查。\n' +
       '- 不要用 write/edit 直接改 chapters/ 里的文件——那边没有历史快照；用 novel_write。\n'
   }
-  const exists = await fsp.access(target).then(() => true).catch(() => false)
-  if (exists) return { path: target, created: false, bytes: 0 }
-  await fsp.writeFile(target, body, 'utf8')
-  return { path: target, created: true, bytes: Buffer.byteLength(body) }
+  const previous = await readText(target)
+  const startMarker = '<!-- novel-deai:start -->'
+  const endMarker = '<!-- novel-deai:end -->'
+  const block = `${startMarker}\n## 交付前语义复核（本节替代旧版去味流程）\n\n${DEAI_WORKFLOW}\n${endMarker}`
+  const source = previous ?? body
+  const start = source.indexOf(startMarker)
+  const end = source.indexOf(endMarker, start)
+  if (start >= 0 && end < start || start < 0 && end >= 0) throw new Error('AGENTS.md 的去味流程标记不完整，请先修复标记；未写入')
+  const next = start >= 0
+    ? source.slice(0, start) + block + source.slice(end + endMarker.length)
+    : `${source}${source.endsWith('\n') ? '\n' : '\n\n'}${block}\n`
+  if (next !== previous) await writeFileAtomic(target, next)
+  return { path: target, created: previous === null, updated: previous !== null && next !== previous, bytes: Buffer.byteLength(next) }
 }
 
 async function persistBook(root, meta, chapterList) {
@@ -2309,6 +2329,7 @@ async function persistBook(root, meta, chapterList) {
       status: item.status,
       ...(item.targetChars > 0 ? { targetChars: item.targetChars } : {}),
       ...(item.note ? { note: item.note } : {}),
+      ...(item.deaiReview ? { deaiReview: item.deaiReview } : {}),
     })),
   }
   // 只有作者明确设过目标字数才落盘；默认值留在内存里用，不写进文件。
@@ -2860,7 +2881,7 @@ export function apply(ctx, config) {
         targetChars: { type: 'number', description: '每章目标字数（200–50000，整本默认）' },
         scaffold: {
           type: 'boolean',
-          description: '在工作区根目录写一份 AGENTS.md（写作规范：目录结构、人物卡/章纲/伏笔/文风卡格式、六步流程、红线）。已存在则不覆盖。',
+          description: '创建写作规范；已存在时仅追加或更新插件管理的交付复核小节，保留作者自定义内容。旧书无需更新文件也会在上下文中收到最新复核流程。',
         },
       },
       additionalProperties: false,
@@ -2888,7 +2909,9 @@ export function apply(ctx, config) {
           notes.push(
             value.scaffold.created
               ? `写作规范已写到 ${value.scaffold.path}（${value.scaffold.bytes} 字节）：目录结构、人物卡 / 章纲 / 伏笔 / 文风卡格式、六步流程都在里面，下一轮对话会被自动加载。`
-              : `${value.scaffold.path} 已经存在，没有覆盖（要重写就自己改那个文件）。`,
+              : value.scaffold.updated
+                ? `${value.scaffold.path} 的交付复核小节已更新，作者自定义内容已保留。`
+                : `${value.scaffold.path} 的交付复核小节已是最新。`,
           )
         }
         return textRender(
@@ -2926,7 +2949,7 @@ export function apply(ctx, config) {
       let scaffold = null
       if (args.scaffold === true) {
         scaffold = await scaffoldAgents(rootNow())
-        if (scaffold.created) changed.push('AGENTS.md（写作规范）')
+        if (scaffold.created || scaffold.updated) changed.push('AGENTS.md（写作规范）')
       }
       return {
         book: {
@@ -3252,7 +3275,7 @@ export function apply(ctx, config) {
     name: 'novel_write',
     description:
       '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。如果一章写到接近目标字数但章纲还有场景没写完，别硬塞成流水账，传 carryOver: true 可自动把未写完的场景顺延到下一章章纲。' +
-      '\n改写一章的标准动作：novel_context({ chapter, mode: "rewrite" }) 拿装配包；ready=false 时先调整预算或分段。优先传 rewriteStart/rewriteLimit 局部改写，再用 novel_write({ chapter, content, mode: "patch", start, end, baseHash }) 保存，旧稿自动备份。',
+      '\n改写先用 novel_deai_pack 阅读全文与声口；多个修改用 mode:"patch", baseHash, patches:[{start,end,content}] 一次提交，所有坐标均以同一版原文为准。单片段 start/end/content 仍可用。修改后重新取包并提交 novel_deai_review，再 novel_check；未完成当前版本复核不可标记 final。',
     parameters: {
       type: 'object',
       properties: {
@@ -3263,11 +3286,19 @@ export function apply(ctx, config) {
         baseHash: { type: 'string', description: '上下文返回的原文 SHA-256，patch 必填；原文改变则拒绝写入' },
         start: { type: 'integer', minimum: 0, description: 'patch 起点，Unicode 字符索引，含起点' },
         end: { type: 'integer', minimum: 1, description: 'patch 终点，Unicode 字符索引，不含终点' },
+        patches: {
+          type: 'array', minItems: 1, description: 'patch 批量替换；一次验证整章哈希，所有范围基于同一版原文，不可重叠。与顶层 start/end/content 互斥。',
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: { start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 }, content: { type: 'string' } },
+            required: ['start', 'end', 'content'],
+          },
+        },
         status: { type: 'string', enum: CHAPTER_STATUS, description: '写完后的章节状态，默认 draft' },
         note: { type: 'string', description: '一句话说明这次改动（写进历史时间线，例如「按文风重写」「补了结尾」）' },
         carryOver: { type: 'boolean', description: 'true = 把本章章纲里还没写完的场景/信息自动顺延到下一章章纲，避免硬塞' },
       },
-      required: ['content'],
+      anyOf: [{ required: ['content'] }, { required: ['patches'] }],
       additionalProperties: false,
     },
     output: {
@@ -3305,6 +3336,8 @@ export function apply(ctx, config) {
       const { meta } = await loadBook(rootNow())
       const chapters = [...meta.chapters]
       const mode = args.mode === 'patch' ? 'patch' : args.mode === 'append' ? 'append' : 'replace'
+      if (args.patches !== undefined && (mode !== 'patch' || args.content !== undefined || args.start !== undefined || args.end !== undefined)) throw new Error('patches 仅用于 patch 模式，不能同时提供顶层 start/end/content')
+      if (args.patches === undefined && typeof args.content !== 'string') throw new Error('必须提供正文 content 或 patch 模式的 patches')
       const existing = args.chapter ? findChapter(chapters, args.chapter) : undefined
 
       if (args.chapter && !existing) {
@@ -3337,6 +3370,9 @@ export function apply(ctx, config) {
       const target = path.join(rootNow(), chapter.file)
       const previous = (await readText(target)) ?? ''
       const body = applyChapterEdit(previous, { ...args, mode })
+      const reviewed = hasCurrentDeaiReview(chapter, body)
+      if (args.status === 'final' && !reviewed) throw new Error('当前正文尚未完成语义复核，请先保存草稿，调用 novel_deai_pack 和 novel_deai_review 后再标记 final；未写入')
+      if (chapter.status === 'final' && !reviewed) chapter.status = 'draft'
 
       // 覆盖/追加前先留一版完整快照（正文 + 元数据），改写是破坏性操作。
       let backup = ''
@@ -3364,7 +3400,7 @@ export function apply(ctx, config) {
       const after = await snapshot()
       const chapterTarget = chapter.targetChars > 0 ? chapter.targetChars : meta.targetChars
       // 写完顺手对一遍章纲：漏掉的场景当场说出来，别等作者读完全章才发现。
-      const warnings = validateChapterContent(args.content)
+      const warnings = validateChapterContent(body)
       const beat = await readBeats(rootNow(), chapter)
       let carriedOver = null
       if (beat.section && beat.section.chars > 0) {
@@ -3489,11 +3525,7 @@ export function apply(ctx, config) {
           }
         }
       }
-      if (mode !== 'patch') {
-        warnings.push(
-          `【交付前必执行】在向用户交付本章前，必须调用 novel_deai_pack({ chapter: "${chapter.id}" }) 提取本章全部对话与心理/金句片段，逐条去除 AI 腔（禁止同句头接龙复读、禁止对称格言收尾、危急时短促抢话），并用 novel_write({ chapter: "${chapter.id}", mode: "patch", ... }) 局部回写后再跑 novel_check。`,
-        )
-      }
+      if (!reviewed) warnings.push(`【当前版本待复核】章节 ${chapter.id}：${DEAI_WORKFLOW}`)
       return {
         id: chapter.id,
         title: chapter.title,
@@ -3963,7 +3995,7 @@ export function apply(ctx, config) {
         settingsCount: settingItems.length,
         warnings: contextWarnings,
         pass: deai ? 'deai' : '',
-        rewriteRules: deai ? DEAI_RULES : '',
+        rewriteRules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
         aiTone: deai ? tone.signals : [],
         rewriteScope: selected.scope,
       }, budget)
@@ -4224,13 +4256,13 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_check',
     description:
-      '写完一段后做机械自检（不联网、不改文件）：①人物卡里登记的旧称是否还在正文里 ②说话人是否有人物卡没登记 ③连续重复的句子 ④省略号/破折号半角写法 ⑤相对目标字数偏长偏短。给 chapter 读文件，给 text 直接查（两者都行）。只报告问题，修改由你决定。',
+      '写完后做机械自检（不联网、不改文件）：旧称、未登记说话人、重复句、标点、长度、文风与默认开启的 AI 腔线索。按章读取时同时检查当前正文的语义复核记录；给 text 直接查仅返回机械线索，不认证语义自然度。只报告，修改由会话判断。',
     parameters: {
       type: 'object',
       properties: {
         chapter: { type: 'string', description: '章节 id 或标题；给了就读这一章的文件来查' },
         text: { type: 'string', description: '直接查这段文本（给了 text 就不读文件）' },
-        aiTone: { type: 'boolean', description: '默认关。为 true 时额外查「AI 腔」（套话、段落整齐、三连排比、全完整句对话等），每条附原文片段' },
+        aiTone: { type: 'boolean', description: '默认开启，false 仅关闭机械线索检测；不跳过当前版本语义复核。命中是待审线索，不是 AI 写作判定。' },
       },
       additionalProperties: false,
     },
@@ -4261,13 +4293,17 @@ export function apply(ctx, config) {
       },
       render: (_args, value) => {
         const review = value.styleReview
-        const reviewLines = review ? [
-          ...review.warnings.map(item => `格式提醒：${item}`),
-          ...(review.limitedCount ? [`少用词命中 ${review.limitedCount} 处（仅提醒，不判违规）：`, ...review.limited] : []),
-          ...(review.semantic.length ? ['语义禁忌待会话 AI 复核（尚未判定）：', ...review.semantic] : []),
-        ] : []
+        const reviewLines = [
+          ...(value.deaiReview ? [value.deaiReview.detail] : []),
+          ...(value.aiToneReview ? [`已纳入当前版本语义复核的机械线索（${value.aiToneReview.total} 处）：`, ...value.aiToneReview.signals.map(item => `${item.label}：${item.samples.join(' / ')}`)] : []),
+          ...(review ? [
+            ...review.warnings.map(item => `格式提醒：${item}`),
+            ...(review.limitedCount ? [`少用词命中 ${review.limitedCount} 处（仅提醒，不判违规）：`, ...review.limited] : []),
+            ...(review.semantic.length ? ['语义禁忌待会话 AI 复核（尚未判定）：', ...review.semantic] : []),
+          ] : []),
+        ]
         if (!value.issues.length) {
-          return textRender([`自动检查未发现问题。${value.chars} 字${value.target ? `（目标 ${value.target}）` : ''}。`, ...reviewLines].join('\n'))
+          return textRender([`本次检查未发现待处理项；语义自然度仍以会话审稿为准。${value.chars} 字${value.target ? `（目标 ${value.target}）` : ''}。`, ...reviewLines].join('\n'))
         }
         const lines = [`查到 ${value.issues.length} 类问题（${value.chars} 字${value.target ? `，目标 ${value.target}` : ''}）：`]
         for (const issue of value.issues) {
@@ -4308,15 +4344,27 @@ export function apply(ctx, config) {
         }
       }
       const report = inspectText(text, { cards, target })
+      const chapterReview = chapter && typeof args.text !== 'string'
+      const reviewed = chapterReview && hasCurrentDeaiReview(chapter, text)
+      report.deaiReview = {
+        status: chapterReview ? reviewed ? 'reviewed' : 'pending' : 'untracked',
+        detail: chapterReview
+          ? reviewed ? '当前正文版本已登记会话语义复核；记录代表审稿依据，不是自动自然度认证。' : '当前正文版本待会话语义复核。'
+          : '本次直接检查文本，仅报告机械线索，未核验章节语义复核。',
+      }
+      if (chapterReview && !reviewed) {
+        report.issues.push({ kind: 'deai-review-pending', detail: `当前正文版本尚未登记完整语义复核。${DEAI_WORKFLOW}` })
+      }
       if (args.aiTone !== false) {
         const tone = detectAiTone(text)
-        if (tone.signals.length > 0) {
+        if (tone.signals.length > 0 && reviewed) report.aiToneReview = tone
+        if (tone.signals.length > 0 && !reviewed) {
           report.issues.push({
             kind: 'ai-tone',
             detail:
               `读到 ${tone.signals.length} 类「AI 腔」（共 ${tone.total} 处）：` +
               `${tone.signals.map(item => `${item.label}×${item.count}`).join('；')}。` +
-              '要改就整章改：novel_context({ chapter, mode: "rewrite", pass: "deai" }) 会带上改写纪律和命中清单。',
+              '这些是待人工判断的线索；结合全文、人物声口和文风样本决定是否修改，正常表达可保留并说明理由。用 novel_deai_pack 获取全文，只修有问题的片段。',
             count: tone.total,
             samples: tone.signals.slice(0, 4).map(item => `[${item.label}] ${(item.samples[0] ?? '').slice(0, 60)}`),
           })
@@ -4558,7 +4606,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_deai_pack',
     description:
-      '【每章交付前必跑】提取本章全部对话（含前后1段动作语境）、心理/体感段、疑似对称金句，附上出场人物的「说话」声口与改写纪律，并给出每段精确的 start/end/baseHash 方便直接用 novel_write(mode:"patch") 局部洗稿。',
+      '交付前阅读全文审稿：返回全部非空段落（含普通叙述）、人物声口和完整文风卡。机械标签仅供定位；须审查时间压力、细节堆叠、人物声口、叙述与节奏、事实保留。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
     parameters: {
       type: 'object',
       properties: {
@@ -4578,27 +4626,28 @@ export function apply(ctx, config) {
           voices: { type: 'array', items: { type: 'object', additionalProperties: true } },
           items: { type: 'array', items: { type: 'object', additionalProperties: true } },
           rules: { type: 'string' },
+          style: { type: 'object', additionalProperties: true },
         },
       },
       render: (_args, value) => {
         const lines = [
-          `【交付前去 AI 味切片】${value.chapter.id} ${value.chapter.title} · 共抽出 ${value.totalItems} 处（baseHash: ${value.baseHash}）`,
+          `【全文语义审稿】${value.chapter.id} ${value.chapter.title} · 全部 ${value.totalItems} 段（baseHash: ${value.baseHash}）`,
           '',
           value.rules,
         ]
         if (value.voices.length) {
           lines.push('', '## 出场人物声口（改对话时必须保住）')
           for (const v of value.voices) {
-            lines.push(`- **${v.name}**：${v.speech || '（未写说话习惯）'}${v.personality ? `｜性格：${v.personality}` : ''}`)
+            lines.push(`### ${v.name}`, v.content)
           }
         }
-        lines.push('', '## 待洗稿片段（带前后 1 段语境；改完用 novel_write({ mode: "patch", baseHash, start, end, content }) 回写）')
+        lines.push('仅以代称出场或尚未匹配的角色，请用 novel_card 补读人物卡；不要由缺少卡片推断人物没有声口约束。')
+        if (value.style.text) lines.push('', `## 文风样本与约束：${value.style.name}`, value.style.text)
+        lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review。')
         for (const item of value.items) {
           lines.push('')
           lines.push(`### #${item.index} [${item.tags.join(' / ')}] (start=${item.start}, end=${item.end})`)
-          if (item.prev) lines.push(`> [前文语境] ${item.prev}`)
           lines.push(`**待审原文**：${item.text}`)
-          if (item.next) lines.push(`> [后文语境] ${item.next}`)
         }
         return textRender(lines.join('\n'))
       },
@@ -4614,13 +4663,58 @@ export function apply(ctx, config) {
         cards.push({ name: card.name, content: (await readCharacter(rootNow(), card.name)) ?? '' })
       }
       const packed = extractDeaiPack(raw, cards)
+      const styleName = activeStyleName(meta)
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
-        rules: DEAI_RULES,
+        rules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
+        style: { name: styleName, text: styleName ? (await readStyle(rootNow(), styleName)) ?? '' : '' },
       }
     },
-    presentCall: args => ({ card: 'generic', title: `提取去AI味切片 ${args.chapter}`, kind: 'read', rawInput: args }),
+    presentCall: args => ({ card: 'generic', title: `全文语义审稿 ${args.chapter}`, kind: 'read', rawInput: args }),
+  })
+
+  registerTool({
+    name: 'novel_deai_review',
+    description: '登记会话 AI 对最终正文的语义复核，不代替审稿、不自动判定自然度。先读 novel_deai_pack 全文，发现问题先回写并重新取包；对最终版本逐段说明保留理由，再提交五项场景判断。正文变化后复核失效；最后运行 novel_check。',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        chapter: { type: 'string' },
+        baseHash: { type: 'string', description: '最终版本 novel_deai_pack 返回的整章哈希' },
+        checks: {
+          type: 'object', additionalProperties: false,
+          properties: Object.fromEntries(Object.entries(DEAI_REVIEW_ASPECTS).map(([key, description]) => [key, { type: 'string', minLength: 1, description }])),
+          required: Object.keys(DEAI_REVIEW_ASPECTS),
+        },
+        paragraphs: {
+          type: 'array', minItems: 1, description: '覆盖最终审稿包全部段落，每段写出结合原文的保留理由；仍有待改问题时先修改，不要登记完成。',
+          items: { type: 'object', additionalProperties: false, properties: { index: { type: 'integer', minimum: 1 }, reason: { type: 'string', minLength: 1 } }, required: ['index', 'reason'] },
+        },
+      },
+      required: ['chapter', 'baseHash', 'checks', 'paragraphs'],
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { chapter: { type: 'string' }, baseHash: { type: 'string' }, reviewedParagraphs: { type: 'integer' } } },
+      render: (_args, value) => textRender(`已登记 ${value.chapter} 当前版本的会话语义复核，共 ${value.reviewedParagraphs} 段。请再运行 novel_check；本记录不是自动自然度认证。`),
+    },
+    execute: async args => {
+      const root = rootNow()
+      const { meta } = await loadBook(root)
+      const chapter = findChapter(meta.chapters, args.chapter)
+      if (!chapter) throw new Error(`没有这一章「${args.chapter}」`)
+      const raw = (await readText(path.join(root, chapter.file))) ?? ''
+      const packed = extractDeaiPack(raw, [])
+      if (!raw.trim() || args.baseHash !== packed.baseHash) throw new Error('正文为空或版本已变化，请重新调用 novel_deai_pack；未登记')
+      if (!args.checks || Object.keys(DEAI_REVIEW_ASPECTS).some(key => typeof args.checks[key] !== 'string' || !args.checks[key].trim())) throw new Error('必须提交完整的五项场景判断；未登记')
+      const paragraphs = args.paragraphs
+      const indices = new Set(Array.isArray(paragraphs) ? paragraphs.map(item => item?.index) : [])
+      if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖最终版本全文并说明保留理由，不能遗漏或重复；未登记')
+      chapter.deaiReview = { version: 1, baseHash: packed.baseHash, reviewedAt: new Date().toISOString(), checks: args.checks, paragraphs }
+      await persistBook(root, meta, meta.chapters)
+      return { chapter: chapter.id, baseHash: packed.baseHash, reviewedParagraphs: paragraphs.length }
+    },
+    presentCall: args => ({ card: 'generic', title: `登记语义复核 ${args.chapter}`, kind: 'write', rawInput: args }),
   })
 
   // ---- 章纲（大纲之下、正文之上那一层）------------------------------------
@@ -5372,7 +5466,7 @@ export function apply(ctx, config) {
                 chars: countChars(raw),
                 total: tone.total,
                 signals: tone.signals,
-                rules: DEAI_RULES,
+                rules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
               })
               return
             }
@@ -5773,9 +5867,9 @@ const aiSentences = body => body.split(/[。！？!?…]/u).map(item => item.tri
 function detectAiTone(text) {
   const body = String(text ?? '')
   const signals = []
-  const add = (kind, label, samples) => {
+  const add = (kind, label, samples, count = samples?.length ?? 0) => {
     if (!samples || samples.length === 0) return
-    signals.push({ kind, label, count: samples.length, samples: samples.slice(0, 3) })
+    signals.push({ kind, label, count, samples: samples.slice(0, 3) })
   }
   if (!body.trim()) return { signals, total: 0 }
 
@@ -5797,8 +5891,8 @@ function detectAiTone(text) {
     const mean = paragraphLengths.reduce((sum, item) => sum + item, 0) / paragraphLengths.length
     const variance = paragraphLengths.reduce((sum, item) => sum + (item - mean) ** 2, 0) / paragraphLengths.length
     const deviation = mean > 0 ? Math.sqrt(variance) / mean : 0
-    if (deviation > 0 && deviation < 0.12) {
-      add('uniform-paragraph', `段落长度几乎一样（平均 ${Math.round(mean)} 字，波动只有 ${(deviation * 100).toFixed(0)}%）`, paragraphs.slice(0, 2).map(item => item.slice(0, 22)))
+    if (deviation < 0.12) {
+      add('uniform-paragraph', `段落长度几乎一样（平均 ${Math.round(mean)} 字，波动只有 ${(deviation * 100).toFixed(0)}%）`, paragraphs.slice(0, 2).map(item => item.slice(0, 22)), 1)
     }
   }
 
@@ -5806,7 +5900,7 @@ function detectAiTone(text) {
   if (sentences.length >= 20) {
     const shorts = sentences.filter(item => countChars(item) <= 8)
     if (shorts.length / sentences.length < 0.05) {
-      add('no-short', `${sentences.length} 句里只有 ${shorts.length} 句短句（≤8 字）：真人写作会有短句，甚至独立成段`, [])
+      add('no-short', `${sentences.length} 句里只有 ${shorts.length} 句短句（≤8 字），请结合文风检查节奏，不要求强行插入短句`, sentences.filter(item => countChars(item) > 8).slice(0, 2), 1)
     }
     const groups = []
     let bucket = [sentences[0]]
@@ -5823,7 +5917,7 @@ function detectAiTone(text) {
     groups.push(bucket)
     const parallels = groups.filter(group => group.length >= 3 && countChars(group[0]) >= 10)
     if (parallels.length > 0) {
-      add('parallel-run', `有 ${parallels.length} 处连续三句以上字数齐平、开头相同`, parallels.slice(0, 3).map(group => group.slice(0, 3).join('｜')))
+      add('parallel-run', `有 ${parallels.length} 处连续三句以上字数齐平、开头相同`, parallels.slice(0, 3).map(group => group.slice(0, 3).join('｜')), parallels.length)
     }
   }
 
@@ -5831,10 +5925,10 @@ function detectAiTone(text) {
   if (quotes.length >= 5) {
     const clean = quotes.filter(item => !/[，,]|…|—/u.test(item) && countChars(item) > 12)
     if (clean.length / quotes.length >= 0.7) {
-      add('clean-dialogue', `有 ${clean.length}/${quotes.length} 句对话是长而完整的一口气（没有打断、停顿、省略）`, clean.slice(0, 2))
+      add('clean-dialogue', `有 ${clean.length}/${quotes.length} 句较长且缺少停顿标点，需结合语境判断是否生硬`, clean.slice(0, 2), clean.length)
     }
-    if (quotes.length >= 8 && !/[—…]/u.test(body)) {
-      add('no-pause', '有对话却一处破折号、省略号都没有：人说话会停顿、会抢话、会说不下去', [])
+    if (quotes.length >= 8 && !quotes.some(quote => /[—…]/u.test(quote))) {
+      add('no-pause', '对话中缺少显式停顿标点，请结合角色和场景判断是否自然，不要求补破折号或省略号', quotes.slice(0, 2), 1)
     }
   }
 
@@ -5842,12 +5936,7 @@ function detectAiTone(text) {
   const echoHits = []
   let prevQuoteHead = ''
   let prevQuoteFull = ''
-  for (const para of paragraphs) {
-    const qm = /[「『"“]([^」』"”]{3,})[」』"”]/u.exec(para)
-    if (!qm) {
-      prevQuoteHead = ''
-      continue
-    }
+  for (const qm of body.matchAll(/[「『"“]([^」』"”\n]{2,})[」』"”]/gu)) {
     const head = qm[1].replace(/[^\u4e00-\u9fff]/gu, '').slice(0, 3)
     if (head.length >= 2 && head === prevQuoteHead) {
       echoHits.push(`${prevQuoteFull.slice(0, 18)} ∥ ${qm[1].slice(0, 18)}`)
@@ -5855,7 +5944,7 @@ function detectAiTone(text) {
     prevQuoteHead = head
     prevQuoteFull = qm[1]
   }
-  add('echo-dialogue', '相邻对话同句头接龙复读（真人吵架不会按同一句式对仗）', echoHits)
+  add('echo-dialogue', '连续引语同句头，需区分机械接龙与正常重复、确认或反驳', echoHits)
 
   // 对称格言 / 镜像对比收尾（如「…看不出来。…看得出来。」「…先…，…再…」「不是…，是…」）
   const symmetryHits = []
@@ -5870,7 +5959,7 @@ function detectAiTone(text) {
       symmetryHits.push(aiSnippet(body, m.index ?? 0, m[0].length))
     }
   }
-  add('symmetry-aphorism', '对称金句/格言式收尾（去掉装深沉的工整对仗）', symmetryHits)
+  add('symmetry-aphorism', '对称句式，需结合语境区分空泛总结与有效对比', symmetryHits)
 
   const total = signals.reduce((sum, item) => sum + item.count, 0)
   return { signals, total }
@@ -5878,16 +5967,34 @@ function detectAiTone(text) {
 
 /** 改写纪律（从 qu-ai-wei 的仲裁顺序与禁令压缩而来）。 */
 const DEAI_RULES = [
-  '改写纪律（去 AI 味）：',
-  '1. 事实优先：情节、人名、数字、设定名、人物口癖（如「成不成」）一个字都不能改丢。',
-  '2. 斩断同句头接龙对白：绝不允许对手用前一句相同的开头句式接龙，吵架/危机时直接抢话、粗口、反问或答非所问。',
-  '3. 删掉对称格言与升华尾音：如「表盘看不出来。他的手看得出来」「手上先知道，嘴上再说」「不是X，是Y」——改写成大白话直觉或直接删掉总结句。',
-  '4. 危急时刻不说完整科普长句：把书面的比喻和制度宣讲拆成短促喊话或动作。',
-  '5. 优先级：事实原意 > 角色声口 > 自然人话 > 原有句式。',
-  '6. 自检：如果改完比原文更整齐、更对称、更像朗诵，那是改错了方向。',
+  '写作与语义审稿纪律：',
+  '1. 保留事实、情节、人物意图、数字、设定和有效信息；不补造因果、动机、动作，不把可能改成确定。台词可调整表达，不能改变其信息、承诺和人物关系。',
+  '2. 先读完整场景、人物卡和文风锚点，再判断具体问题。机械命中只作线索；正常重复、纠正、对比和长句可以保留，不以零命中为目标。',
+  '3. 对话按角色的身份、目的、认知和口癖区分；不把所有人统一改成短句、粗口、反问或抢话。仅当时间压力和人物状态需要时压缩解释。',
+  '4. 核对场景时间：倒计时、动作、观察、回忆和交涉是否相容；删减或调整拖慢现场的说明，不擅自修改倒计时数值或事件结果。',
+  '5. 检查细节是否反复证明同一标签、旁白是否重复解释已演出的意义、句段是否固定为动作—体感—总结、冲突是否只为剧情服务。保留有信息或声口价值的细节，不机械删修辞。',
+  '6. 优先级：事实原意 > 作者文风与角色声口 > 场景自然度 > 原句式。只修有问题的地方；对照原稿核实信息保留，并说明保留与修改的理由。',
 ].join('\n')
 
-/** 提取本章全部对话（含前后1段语境）、心理/体感段与对称金句，供交付前洗稿。 */
+const DEAI_WORKFLOW = '交付前先调用 novel_deai_pack({chapter}) 阅读全文、人物声口与文风卡；有问题才用 novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}) 一次提交多个修改。修改后重新取包，核对全文事实与表达；逐段说明保留理由，并以 timing（时间压力）、voice（角色声口）、narration（细节与解释）、rhythm（句段与冲突）、facts（事实保留）五项 checks 调用 novel_deai_review({chapter,baseHash,checks,paragraphs:[{index,reason}]}），最后运行 novel_check。正文变化后旧复核失效；机械零命中不代表自然，不为消除线索强改正常表达。本流程替代旧版强制洗稿或整章重写要求。'
+
+const DEAI_REVIEW_ASPECTS = {
+  timing: '核对倒计时与动作、观察、解释、交涉是否相容，指出具体段落依据；无倒计时也检查场景时间。',
+  voice: '对照人物说话方式和认知，检查角色是否雷同；未匹配人物卡时先补读，说明依据。',
+  narration: '检查细节堆叠、旁白解释、标签重复和过度总结，指出保留细节的作用。',
+  rhythm: '对照文风锚点检查固定句段模板、重复分镜、冲突与对白是否生硬；无文风卡时明确说明。',
+  facts: '与改写前原稿及设定核对事实、意图、因果、数字和信息点；未修改时说明核对范围。',
+}
+
+/** 复核只对登记时的正文版本有效，不把登记记录当作自动自然度认证。 */
+function hasCurrentDeaiReview(chapter, text) {
+  const review = chapter.deaiReview
+  return review?.version === 1 && review.baseHash === createHash('sha256').update(text).digest('hex')
+    && Object.keys(DEAI_REVIEW_ASPECTS).every(key => typeof review.checks?.[key] === 'string' && review.checks[key].trim())
+    && Array.isArray(review.paragraphs) && review.paragraphs.length > 0
+}
+
+/** 返回全部非空正文段落，机械标签只帮助定位，不决定审稿范围。 */
 function extractDeaiPack(text, cards) {
   const source = String(text ?? '')
   const baseHash = createHash('sha256').update(source).digest('hex')
@@ -5901,34 +6008,32 @@ function extractDeaiPack(text, cards) {
     }
     offset += len + 1
   }
-  const symDetect = detectAiTone(source).signals.flatMap(s => s.samples ?? [])
   const items = []
   for (let i = 0; i < paras.length; i += 1) {
     const cur = paras[i]
     const tags = []
     if (/[「『"“]/u.test(cur.text)) tags.push('对话')
     if (INTERIOR_RE.test(cur.text) || /(他自己管这叫|他没打算|想的是|脑子里)/u.test(cur.text)) tags.push('心理/体感')
-    if (/不是[^，。！？\n]{2,12}，是|看不出来|听不见|先[^，]{1,6}，[^，]{1,6}再|像有人在/u.test(cur.text) || symDetect.some(s => cur.text.includes(s.replace(/…/g, '').slice(0, 8)))) {
+    if (/不是[^，。！？\n]{2,12}，是|看不出来|听不见|先[^，]{1,6}，[^，]{1,6}再|像有人在/u.test(cur.text)) {
       tags.push('疑似金句/对称')
     }
-    if (!tags.length) continue
+    if (!tags.length) tags.push('叙述')
     items.push({
       index: items.length + 1,
       start: cur.start,
       end: cur.end,
       tags,
-      prev: i > 0 ? paras[i - 1].text.slice(0, 120) : '',
       text: cur.text,
-      next: i + 1 < paras.length ? paras[i + 1].text.slice(0, 120) : '',
     })
   }
   const voices = []
   for (const card of cards ?? []) {
-    if (!source.includes(card.name)) continue
+    if (![card.name, ...parseCardAliases(card.content ?? '')].some(name => source.includes(name))) continue
     const speechHit = /^\s*[-*+]?\s*(?:说话|说话方式|口癖)\s*[：:]\s*(.+)$/mu.exec(card.content ?? '')
     const persHit = /^\s*[-*+]?\s*(?:性格|表面)\s*[：:]\s*(.+)$/mu.exec(card.content ?? '')
     voices.push({
       name: card.name,
+      content: card.content ?? '',
       speech: speechHit ? speechHit[1].trim() : '',
       personality: persHit ? persHit[1].trim() : '',
     })
