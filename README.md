@@ -15,6 +15,8 @@ DSH（DeepSeekRuntime）插件：把「写长篇小说」变成一条模型能�
 
 每章目标字数的唯一真相是 `book.json` 的 `targetChars`。**没写**时插件用默认 3000，只在状态里标「默认值」，不会替你写进文件；要定下来就调 `novel_book({ targetChars })`。作者在大纲里写的「4 章 × 1000 字」只是散文，需要被翻译成 `targetChars: 1000` 才算数——否则会出现「大纲说 1000、自查按 3000 报偏短」的假警报。
 
+目标字数是参考篇幅，不是上限。超出不报警、不导致自检失败，也不触发删减、缩写、提前收尾或强制分章；保留字数统计。是否分章由情节自然节点决定，关键动作、空间过渡和信息因果需要完整呈现。工具的上下文预算只限制装配包，不限制正文长度。
+
 ## 目录结构
 
 ```
@@ -62,9 +64,9 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 | `novel_read` | 读某一章正文 |
 | `novel_write` | 写正文（`mode: append` 默认 / `replace`，可带 `status`；省略 `chapter` 自动建下一章并登记进 `book.json`） |
 | `novel_outline` | 读 / 写 `outline.md` |
-| `novel_context` | **续写前的标准动作**：一次拿到本章大纲 + 上一章末 + 出场人物卡 + 该惦记的伏笔（默认 ≤ 2000 字） |
+| `novel_context` | **续写前的标准动作**：一次拿到本章大纲 + 上一章末 + 出场人物卡 + 该惦记的伏笔（续写上下文默认最多 5000 Unicode 字符，不限制正文长度） |
 | `novel_card` | 人物卡：无参列清单 / 给 `name` 读 / 再加 `content` 写 |
-| `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 相对目标字数偏长偏短 / **章纲写的场次没落到正文（`beats-gap`）** / **这一章没有爽点（`no-payoff`，会带「已连续 N 章没有」）/ 章末没有钩子（`no-hook`）** |
+| `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 参考篇幅统计与偏短提示（超出不报错） / **章纲写的场次没落到正文（`beats-gap`）** / **这一章没有爽点（`no-payoff`，会带「已连续 N 章没有」）/ 章末没有钩子（`no-hook`）** |
 | `novel_beats` | 章纲：无参看全书覆盖 / 给 `chapter` 读这一章的拍摄清单 / 给 `content` 覆盖写（只动这一节） |
 | `novel_events` | 事件线：无参看全书事件线与推进情况 / 给 `line` 读那条线（含覆盖章、已写数）/ 给 `line` + `content` 整段替换这一条线（别的线不动） |
 | `novel_threads` | 伏笔：无参看清单（未回收 / 已回收 / 到期未收）/ 给 `thread` + `planted`/`payoff`/`status` 登记或改状态 |
@@ -189,13 +191,15 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 去味由机械线索检测和会话语义审稿共同完成；插件不会自动改稿，也不会把检测通过当作自然度认证。
 
 1. **写作前约束**：普通 `novel_context({ chapter })` 和改写装配包都包含场景审稿纪律与最新交付流程，已有小说无需重建规范文件。`pass: "deai"` 额外带上机械命中线索。
-2. **阅读全文**：`novel_deai_pack({ chapter })` 返回全部非空正文段落、原文坐标、整章 `baseHash`、人物声口和完整文风卡。语义审稿覆盖时间压力、细节堆叠、过度解释、角色雷同和固定句段模板，不仅检查带标签的片段。
+2. **阅读全文**：`novel_deai_pack({ chapter })` 返回全部非空正文段落、原文坐标、整章 `baseHash`、人物声口和完整文风卡。语义审稿先还原空间、动作、工具、时间、安全约束与技术因果，再检查对白、紧张场景的设定投放、格言式总结和无设定依据的逐项感官报幕。包内附设定索引，涉及机制时按需读取完整条目；缺失前因或存在矛盾时先修订或澄清，不能以脑补步骤登记完成。
 3. **按需修改**：`novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次提交多个不重叠修改，所有坐标基于同一版原文。原有单片段写法仍可用；每次写入后需要重新取包，不能复用旧哈希和坐标。
-4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`。带对话标签的段落另填 `dialogue.kind` 区分实际对白（`speech`）、内心（`thought`）、引用（`quotation`）或无法确定（`uncertain`）；实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，结合章纲和现场判断表达目的、听者、时间压力与措辞。再填写 `checks` 的 `timing`、`voice`、`narration`、`rhythm`、`facts` 五项判断，再调用 `novel_deai_review({ chapter, baseHash, checks, paragraphs })`。有待改问题先修改；无须修改也应记录具体保留理由。记录保存在 `book.json` 对应章节的 `deaiReview` 中，仅对该正文版本有效。旧版未包含对白场景判断的复核记录需要重新提交。
-5. **最后自查**：`novel_check({ chapter })` 默认开启机械线索检测；`aiTone: false` 仅关闭该检测，不跳过语义复核。当前版本未复核会报 `deai-review-pending`，也不能通过 `novel_write` 标记为 `final`。修改已复核正文会使记录失效。
+4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`。带对话标签的段落另填 `dialogue.kind` 区分实际对白（`speech`）、内心（`thought`）、引用（`quotation`）或无法确定（`uncertain`）；实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，结合章纲和现场判断表达目的、听者、时间压力与措辞。按场景提交 `scenes`：连续的 `startIndex/endIndex` 必须覆盖全文，每场填写 `layout`（布局）、`mechanism`（主要因果链）、`timeline`（完整时间线）与 `actions`。关键动作逐条记录 `index` 和 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对位置、工具来源、前提、结果、耗时和危险禁令。同段多动作逐条记录；静态场景可用空动作数组，但须说明依据。再填写 `checks` 的 `continuity`、`timing`、`voice`、`narration`、`rhythm`、`facts`，调用 `novel_deai_review({ chapter, baseHash, checks, scenes, paragraphs })`。每项 `checks` 使用 `{ verdict, detail, evidence, counterargument }`，不再接受一句肯定话。`verdict` 为 `supported`、`conflict`、`uncertain` 或 `not-applicable`；至少一条正文逐字引文，确认矛盾至少两条不同引文。正文证据写 `{ source: "chapter", index, quote }`；其他来源为 `beats`、`outline`，或带实际条目名 `name` 的 `character`、`setting`、`style`。工具验证引文存在、正文段号准确，并记录来源哈希。`counterargument` 说明最可能推翻结论的证据或缺失依据，不将推测当原文。记录保存在 `book.json` 对应章节的 `deaiReview` 中；正文、被引用资料或启用文风变化后失效。旧版无证据记录需重新提交。
+5. **最后自查**：`novel_check({ chapter })` 默认开启机械线索检测；`aiTone: false` 仅关闭该检测，不跳过语义复核。当前版本未复核会报 `deai-review-pending`。`conflict` 和 `uncertain` 会实际保存为 `blocked`，按连续性、时间、信息缺失、对白、叙述和句段顺序回显；即使其余字段完整也不能标记 `final`。旧阻塞项转为通过时必须填写对应 `resolutions`，说明修复依据或更正原因，旧问题和处理理由保留在 `resolvedFindings`。机械结果与已登记语义问题分别显示；模型未登记的问题不会被伪称为自动检出。
 6. **右栏入口与旧书**：「去AI味」按钮提示先读取完整审稿包并局部修改，不再截取 1200 字要求整章覆盖。`novel_book({ scaffold: true })` 可为旧书追加或更新插件管理的复核小节，保留原有自定义内容。
 
 `ai-tone` 报零类不代表自然，出现线索也不必强改。正常重复、长句、对比和角色口癖可以保留；不通过统一粗口、抢话或短句来消除线索。当前版本已登记完整语义复核后，机械线索仍会展示，作为复核参考而不再单独判失败；正文变化后需重新复核。复核记录表示会话提交了审稿依据，不能证明其判断一定正确。
+
+审稿机制的通用验收场景见 [审稿验收](docs/review-acceptance.md)。引文存在校验不等于推论成立；物理、因果和文风判断仍需会话模型复核，不能用字段齐全证明审稿质量。
 
 ## 节奏与戏份：规格写在数据里，不是写死在代码里
 

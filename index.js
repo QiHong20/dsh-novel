@@ -1252,8 +1252,8 @@ function assembleNovelContext(value, budget) {
     ? scope.partial
       ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
       : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风与各角色声口。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。${voiceRule}`
-    : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule} 宁可把前几场写透细节、在接近目标字数时自然收尾留钩子并用 novel_write({ ..., carryOver: true }) 将剩余场次顺延到下一章，也不要为了塞全章纲把后半段压缩成流水账。`
-  const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n目标 ${value.chapter.target} 字。预算 ${budget} Unicode 字符（含标题、空白和指令，不是 token）。\n${instructions}`
+    : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule} 场景和关键动作链应完整呈现；参考字数不限制正文长度，不因接近或超过目标而缩写、省略过程或提前收尾。是否分章按情节自然节点决定；确需顺延尚未开始的后续场景时，可用 novel_write({ ..., carryOver: true })，不能把当前动作的前提与结果拆散。`
+  const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n参考篇幅 ${value.chapter.target} 字（允许超出，不因超出删减）。上下文预算 ${budget} Unicode 字符（仅限制本次装配包，含标题、空白和指令，不是 token，也不是正文字数上限）。\n${instructions}`
   const blocks = []
   const add = (id, label, body, required = false) => {
     if (body) blocks.push({ id, label, text: `## ${label}\n${body}`, required })
@@ -2551,7 +2551,6 @@ async function auditBook(root) {
     const goal = row.target > 0 ? row.target : target
     if (goal > 0) {
       if (row.chars < goal * 0.7) add('warn', 'short', label + '：' + row.chars + '/' + goal + ' 字，差 ' + (goal - row.chars), row.id)
-      else if (row.chars > goal * 1.35) add('warn', 'long', label + '：' + row.chars + '/' + goal + ' 字，超 ' + (row.chars - goal), row.id)
     }
     if (sections.length) {
       const section = matchBeatSection(sections, row)
@@ -2868,7 +2867,7 @@ export function apply(ctx, config) {
     name: 'novel_book',
     description:
       '查看或修改整本书的元信息：书名、作者、类型、一句话简介、每章目标字数。' +
-      '目标字数是全书默认（每章可单独覆盖），写章自查按它判「偏短 / 超长」。' +
+      '目标字数是全书默认的参考篇幅（每章可单独覆盖），超出不报警、不要求删减或缩写。' +
       '作者的篇幅意图常写在大纲里（例如「4 章 × 1000 字」）：如果大纲写了而 book.json 没写，' +
       '用这个工具把 targetChars 定下来，不要让插件默认值冒充作者的决定。',
     parameters: {
@@ -3274,7 +3273,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_write',
     description:
-      '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。如果一章写到接近目标字数但章纲还有场景没写完，别硬塞成流水账，传 carryOver: true 可自动把未写完的场景顺延到下一章章纲。' +
+      '写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。目标字数只作参考，允许超出，不要求缩写或提前收尾。按情节自然节点决定分章；确需顺延后续场景时可传 carryOver: true。' +
       '\n改写先用 novel_deai_pack 阅读全文与声口；多个修改用 mode:"patch", baseHash, patches:[{start,end,content}] 一次提交，所有坐标均以同一版原文为准。单片段 start/end/content 仍可用。修改后重新取包并提交 novel_deai_review，再 novel_check；未完成当前版本复核不可标记 final。',
     parameters: {
       type: 'object',
@@ -3370,7 +3369,7 @@ export function apply(ctx, config) {
       const target = path.join(rootNow(), chapter.file)
       const previous = (await readText(target)) ?? ''
       const body = applyChapterEdit(previous, { ...args, mode })
-      const reviewed = hasCurrentDeaiReview(chapter, body)
+      const reviewed = await hasCurrentDeaiReview(rootNow(), chapter, body, meta)
       if (args.status === 'final' && !reviewed) throw new Error('当前正文尚未完成语义复核，请先保存草稿，调用 novel_deai_pack 和 novel_deai_review 后再标记 final；未写入')
       if (chapter.status === 'final' && !reviewed) chapter.status = 'draft'
 
@@ -3485,16 +3484,10 @@ export function apply(ctx, config) {
         } else {
           const skipped = gap.missing.map(item => `第 ${item.index} 场「${item.snippet}…」`)
           if (skipped.length) {
-            if (chapterTarget > 0 && chars >= chapterTarget * 0.85) {
-              warnings.push(
-                `本章已达 ${chars}/${chapterTarget} 字，写不完的 ${skipped.length} 场（${skipped.join('、')}）别硬塞成流水账——可传 carryOver: true 自动顺延到下一章章纲，或手动拆章。`,
-              )
-            } else {
-              warnings.push(
-                `章纲里这 ${gap.total} 场，有 ${skipped.length} 场在正文里几乎找不到对应情节：${skipped.join('、')}。` +
-                  '要么补写，要么把章纲改掉——别让章纲和正文各说各的。',
-              )
-            }
+            warnings.push(
+              `章纲里这 ${gap.total} 场，有 ${skipped.length} 场在正文里几乎找不到对应情节：${skipped.join('、')}。` +
+                '请核对是否漏写，不能因达到参考字数省略关键过程。按情节决定补写或调整章纲；确需分章时再顺延后续场景。',
+            )
           }
           if (infoGap.missing.length) {
             warnings.push(
@@ -3773,7 +3766,7 @@ export function apply(ctx, config) {
       type: 'object',
       properties: {
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
-        budget: { type: 'integer', description: '最终提示文本的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 2000、改写 6000，最多 20000' },
+        budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 5000、改写 6000，最多 20000；不限制正文字数' },
         rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
         rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
@@ -4272,6 +4265,8 @@ export function apply(ctx, config) {
         additionalProperties: true,
         properties: {
           ok: { type: 'boolean' },
+          mechanicalOk: { type: 'boolean', description: '仅表示本次机械检查是否有待处理项，不表示语义正确' },
+          deaiReview: { type: 'object', additionalProperties: true, description: '已登记的模型语义判断：pending 待复核，blocked 有矛盾或依据不足，reviewed 已有有效证据记录，untracked 为直接检查文本；均不代表自动认证' },
           chars: { type: 'integer' },
           target: { type: 'integer' },
           issues: {
@@ -4302,10 +4297,10 @@ export function apply(ctx, config) {
             ...(review.semantic.length ? ['语义禁忌待会话 AI 复核（尚未判定）：', ...review.semantic] : []),
           ] : []),
         ]
-        if (!value.issues.length) {
-          return textRender([`本次检查未发现待处理项；语义自然度仍以会话审稿为准。${value.chars} 字${value.target ? `（目标 ${value.target}）` : ''}。`, ...reviewLines].join('\n'))
-        }
-        const lines = [`查到 ${value.issues.length} 类问题（${value.chars} 字${value.target ? `，目标 ${value.target}` : ''}）：`]
+        const semanticCount = value.issues.filter(item => item.kind.startsWith('semantic-') || item.kind === 'deai-review-pending').length
+        const heading = `机械检查 ${value.issues.length - semanticCount} 项；已登记语义问题或待复核 ${semanticCount} 项（${value.chars} 字${value.target ? `，参考 ${value.target}` : ''}）。`
+        if (!value.issues.length) return textRender([heading, ...reviewLines, '机械零命中与审稿登记均不代表语义结论一定正确。'].join('\n'))
+        const lines = [heading]
         for (const issue of value.issues) {
           lines.push(`- [${issue.kind}] ${issue.detail}`)
           for (const sample of issue.samples ?? []) lines.push(`    · ${sample}`)
@@ -4345,14 +4340,16 @@ export function apply(ctx, config) {
       }
       const report = inspectText(text, { cards, target })
       const chapterReview = chapter && typeof args.text !== 'string'
-      const reviewed = chapterReview && hasCurrentDeaiReview(chapter, text)
+      const reviewState = chapterReview ? await deaiReviewState(rootNow(), chapter, text, meta) : { status: 'untracked', findings: [] }
+      const reviewed = reviewState.status === 'reviewed'
       report.deaiReview = {
-        status: chapterReview ? reviewed ? 'reviewed' : 'pending' : 'untracked',
+        status: reviewState.status,
         detail: chapterReview
-          ? reviewed ? '当前正文版本已登记会话语义复核；记录代表审稿依据，不是自动自然度认证。' : '当前正文版本待会话语义复核。'
+          ? reviewed ? '当前版本已登记有原文依据的会话复核；引用已校验，结论仍是模型判断。' : reviewState.status === 'blocked' ? '当前版本存在已登记的语义矛盾或依据不足，尚未通过复核。' : '当前正文或引用资料已变化，或尚无有效记录，待会话语义复核。'
           : '本次直接检查文本，仅报告机械线索，未核验章节语义复核。',
       }
-      if (chapterReview && !reviewed) {
+      report.issues.unshift(...reviewState.findings.map(item => ({ kind: `semantic-${item.verdict}`, detail: `[${item.aspect}] ${item.detail}`, samples: item.evidence.map(reference => `${reference.source}${reference.name ? ':' + reference.name : ''}${reference.index ? ' #' + reference.index : ''}：${reference.quote}`) })))
+      if (chapterReview && reviewState.status === 'pending') {
         report.issues.push({ kind: 'deai-review-pending', detail: `当前正文版本尚未登记完整语义复核。${DEAI_WORKFLOW}` })
       }
       if (args.aiTone !== false) {
@@ -4592,6 +4589,7 @@ export function apply(ctx, config) {
           }
         }
       }
+      report.mechanicalOk = report.issues.every(item => item.kind.startsWith('semantic-') || item.kind === 'deai-review-pending')
       report.ok = report.issues.length === 0
       return report
     },
@@ -4606,7 +4604,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_deai_pack',
     description:
-      '交付前阅读全文审稿：返回全部非空段落、当前章纲、场景对白审稿钩子、人物卡和完整文风卡。逐段结合现场、说话目的、听者与时间压力判断对白，不按固定句式替换。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
+      '交付前阅读全文审稿：返回全部非空段落、章纲、设定索引、人物卡和文风卡。先按场景追踪人物位置、工具来源、动作前提、耗时与救险因果，再审对白、设定讲解和朗诵腔。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
     parameters: {
       type: 'object',
       properties: {
@@ -4628,6 +4626,7 @@ export function apply(ctx, config) {
           rules: { type: 'string' },
           style: { type: 'object', additionalProperties: true },
           dialogueContext: { type: 'object', additionalProperties: true },
+          settingReferences: { type: 'array', items: { type: 'object', additionalProperties: true } },
         },
       },
       render: (_args, value) => {
@@ -4643,7 +4642,10 @@ export function apply(ctx, config) {
           }
         }
         lines.push('仅以代称出场或尚未匹配的角色，请用 novel_card 补读人物卡；不要由缺少卡片推断人物没有声口约束。')
-        lines.push('', '## 本章场景与认知约束（按对白场景钩子逐段核对）', value.dialogueContext.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
+        lines.push('', '## 本章场景与认知约束（按空间动作与对白钩子逐段核对）', value.dialogueContext?.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
+        lines.push('', '## 设定索引（涉及机制、能量路径或身体反应时，用 novel_setting 读取相关完整条目）')
+        for (const item of value.settingReferences ?? []) lines.push(`- ${item.name}：${item.summary}`)
+        if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
         if (value.style.text) lines.push('', `## 文风样本与约束：${value.style.name}`, value.style.text)
         lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review。')
         for (const item of value.items) {
@@ -4670,9 +4672,10 @@ export function apply(ctx, config) {
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
-        rules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
+        rules: `${DEAI_RULES}\n\n${SCENE_REVIEW_RULES}\n\n${REVIEW_EVIDENCE_RULES}\n\n${DEAI_WORKFLOW}`,
         style: { name: styleName, text: styleName ? (await readStyle(rootNow(), styleName)) ?? '' : '' },
         dialogueContext: { beats: beats.section?.body ?? '' },
+        settingReferences: (await listSettings(rootNow())).map(item => ({ name: item.name, summary: item.summary })),
       }
     },
     presentCall: args => ({ card: 'generic', title: `全文语义审稿 ${args.chapter}`, kind: 'read', rawInput: args }),
@@ -4680,19 +4683,54 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_deai_review',
-    description: '登记会话 AI 对最终正文的语义复核，不代替审稿、不自动判定自然度。先读 novel_deai_pack 全文，发现问题先回写并重新取包；对最终版本逐段说明保留理由，再提交五项场景判断。正文变化后复核失效；最后运行 novel_check。',
+    description: '登记有证据的审稿结果，允许发现矛盾或依据不足，不要求先宣告通过。checks 每项提交 verdict/detail/evidence/counterargument；引用必须逐字存在，正文引文必须对应段号。conflict/uncertain 会保存为阻塞项并按严重程度回显，不能标记 final。记录完整不代表语义正确。正文或被引资料变化后记录失效。',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         chapter: { type: 'string' },
-        baseHash: { type: 'string', description: '最终版本 novel_deai_pack 返回的整章哈希' },
+        baseHash: { type: 'string', description: '当前 novel_deai_pack 返回的整章哈希，发现矛盾也可登记' },
         checks: {
           type: 'object', additionalProperties: false,
-          properties: Object.fromEntries(Object.entries(DEAI_REVIEW_ASPECTS).map(([key, description]) => [key, { type: 'string', minLength: 1, description }])),
+          properties: Object.fromEntries(Object.entries(DEAI_REVIEW_ASPECTS).map(([key, description]) => [key, {
+            type: 'object', additionalProperties: false, description,
+            properties: {
+              verdict: { type: 'string', enum: ['supported', 'conflict', 'uncertain', 'not-applicable'], description: '有依据支持、确认矛盾、依据不足或本项不适用；不确定不能伪装通过' },
+              detail: { type: 'string', minLength: 1, description: '具体结论，区分原文事实与推断；不把修改设想当原文事实' },
+              evidence: { type: 'array', minItems: 1, items: REVIEW_EVIDENCE_SCHEMA, description: '至少一条对应段号的正文引文；确认矛盾至少两条不同引文。涉及设定的断言另引相关来源；引文逐字校验' },
+              counterargument: { type: 'string', minLength: 1, description: '指出最可能推翻本结论的原文、缺失依据或替代解释，再说明如何处理；不能只写已检查无问题' },
+            },
+            required: ['verdict', 'detail', 'evidence', 'counterargument'],
+          }])),
           required: Object.keys(DEAI_REVIEW_ASPECTS),
         },
+        resolutions: {
+          type: 'object', additionalProperties: false, description: '上次已登记的阻塞项本次转为 supported/not-applicable 时，必须按对应维度说明如何修复或为何更正判断；证据使用本次 checks 的引文，不能静默删除旧问题。',
+          properties: Object.fromEntries(Object.keys(DEAI_REVIEW_ASPECTS).map(key => [key, { type: 'string', minLength: 1 }])),
+        },
+        scenes: {
+          type: 'array', minItems: 1, description: '按正文顺序分场，连续覆盖当前包全部段落，不可遗漏或重叠；每场列全关键动作并承接上一场状态。静态场景可用空 actions，但须说明无动作的依据。',
+          items: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              startIndex: { type: 'integer', minimum: 1 },
+              endIndex: { type: 'integer', minimum: 1 },
+              layout: { type: 'string', minLength: 1, description: '人物、设备、通道与危险区的相对位置及已知状态；转场说明如何从上场到达' },
+              mechanism: { type: 'string', minLength: 1, description: '主要因果链：异常来源→采取措施→能量或物质去向→结果；说明各辅助动作的必要性与设定依据，无此类机制时说明原因' },
+              timeline: { type: 'string', minLength: 1, description: '把移动、拿取工具、对白与操作放进同一时间线，核对串并行和倒计时；不默认一息等于一秒，不编造精确耗时；无明确时间窗口时说明依据' },
+              actions: {
+                type: 'array', description: '按发生顺序记录全部关键物理动作；同段多个动作逐条列出',
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: { index: { type: 'integer', minimum: 1 }, ...Object.fromEntries(Object.entries(SCENE_ACTION_FIELDS).map(([key, description]) => [key, { type: 'string', minLength: 1, description }])) },
+                  required: ['index', ...Object.keys(SCENE_ACTION_FIELDS)],
+                },
+              },
+            },
+            required: ['startIndex', 'endIndex', 'layout', 'mechanism', 'timeline', 'actions'],
+          },
+        },
         paragraphs: {
-          type: 'array', minItems: 1, description: '覆盖最终审稿包全部段落，每段写出结合原文的保留理由；仍有待改问题时先修改，不要登记完成。',
+          type: 'array', minItems: 1, description: '覆盖当前审稿包全部段落，每段说明保留理由或待解决问题；有矛盾或缺依据时如实登记，并在 checks 标为 conflict/uncertain，不能编造前提后宣告完成。',
           items: {
             type: 'object', additionalProperties: false,
             properties: {
@@ -4706,7 +4744,7 @@ export function apply(ctx, config) {
                   listener: { type: 'string', description: '说给谁听，以及对方此刻知道什么' },
                   intent: { type: 'string', description: '此刻想让对方知道、相信或做什么，依据正文和章纲判断' },
                   pressure: { type: 'string', description: '剩余时间、正在进行的动作及双方关系怎样影响这句话' },
-                  assessment: { type: 'string', description: '措辞是否清楚、符合声口、能完成目的；省略或狠话是否需要读者解码，说明保留理由' },
+                  assessment: { type: 'string', description: '措辞是否清楚、符合声口、能完成目的；省略或狠话是否需要读者解码，说明保留理由或待解决问题' },
                 },
                 required: ['kind'],
               },
@@ -4715,11 +4753,15 @@ export function apply(ctx, config) {
           },
         },
       },
-      required: ['chapter', 'baseHash', 'checks', 'paragraphs'],
+      required: ['chapter', 'baseHash', 'checks', 'scenes', 'paragraphs'],
     },
     output: {
-      schema: { type: 'object', additionalProperties: true, properties: { chapter: { type: 'string' }, baseHash: { type: 'string' }, reviewedParagraphs: { type: 'integer' } } },
-      render: (_args, value) => textRender(`已登记 ${value.chapter} 当前版本的会话语义复核，共 ${value.reviewedParagraphs} 段。请再运行 novel_check；本记录不是自动自然度认证。`),
+      schema: { type: 'object', additionalProperties: true, properties: { chapter: { type: 'string' }, baseHash: { type: 'string' }, reviewedParagraphs: { type: 'integer' }, status: { type: 'string' }, findings: { type: 'array', items: { type: 'object', additionalProperties: true } } } },
+      render: (_args, value) => textRender([
+        `已登记 ${value.chapter} 当前版本的审稿结果，共 ${value.reviewedParagraphs} 段。${value.status === 'blocked' ? '存在矛盾或依据不足，复核未通过。' : '引用校验通过，语义结论仍是会话模型的判断。'}`,
+        ...value.findings.map(item => `[${item.aspect}/${item.verdict}] ${item.detail}\n${item.evidence.map(reference => `- ${reference.source}${reference.name ? ':' + reference.name : ''}${reference.index ? ' #' + reference.index : ''}：${reference.quote}`).join('\n')}`),
+        '请运行 novel_check 核对当前状态；登记记录不是自动自然度认证。',
+      ].join('\n')),
     },
     execute: async args => {
       const root = rootNow()
@@ -4729,20 +4771,41 @@ export function apply(ctx, config) {
       const raw = (await readText(path.join(root, chapter.file))) ?? ''
       const packed = extractDeaiPack(raw, [])
       if (!raw.trim() || args.baseHash !== packed.baseHash) throw new Error('正文为空或版本已变化，请重新调用 novel_deai_pack；未登记')
-      if (!args.checks || Object.keys(DEAI_REVIEW_ASPECTS).some(key => typeof args.checks[key] !== 'string' || !args.checks[key].trim())) throw new Error('必须提交完整的五项场景判断；未登记')
+      const sources = await validateReviewEvidence(root, chapter, packed, args.checks)
+      if (!hasCompleteSceneReviews(args.scenes, packed.totalItems)) throw new Error('场景复核必须按顺序连续覆盖全文，并完整填写布局、机制、时间线与关键动作；未登记')
       const paragraphs = args.paragraphs
       const indices = new Set(Array.isArray(paragraphs) ? paragraphs.map(item => item?.index) : [])
-      if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖最终版本全文并说明保留理由，不能遗漏或重复；未登记')
+      if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
       const byIndex = new Map(paragraphs.map(item => [item.index, item]))
       for (const item of packed.items) {
         if (!item.tags.includes('对话')) continue
         const dialogue = byIndex.get(item.index).dialogue
         if (!dialogue || !['speech', 'thought', 'quotation', 'uncertain'].includes(dialogue.kind)) throw new Error(`第 ${item.index} 段缺少引语类型判断；未登记`)
+        if (dialogue.kind === 'uncertain' && !['conflict', 'uncertain'].includes(args.checks.voice.verdict)) throw new Error(`第 ${item.index} 段引语类型尚未确定，voice 不能登记为通过；请如实标记 uncertain 或 conflict`)
         if (dialogue.kind === 'speech' && ['speaker', 'listener', 'intent', 'pressure', 'assessment'].some(key => typeof dialogue[key] !== 'string' || !dialogue[key].trim())) throw new Error(`第 ${item.index} 段必须结合实际场景填写完整对白判断；未登记`)
       }
-      chapter.deaiReview = { version: 2, baseHash: packed.baseHash, reviewedAt: new Date().toISOString(), checks: args.checks, paragraphs }
+      const findings = reviewFindings(args.checks)
+      const previous = chapter.deaiReview
+      const resolvedFindings = hasCompleteReviewChecks(previous?.checks)
+        ? reviewFindings(previous.checks).filter(item => !['conflict', 'uncertain'].includes(args.checks[item.aspect].verdict))
+        : []
+      if (resolvedFindings.some(item => typeof args.resolutions?.[item.aspect] !== 'string' || !args.resolutions[item.aspect].trim())) throw new Error('旧阻塞项转为通过时必须填写对应 resolutions，说明修复依据或更正原因；未登记')
+      const status = findings.length ? 'blocked' : 'reviewed'
+      chapter.deaiReview = {
+        version: DEAI_REVIEW_VERSION,
+        baseHash: packed.baseHash,
+        styleName: activeStyleName(meta),
+        reviewedAt: new Date().toISOString(),
+        status,
+        checks: args.checks,
+        sources,
+        scenes: args.scenes,
+        paragraphs,
+        resolvedFindings: resolvedFindings.map(item => ({ ...item, resolution: args.resolutions[item.aspect] })),
+      }
+      if (status === 'blocked' && chapter.status === 'final') chapter.status = 'draft'
       await persistBook(root, meta, meta.chapters)
-      return { chapter: chapter.id, baseHash: packed.baseHash, reviewedParagraphs: paragraphs.length }
+      return { chapter: chapter.id, baseHash: packed.baseHash, reviewedParagraphs: paragraphs.length, status, findings }
     },
     presentCall: args => ({ card: 'generic', title: `登记语义复核 ${args.chapter}`, kind: 'write', rawInput: args }),
   })
@@ -6001,7 +6064,50 @@ const DIALOGUE_REVIEW_RULES = [
   '逐段区分实际对白、内心、引用和无法确定；实际对白逐轮核对谁对谁说、想让对方知道或做什么、对方已知什么、时间压力与手上动作，以及人物关系和说话习惯。没有明确依据时先补读，不补造人物动机。',
   '检查表达能否当场被听懂：省略的对象、指代和后果是否清楚，是否为了狠话、金句或陌生搭配而让听者解码；正常省略、行话和人物特有表达可保留。先保留说话目的，再选择贴合现场的说法。',
   '危机中检查解释是否有必要和时间，不一律缩成喊话；平静交涉允许完整表达、试探和绕弯。不把身份差异改成统一的日常口语，也不改变威胁程度、承诺、事实和事件结果。',
-  '最终复核的 paragraphs 中，带对话标签的段落填写 dialogue.kind；实际对白填写 speaker、listener、intent、pressure、assessment。多轮对白逐轮说明，同段混有实际对白与内心或引用时按实际对白审查；纯内心或引用在 reason 中解释分类依据。发现需要修改时先回写，再重新获取审稿包。',
+  '复核的 paragraphs 中，带对话标签的段落填写 dialogue.kind；实际对白填写 speaker、listener、intent、pressure、assessment。多轮对白逐轮说明，同段混有实际对白与内心或引用时按实际对白审查；纯内心或引用在 reason 中解释分类依据。发现问题或无法确定时先如实登记 conflict/uncertain；修改后重新获取审稿包。',
+].join('\n')
+
+const DEAI_REVIEW_VERSION = 4
+
+const REVIEW_EVIDENCE_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    source: { type: 'string', enum: ['chapter', 'beats', 'outline', 'character', 'setting', 'style'] },
+    name: { type: 'string', description: 'character/setting/style 的实际条目名，不能填写路径；其他来源省略' },
+    index: { type: 'integer', minimum: 1, description: 'chapter 来源必填，使用审稿包的段号；其他来源省略' },
+    quote: { type: 'string', minLength: 1, description: '逐字短引文，不能用省略号拼接或把推断写成原文' },
+  },
+  required: ['source', 'quote'],
+}
+
+const REVIEW_EVIDENCE_RULES = [
+  '证据审稿：checks 每项填写 verdict/detail/evidence/counterargument。verdict 取 supported（有依据支持）、conflict（确认矛盾）、uncertain（依据不足）、not-applicable（不适用）。发现问题也可以登记，conflict/uncertain 会保存为阻塞项，不能用空泛肯定句替代判断。',
+  '每项至少引用一条当前正文，格式 {source:"chapter",index:段号,quote:"逐字短引文"}；确认矛盾至少提供两条不同引文。可另引 beats/outline；人物、设定、文风用 {source:"character"或"setting"或"style",name:"实际条目名",quote:"逐字短引文"}，先读取相应资料。工具会核对原文和段号并绑定来源版本。',
+  'counterargument 写最可能推翻当前结论的原文、缺失依据或替代解释及处理结果。连接、状态与危险禁令要比较前后证据；时间只能使用已有单位和数量，不把常识估算当设定，不编造距离、长度、级数或耗时。修法是提案，不是现成事实；影响后文需读后文，未读不得宣称无影响。',
+  '问题顺序固定为连续性与技术因果、时间、事实与信息缺失、对白、叙述及句段。外貌锚点数量、词频、没有打断的独白本身不构成硬伤；没有明确要求不得当强制修改项。上下文缺失记 uncertain，不能补造设定后提交 supported。',
+].join('\n')
+
+const SCENE_ACTION_FIELDS = {
+  actor: '执行动作的人物或设备；同段多个执行者分别记录',
+  from: '动作前的位置、姿态及接触对象，引用段号说明来源',
+  to: '动作后的位置和状态；原地操作也要说明，不用瞬移跳过通路',
+  action: '具体做了什么，动作如何完成',
+  tools: '使用物件、手持状态、拿取或交接来源及对应段号；未使用工具则明确说明',
+  prerequisites: '动作成立的先决条件、通路与既有设定依据，引用相应段号或已读取的设定条目',
+  result: '直接产生的可见结果及如何承接下一步，状态变化必须有前因',
+  timing: '动作与移动、取物、对白的先后或并行关系，是否容得进已知时间窗口',
+  safety: '与已出现的危险和禁令是否相容，接触危险物的防护或例外是否已有依据；无此约束也需说明',
+}
+
+const SCENE_REVIEW_RULES = [
+  '场景连续性钩子：先按全文顺序分场，再逐步还原人物与设备的位置、姿态、持物和状态。不得用未写出的拿取、移动、入水或防护步骤替原文圆场。',
+  '每场用 scenes 记录连续的 startIndex/endIndex、layout（布局）、mechanism（异常—措施—去向—结果）、timeline（含移动、取物和对白的完整时间线）与 actions。关键动作逐条填写 index 及 actor/from/to/action/tools/prerequisites/result/timing/safety；同段多动作分别记录，转场承接上一场状态。纯静态段落允许空 actions，但布局与时间线需说明依据。',
+  '追踪工具从哪里来、由谁拿取或交接、是否够得着；追踪湿衣、伤口、姿态变化的前因；核对先前危险禁令与后续接触行为，不能无依据忽然安全。',
+  '核对救险或技术操作的主要因果链，说明每个辅助操作的必要作用、能量或物质的去向与既有设定依据。不要用术语、动作堆叠或巧合代替机制；不得为简化而改变已确认的设定。',
+  '把所有移动、对白、拿取和操作放进同一时间窗口，区分谁在同时做什么，不把一息擅自换算成一秒。原稿有矛盾时先指出并修订；设定不足以确定修法时向作者澄清，不能编造前提后登记完成。',
+  '复核信息投放：紧张场景先给读者理解当前动作所需的信息，完整体系讲解按情节需要放置；挪动说明不能让关键操作失去依据。检查对称格言、逐项报幕和旁白总结是否替代现场；正常排比可保留。',
+  '检查接口、器官与感官反应的对应和先后是否有设定依据，不凭数量相同就安排一一对应或逐项亮起；判断异常感知是在演示机制还是机械报幕，不把某一种身体描写设为全书禁用。',
+  '篇幅规则：目标字数仅供参考，超出是正常写作结果，不触发删字、缩写、提前结束或强行分章。保留空间过渡、工具来源、动作前提、因果桥梁和读者必需的信息；是否分章由情节自然节点决定，不能把当前因果链拆散。上下文预算只限制工具装配，不限制正文长度。',
 ].join('\n')
 
 /** 写作约束与审稿钩子共用，避免只在改写后补救。 */
@@ -6014,24 +6120,119 @@ const DEAI_RULES = [
   '5. 检查细节是否反复证明同一标签、旁白是否重复解释已演出的意义、句段是否固定为动作—体感—总结、冲突是否只为剧情服务。保留有信息或声口价值的细节，不机械删修辞。',
   '6. 优先级：事实原意 > 作者文风与角色声口 > 场景自然度 > 原句式。只修有问题的地方；对照原稿核实信息保留，并说明保留与修改的理由。',
   DIALOGUE_REVIEW_RULES,
+  '场景与篇幅：先核对人物设备的相对位置、移动通路、工具来源、状态变化、安全约束和动作因果，再审表达；不以脑补步骤补救矛盾。空间过渡、动作前提和关键后果必须写清。目标字数只供参考，超出不删减、不缩写、不提前收尾；按情节决定分章，上下文预算不限制正文长度。紧张时按当前理解需要投放设定，不用格言总结或逐项感官报幕替代情节；技术与身体反应要有既有设定依据。',
 ].join('\n')
 
-const DEAI_WORKFLOW = '交付前先调用 novel_deai_pack({chapter}) 阅读全文、章纲、人物声口与文风卡，按场景对白钩子审查台词；有问题才用 novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}) 一次提交多个修改。修改后重新取包，核对全文事实与表达；逐段说明保留理由，带对话标签的段落另填 dialogue 分类和场景判断，并以 timing（时间压力）、voice（角色声口）、narration（细节与解释）、rhythm（句段与冲突）、facts（事实保留）五项 checks 调用 novel_deai_review({chapter,baseHash,checks,paragraphs:[{index,reason,dialogue}]}），最后运行 novel_check。正文变化后旧复核失效；机械零命中不代表自然，不为消除线索强改正常表达。本流程替代旧版强制洗稿或整章重写要求。'
+const DEAI_WORKFLOW = '先调用 novel_deai_pack({chapter}) 阅读全文和资料，按需补读设定。先查空间因果，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,checks,scenes,paragraphs}) 如实登记：checks 每项提交 verdict/detail/evidence/counterargument，至少引用一条对应段号的逐字正文，确认矛盾至少两条不同引文；scenes 连续覆盖全文并记录布局、机制、时间线和关键动作，paragraphs 逐段说明理由或问题并填写 dialogue。conflict/uncertain 保存为阻塞状态，不得伪装通过；需要修改时在已获授权范围内修订，修改后重新取包、复核。最后运行 novel_check，分别查看机械检查和语义状态；正文、引用资料或启用文风变化后旧复核失效。引文校验只证明引用存在，不证明推论正确。本流程替代旧版填表即完成、强制洗稿与按字数收尾要求。'
 
 const DEAI_REVIEW_ASPECTS = {
+  continuity: '结合 scenes 动作链核对人物与设备位置、转场路线、工具来源、状态变化前因、技术因果和安全禁令，确认读者能连续还原现场，不能用脑补步骤消解矛盾。',
   timing: '核对倒计时与动作、观察、解释、交涉是否相容，指出具体段落依据；无倒计时也检查场景时间。',
   voice: '对照场景、人物认知、关系与说话目的，检查对白是否当场听得懂、是否为了狠话而生硬压缩，检查角色是否雷同；逐段提交 dialogue 判断，未匹配人物卡时先补读。',
-  narration: '检查细节堆叠、旁白解释、标签重复和过度总结，指出保留细节的作用。',
-  rhythm: '对照文风锚点检查固定句段模板、重复分镜、冲突与对白是否生硬；无文风卡时明确说明。',
-  facts: '与改写前原稿及设定核对事实、意图、因果、数字和信息点；未修改时说明核对范围。',
+  narration: '检查紧张场景的体系讲解是否打断现场，细节堆叠、旁白解释、标签重复与总结是否替代情节；检查数量对应和感官亮灯是否有设定依据，说明保留理由。',
+  rhythm: '对照文风锚点检查固定句段模板、工整对称、逐项报幕、冲突与对白是否生硬；无文风卡时明确说明，不因篇幅超出强制缩写。',
+  facts: '核对事实、意图、因果、数字和信息点；尤其检查空间过渡、工具来源、动作前提和后果是否被缩写省略。区分已确认事实与原稿矛盾，修法不明先澄清，不编造补丁。',
 }
 
-/** 复核只对登记时的正文版本有效，不把登记记录当作自动自然度认证。 */
-function hasCurrentDeaiReview(chapter, text) {
+/** 验证场景记录的结构与全文覆盖，物理和语义判断由会话审稿负责。 */
+function hasCompleteSceneReviews(scenes, totalItems) {
+  if (!Array.isArray(scenes) || !scenes.length) return false
+  let nextIndex = 1
+  for (const scene of scenes) {
+    if (!scene || scene.startIndex !== nextIndex || !Number.isInteger(scene.endIndex) || scene.endIndex < scene.startIndex || scene.endIndex > totalItems) return false
+    if (['layout', 'mechanism', 'timeline'].some(key => typeof scene[key] !== 'string' || !scene[key].trim()) || !Array.isArray(scene.actions)) return false
+    let actionIndex = scene.startIndex
+    for (const action of scene.actions) {
+      if (!action || !Number.isInteger(action.index) || action.index < actionIndex || action.index > scene.endIndex) return false
+      if (Object.keys(SCENE_ACTION_FIELDS).some(key => typeof action[key] !== 'string' || !action[key].trim())) return false
+      actionIndex = action.index
+    }
+    nextIndex = scene.endIndex + 1
+  }
+  return nextIndex === totalItems + 1
+}
+
+function hasCompleteReviewChecks(checks) {
+  return Object.keys(DEAI_REVIEW_ASPECTS).every(key => {
+    const check = checks?.[key]
+    return check && ['supported', 'conflict', 'uncertain', 'not-applicable'].includes(check.verdict)
+      && ['detail', 'counterargument'].every(field => typeof check[field] === 'string' && check[field].trim())
+      && Array.isArray(check.evidence) && check.evidence.length > 0
+      && check.evidence.some(reference => reference?.source === 'chapter')
+      && check.evidence.every(reference => reference && typeof reference.quote === 'string' && reference.quote.trim())
+      && (check.verdict !== 'conflict' || new Set(check.evidence.map(reference => JSON.stringify([reference.source, reference.name ?? '', reference.index, reference.quote]))).size >= 2)
+  })
+}
+
+/** 严重程度由工具固定排序，不能让外貌等补充项挤到因果矛盾之前。 */
+function reviewFindings(checks) {
+  return ['continuity', 'timing', 'facts', 'voice', 'narration', 'rhythm']
+    .filter(aspect => ['conflict', 'uncertain'].includes(checks[aspect].verdict))
+    .map(aspect => ({ ...checks[aspect], aspect }))
+}
+
+async function readReviewSource(root, chapter, reference) {
+  switch (reference.source) {
+    case 'chapter': return await readText(path.join(root, chapter.file))
+    case 'beats': return await readText(path.join(root, BEATS_FILE))
+    case 'outline': return await readText(path.join(root, OUTLINE_FILE))
+    case 'character': return await readCharacter(root, reference.name)
+    case 'setting': return await readSetting(root, reference.name)
+    case 'style': return await readStyle(root, reference.name)
+    default: throw new Error(`未知审稿来源：${reference.source}`)
+  }
+}
+
+/** 核实引文存在和段号准确；引文是否支持结论仍需语义审稿。 */
+async function validateReviewEvidence(root, chapter, packed, checks) {
+  if (!hasCompleteReviewChecks(checks)) throw new Error('每项 checks 必须提交 verdict/detail/evidence/counterargument，并引用正文；conflict 至少需要两条不同引文；未登记')
+  const cache = new Map()
+  const byIndex = new Map(packed.items.map(item => [item.index, item]))
+  for (const check of Object.keys(DEAI_REVIEW_ASPECTS).map(key => checks[key])) {
+    for (const reference of check.evidence) {
+      const named = ['character', 'setting', 'style'].includes(reference.source)
+      if (named ? typeof reference.name !== 'string' || !reference.name.trim() : reference.name !== undefined) throw new Error('人物、设定、文风引用必须填写条目名，其他来源不要填写 name；未登记')
+      const key = JSON.stringify([reference.source, reference.name ?? ''])
+      if (!cache.has(key)) {
+        const text = await readReviewSource(root, chapter, reference)
+        if (text === null) throw new Error(`审稿引用来源不存在：${key}；未登记`)
+        const hash = createHash('sha256').update(text).digest('hex')
+        if (reference.source === 'chapter' && hash !== packed.baseHash) throw new Error('正文已变化，请重新取审稿包；未登记')
+        cache.set(key, { text, source: reference.source, ...(named ? { name: reference.name } : {}), hash })
+      }
+      const source = cache.get(key)
+      if (!source.text.includes(reference.quote)) throw new Error(`引用不是来源中的逐字原文：${key}；未登记`)
+      if (reference.source === 'chapter') {
+        const paragraph = byIndex.get(reference.index)
+        if (!paragraph || !paragraph.text.includes(reference.quote)) throw new Error(`正文引文与段号 ${reference.index} 不匹配；未登记`)
+      } else if (reference.index !== undefined) throw new Error('非正文来源不使用审稿包段号，请省略 index；未登记')
+    }
+  }
+  return [...cache.values()].map(({ text, ...reference }) => reference)
+}
+
+/** 正文或证据来源变化后记录失效，阻塞项不会因登记成功而消失。 */
+async function deaiReviewState(root, chapter, text, meta) {
+  const pending = { status: 'pending', findings: [] }
   const review = chapter.deaiReview
-  return review?.version === 2 && review.baseHash === createHash('sha256').update(text).digest('hex')
-    && Object.keys(DEAI_REVIEW_ASPECTS).every(key => typeof review.checks?.[key] === 'string' && review.checks[key].trim())
-    && Array.isArray(review.paragraphs) && review.paragraphs.length > 0
+  if (review?.version !== DEAI_REVIEW_VERSION || review.baseHash !== createHash('sha256').update(text).digest('hex')
+    || review.styleName !== activeStyleName(meta) || !hasCompleteReviewChecks(review.checks)
+    || !Array.isArray(review.sources) || !review.sources.length || !Array.isArray(review.paragraphs)
+    || !hasCompleteSceneReviews(review.scenes, review.paragraphs.length)) return pending
+  try {
+    for (const reference of review.sources) {
+      const current = reference.source === 'chapter' ? text : await readReviewSource(root, chapter, reference)
+      if (current === null || createHash('sha256').update(current).digest('hex') !== reference.hash) return pending
+    }
+  } catch {
+    return pending
+  }
+  const findings = reviewFindings(review.checks)
+  return { status: findings.length ? 'blocked' : 'reviewed', findings }
+}
+
+async function hasCurrentDeaiReview(root, chapter, text, meta) {
+  return (await deaiReviewState(root, chapter, text, meta)).status === 'reviewed'
 }
 
 /** 返回全部非空正文段落，机械标签只帮助定位，不决定审稿范围。 */
@@ -6175,11 +6376,6 @@ function inspectText(text, { cards, target }) {
       issues.push({
         kind: 'length',
         detail: `比目标短：${chars}/${target} 字，还差 ${target - chars} 字`,
-      })
-    } else if (chars > target * 1.3) {
-      issues.push({
-        kind: 'length',
-        detail: `比目标长：${chars}/${target} 字，超了 ${chars - target} 字`,
       })
     }
   }
