@@ -56,6 +56,38 @@ const REVIEW_SOURCE_ROLES = {
 const MATERIAL_INPUT_RULES = '生成前先核对材料角色：正文是当前表述，设定是声明规则，人物卡是资料，文风是表达约束，章纲/大纲/事件线是计划，threads 是伏笔计划与可能过时的备忘。来源差异不自动证明谁错；作者明确裁决优先，裁决不明时指出分歧，不擅自覆盖资料。计划原句默认不要求照抄，保留意图与情绪并按文风表达。候选冲突需要模型核对，工具不自动认证兼容性。'
 
 
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu
+
+/**
+ * 工具返回值必须能无损往返 JSON：值为 undefined 的键、NaN/Infinity、落单代理项、
+ * 循环引用都会让宿主把整个结果判成非法输出（invalid output: value is not lossless JSON），
+ * 调用方只能看到一个和书稿毫无关系的报错。这里在注册边界统一收口：
+ * 丢掉 undefined 键、把非有限数与不可表示的值落成 null、修掉落单代理项。
+ */
+function toLosslessJson(value, seen = new WeakSet()) {
+  if (value === undefined) return null
+  if (value === null) return null
+  const type = typeof value
+  if (type === 'number') return Number.isFinite(value) ? value : null
+  if (type === 'string') return value.replace(LONE_SURROGATE, '\uFFFD')
+  if (type === 'boolean') return value
+  if (type === 'bigint') return value.toString()
+  if (type !== 'object') return null
+  if (value instanceof Date || Object.prototype.toString.call(value) === '[object Date]') {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString()
+  }
+  if (seen.has(value)) return null
+  seen.add(value)
+  if (Array.isArray(value)) return value.map(item => toLosslessJson(item, seen))
+  const copy = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (item === undefined) continue
+    copy[key] = toLosslessJson(item, seen)
+  }
+  seen.delete(value)
+  return copy
+}
+
 /** 一次调用作用域里的书根（工具/路由各自解析，互不串书）。 */
 const rootContext = new AsyncLocalStorage()
 
@@ -1485,7 +1517,7 @@ export function apply(ctx, config) {
       async execute(args, exec) {
         const header = exec && exec.agent && exec.agent.session ? exec.agent.session.header : undefined
         const root = await rootOf(header ? header.id : undefined, exec)
-        return await rootContext.run(root, () => execute(args, exec))
+        return toLosslessJson(await rootContext.run(root, () => execute(args, exec)))
       },
     })
   }
@@ -3196,7 +3228,9 @@ export function apply(ctx, config) {
         status: reviewState.status,
         certifiesSemantics: false,
         findings: reviewState.findings,
-        checkVerdicts: reviewState.checkVerdicts,
+        // 待审稿/直接查文本时没有六维结论：这里必须落成 null，不能是 undefined 键，
+        // 否则工具结果过不了宿主的无损 JSON 校验（宿主报 invalid output: value is not lossless JSON）。
+        checkVerdicts: reviewState.checkVerdicts ?? null,
         evidenceContexts: reviewState.evidenceContexts ?? [],
         timingReports: reviewState.timingReports ?? [],
         detail: chapterReview
