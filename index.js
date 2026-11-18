@@ -25,7 +25,7 @@ import { CHARACTERS_DIR } from './lib/book.js'
 import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
 import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
-import { numberFromToken, parseCadence } from './lib/people.js'
+import { parseCadence } from './lib/people.js'
 import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
 import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL } from './lib/beats.js'
@@ -310,23 +310,6 @@ function validateChapterContent(content) {
   }
   return warnings
 }
-
-/** 「三」这类中文数字也认：大纲里写「三章一爽点」是常态，写代码的人却总当成 sin=3。 */
-
-/** 人物卡上的戏份承诺：「- 戏份：每 8 章至少出场一次」。 */
-
-/** 大纲里的爽点规格：「三章一爽点」/「每 3 章至少一次爽点」。 */
-
-// 出场索引按「书的内容指纹」缓存：/characters 每 15 秒轮询一次，
-// 每次把几十章正文全读一遍太浪费，指纹没变就直接用上次的结果。
-let appearanceCache = { key: '', value: null }
-
-/**
- * 谁在哪一章出场过。判据是「名字出现在正文里」——含人物卡上的旧称。
- * 只扫有正文的章（characters.written），空章和占位章不算出场。
- */
-
-/** 把出场索引换算成「多久没露面」，给 /characters 与 novel_check 共用。 */
 
 /** 人物卡的「- 定位：」决定谁是主角、谁是女主——排序、装配、描写要求都靠它。 */
 /** 「- 记忆点：算珠；素色麻衣」——正文里反复认得出来的那几样东西。 */
