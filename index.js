@@ -31,7 +31,7 @@ import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognit
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
 import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
-import { THREADS_FILE, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
+import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
 import { stampOf, stampToIso, shortHash } from './lib/book.js'
 
 export const name = 'novel'
@@ -51,6 +51,7 @@ const REVIEW_SOURCE_ROLES = {
   outline: { role: 'plot-plan', label: '大纲计划', policy: '表达将来的安排，不能据此把正文中的差异直接判成事实错误。' },
   events: { role: 'event-plan', label: '事件线计划', policy: '检查目标、因果与推进安排，计划区间不自动证明事件已经发生。' },
   threads: { role: 'plan-and-history', label: '伏笔计划与历史备忘', policy: '先区分条目是计划、记录还是旧备忘；可能过时，不自动作为覆盖正文的事实基准。' },
+  ledger: { role: 'state-ledger', label: '动态状态台账', policy: '记录钱数、修为境界、道具去向、伤势与当前时间；续写前以此为准，写完有变动须用 novel_ledger 更新。' },
 }
 
 const MATERIAL_INPUT_RULES = '生成前先核对材料角色：正文是当前表述，设定是声明规则，人物卡是资料，文风是表达约束，章纲/大纲/事件线是计划，threads 是伏笔计划与可能过时的备忘。来源差异不自动证明谁错；作者明确裁决优先，裁决不明时指出分歧，不擅自覆盖资料。计划原句默认不要求照抄，保留意图与情绪并按文风表达。候选冲突需要模型核对，工具不自动认证兼容性。'
@@ -863,6 +864,9 @@ function assembleNovelContext(value, budget) {
   value.spine.forEach((item, i) => add(`event-${i}`, `事件：${item.id} ${item.title}`, `因为：${item.because}\n所以：${item.so}`))
   add('prevTail', '上一章结尾（节选）', value.prevTail.text)
   add('outline', '大纲参考（节选）', value.outline)
+  if (Array.isArray(value.ledger) && value.ledger.length) {
+    add('ledger', '动态状态台账（钱/境界/道具/时间，续写以此为准）', value.ledger.map(item => `- [${item.category}] ${item.item}：${item.state}${item.chapter ? `（@${item.chapter}${item.note ? `｜${item.note}` : ''}）` : item.note ? `（${item.note}）` : ''}`).join('\n'), true)
+  }
   value.threads.forEach((item, i) => add(`thread-${i}`, '伏笔', `${item.thread}（埋于 ${item.planted}，回收 ${item.payoff}）`))
   value.aiTone.forEach((item, i) => add(`tone-${i}`, `AI 腔线索：${item.label}`, (item.samples || []).join('\n')))
   value.warnings.forEach((item, i) => add(`warning-${i}`, '写作提醒', item))
@@ -1529,6 +1533,7 @@ export function apply(ctx, config) {
     const outline = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
     const characters = await listCharacters(rootNow())
     const threads = await loadThreads(rootNow())
+    const ledger = await loadLedger(rootNow())
     const beats = await beatsCoverage(rootNow(), chapters)
     const rhythm = await beatRhythm(rootNow(), chapters)
     const eventBoard = await readEvents(rootNow())
@@ -1592,6 +1597,11 @@ export function apply(ctx, config) {
         opened: threads.rows.filter(item => item.open).length,
         due: decorateThreads(threads.rows, writtenLatest).filter(item => item.due).length,
         total: threads.rows.length,
+      },
+      ledger: {
+        present: ledger.present,
+        active: ledger.rows.filter(item => item.active).length,
+        total: ledger.rows.length,
       },
       chapters: chapters.map(item => ({ ...item, progress: chapterProgress(item) })),
       totals: {
@@ -2337,6 +2347,7 @@ export function apply(ctx, config) {
         }
       }
       if (!reviewed) warnings.push(`【当前版本待复核】章节 ${chapter.id}：${DEAI_WORKFLOW}`)
+      if (mode !== 'patch') warnings.push(`若本章中主角的资产、修为境界、关键道具去向、伤势或时间线有变动，记得调用 novel_ledger 更新状态台账（ledger.md），避免下一章写串。`)
       return {
         id: chapter.id,
         title: chapter.title,
@@ -2780,6 +2791,8 @@ export function apply(ctx, config) {
       }
 
       const threads = await loadThreads(rootNow())
+      const ledger = await loadLedger(rootNow())
+      const ledgerRows = ledger.rows.filter(item => item.active !== false).slice(0, 20)
       const currentId = String(current.id)
       const threadRows = threads.rows
         .filter(item => item.open && (item.payoff === '' || item.payoff >= currentId))
@@ -2852,6 +2865,7 @@ export function apply(ctx, config) {
         prevTail: prev ? { id: prev.id, title: prev.title, text: prevTailText } : { id: '', title: '', text: '' },
         characters,
         settings,
+        ledger: ledgerRows,
         threads: threadRows,
         style: { name: styleName, present: Boolean(styleText), ...styleAssembly },
         mode: rewrite ? 'rewrite' : 'continue',
@@ -3103,6 +3117,91 @@ export function apply(ctx, config) {
       card: 'generic',
       title: args.thread ? `伏笔 ${args.thread}` : '列出伏笔',
       kind: args.thread ? 'write' : 'read',
+      rawInput: args,
+    }),
+  })
+
+  // ---- 动态状态台账 ----------------------------------------------------------
+  registerTool({
+    name: 'novel_ledger',
+    description:
+      '动态状态与数值台账（工作区 ledger.md）：记录钱/灵石、修为境界、关键道具去向、伤势、位置与当前时间，防止长篇写串。' +
+      '不传参数 = 列出当前全部生效状态；传 item + state（可选 category、chapter、note）= 新增或更新该项状态；传 item + delete: true = 删除该项。',
+    parameters: {
+      type: 'object',
+      properties: {
+        item: { type: 'string', description: '项目名（主键，如「陆昭现金」「稳相胆」「当前时间」）；省略则列出全部' },
+        state: { type: 'string', description: '当前最新状态或数值（如「79 城元（房租 120 差 41）」「第一天雨夜」；写「已消耗/已丢弃/作废」开头会自动归为非激活）' },
+        category: { type: 'string', enum: ['资产', '境界', '道具', '伤势', '位置', '时间', '其他'], description: '类别，默认「其他」' },
+        chapter: { type: 'string', description: '最近变更章（四位章 id，如 0001）' },
+        note: { type: 'string', description: '去向或补充说明（如「贴身内衬袋」「帆布裹好」）' },
+        delete: { type: 'boolean', description: 'true = 从台账删除该项' },
+        all: { type: 'boolean', description: '列出时是否包含已消耗/作废的旧条目，默认 false' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          mode: { type: 'string' },
+          item: { type: 'string' },
+          row: { type: 'object', additionalProperties: true },
+          rows: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          replaced: { type: 'boolean' },
+          deleted: { type: 'boolean' },
+          warnings: { type: 'array', items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => {
+        const formatRow = r => `- [${r.category}] ${r.item}：${r.state}${r.chapter ? `（@${r.chapter}${r.note ? `｜${r.note}` : ''}）` : r.note ? `（${r.note}）` : ''}`
+        if (value.mode === 'write') {
+          if (value.deleted) return textRender(`已从状态台账删除「${value.item}」。`)
+          return textRender(`${value.replaced ? '已更新' : '已登记'}台账条目：${value.row ? formatRow(value.row) : value.item}。${warnText(value.warnings)}`)
+        }
+        const active = (value.rows || []).filter(r => r.active)
+        const inactive = (value.rows || []).filter(r => !r.active)
+        const out = [`【状态台账】生效 ${active.length} 条 · 已消耗/作废 ${inactive.length} 条`]
+        if (!value.rows?.length) out.push('（台账还是空的。登记一条：novel_ledger({ category: "资产", item: "陆昭现金", state: "79 城元", chapter: "0001" })）')
+        if (active.length) {
+          out.push('', '当前生效：')
+          for (const r of active) out.push(formatRow(r))
+        }
+        if (value.showAll && inactive.length) {
+          out.push('', '已消耗/作废：')
+          for (const r of inactive) out.push(formatRow(r))
+        }
+        return textRender(out.join('\n'))
+      },
+    },
+    execute: async args => {
+      const hasItem = typeof args.item === 'string' && args.item.trim()
+      if (!hasItem) {
+        const ledger = await loadLedger(rootNow())
+        return { mode: 'list', rows: ledger.rows, showAll: args.all === true }
+      }
+      const written = await writeLedger(rootNow(), {
+        item: args.item,
+        category: typeof args.category === 'string' ? args.category : undefined,
+        state: typeof args.state === 'string' ? args.state : undefined,
+        chapter: typeof args.chapter === 'string' ? args.chapter : undefined,
+        note: typeof args.note === 'string' ? args.note : undefined,
+        delete: args.delete === true,
+      })
+      return {
+        mode: 'write',
+        item: written.item,
+        row: written.row,
+        rows: written.rows,
+        replaced: written.replaced,
+        deleted: written.deleted,
+        warnings: validateLedgerPatch(args),
+      }
+    },
+    presentCall: args => ({
+      card: 'generic',
+      title: args.item ? `台账 ${args.item}` : '查看状态台账',
+      kind: args.item ? 'write' : 'read',
       rawInput: args,
     }),
   })
@@ -4247,6 +4346,7 @@ export function apply(ctx, config) {
                 route !== '/setting' &&
                 route !== '/setting-delete' &&
                 route !== '/thread' &&
+                route !== '/ledger' &&
                 route !== '/style' &&
                 route !== '/style-active' &&
                 route !== '/style-clone' &&
@@ -4385,6 +4485,30 @@ export function apply(ctx, config) {
                   row: written.row,
                   replaced: written.replaced,
                   warnings: validateThreadPatch(payload),
+                })
+                return
+              }
+              if (route === '/ledger') {
+                if (typeof payload.item !== 'string' || !payload.item.trim()) {
+                  sendJson(res, 400, { error: '需要 item（台账项目名）' })
+                  return
+                }
+                const written = await writeLedger(rootNow(), {
+                  item: payload.item,
+                  category: typeof payload.category === 'string' ? payload.category : undefined,
+                  state: typeof payload.state === 'string' ? payload.state : undefined,
+                  chapter: typeof payload.chapter === 'string' ? payload.chapter : undefined,
+                  note: typeof payload.note === 'string' ? payload.note : undefined,
+                  delete: payload.delete === true,
+                })
+                sendJson(res, 200, {
+                  ok: true,
+                  item: written.item,
+                  row: written.row,
+                  rows: written.rows,
+                  replaced: written.replaced,
+                  deleted: written.deleted,
+                  warnings: validateLedgerPatch(payload),
                 })
                 return
               }
@@ -4683,6 +4807,10 @@ export function apply(ctx, config) {
               for (const chapter of threadMeta.chapters) threadStats.push(await chapterStats(rootNow(), chapter, threadMeta.targetChars))
               const latest = latestWrittenId(threadStats.filter(item => item.written))
               sendJson(res, 200, { ...threads, rows: decorateThreads(threads.rows, latest), latest })
+              return
+            }
+            if (route === '/ledger') {
+              sendJson(res, 200, await loadLedger(rootNow()))
               return
             }
             if (route === '/history') {
@@ -5268,6 +5396,7 @@ async function readReviewSource(root, chapter, reference) {
     case 'beats': return await readText(path.join(root, BEATS_FILE))
     case 'outline': return await readText(path.join(root, OUTLINE_FILE))
     case 'threads': return await readText(path.join(root, THREADS_FILE))
+    case 'ledger': return await readText(path.join(root, LEDGER_FILE))
     case 'events': return await readText(path.join(root, EVENTS_FILE))
     case 'character': return await readCharacter(root, reference.name)
     case 'setting': return await readSetting(root, reference.name)

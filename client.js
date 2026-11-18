@@ -805,6 +805,7 @@ window.__ModuleLoader__.load({
         const opened = data.threads ? data.threads.opened : 0
         text = `《${data.book.title}》 ${data.totals.written}/${data.totals.chapters} 章 · ${formatChars(data.totals.chars)} 字`
         if (opened > 0) text += ` · 伏笔 ${opened}`
+        if (data.ledger && data.ledger.active > 0) text += ` · 台账 ${data.ledger.active}`
         if (data.settings && data.settings.length) text += ` · 设定 ${data.settings.length}`
         if (data.style) text += ` · 文风 ${data.style}`
         const rhythm = data.rhythm
@@ -1401,6 +1402,7 @@ window.__ModuleLoader__.load({
             ? [
                 `${data.totals.written}/${data.totals.chapters} 章 · ${formatChars(data.totals.chars)} 字`,
                 data.threads && data.threads.opened > 0 ? `伏笔 ${data.threads.opened}` : '',
+                data.ledger && data.ledger.active > 0 ? `台账 ${data.ledger.active}` : '',
                 data.beats ? `章纲 ${data.beats.covered}/${data.beats.total}` : '',
               ]
                 .filter(Boolean)
@@ -2612,6 +2614,260 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 右栏「小说台账」页：钱/灵石、境界、道具去向、伤势、位置与当前时间。
+     * 数据在书根的 ledger.md，支持查看、快速新增/修改、删除，以及一键问 AI。
+     */
+    function LedgerPane() {
+      const { status, data, error, reload } = useJson('/ledger')
+      const novel = useNovel(30000)
+      const [busy, setBusy] = useState(null)
+      const [notice, setNotice] = useState(null)
+      const [showAll, setShowAll] = useState(false)
+      const [formOpen, setFormOpen] = useState(false)
+      const [category, setCategory] = useState('资产')
+      const [itemName, setItemName] = useState('')
+      const [stateVal, setStateVal] = useState('')
+      const [chapterVal, setChapterVal] = useState('')
+      const [noteVal, setNoteVal] = useState('')
+
+      const rows = (data && data.rows) || []
+      const active = rows.filter(item => item.active !== false)
+      const inactive = rows.filter(item => item.active === false)
+      const CATEGORIES = ['资产', '境界', '道具', '伤势', '位置', '时间', '其他']
+
+      const openEdit = row => {
+        setCategory(row ? row.category || '其他' : '资产')
+        setItemName(row ? row.item || '' : '')
+        setStateVal(row ? row.state || '' : '')
+        setChapterVal(row ? row.chapter || '' : '')
+        setNoteVal(row ? row.note || '' : '')
+        setFormOpen(true)
+        setNotice(null)
+      }
+
+      const saveEntry = async e => {
+        e.preventDefault()
+        if (!itemName.trim()) {
+          setNotice({ tone: 'err', text: '项目名不能为空' })
+          return
+        }
+        setBusy('__save__')
+        setNotice(null)
+        try {
+          await postJson(`${API}/ledger`, {
+            category,
+            item: itemName.trim(),
+            state: stateVal.trim(),
+            chapter: chapterVal.trim(),
+            note: noteVal.trim(),
+          })
+          await reload()
+          setFormOpen(false)
+          setNotice({ tone: 'ok', text: `已保存「${itemName.trim()}」` })
+        } catch (failure) {
+          setNotice({ tone: 'err', text: `没保存：${failure instanceof Error ? failure.message : String(failure)}` })
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const deleteEntry = async item => {
+        setBusy(item.item)
+        setNotice(null)
+        try {
+          await postJson(`${API}/ledger`, { item: item.item, delete: true })
+          await reload()
+          setNotice({ tone: 'ok', text: `已删除「${item.item}」` })
+        } catch (failure) {
+          setNotice({ tone: 'err', text: `没删掉：${failure instanceof Error ? failure.message : String(failure)}` })
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const rowOf = item =>
+        h(
+          'div',
+          { className: 'nvl-th-row', key: item.item },
+          h(
+            'div',
+            { className: 'nvl-th-main' },
+            h('span', { className: 'nvl-th-meta' }, `[${item.category}]`),
+            h('span', { className: 'nvl-th-name' }, item.item),
+            h('span', { className: 'nvl-th-meta', style: { color: 'inherit' } }, item.state || '—'),
+            item.chapter || item.note
+              ? h(
+                  'span',
+                  { className: 'nvl-th-meta' },
+                  `${item.chapter ? `@${item.chapter}` : ''}${item.chapter && item.note ? ' · ' : ''}${item.note || ''}`,
+                )
+              : null,
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'nvl-th-btn',
+              disabled: busy !== null || undefined,
+              onClick: () => openEdit(item),
+            },
+            '改',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'nvl-th-btn',
+              disabled: busy === item.item || undefined,
+              onClick: () => void deleteEntry(item),
+            },
+            busy === item.item ? '…' : '删',
+          ),
+        )
+
+      const header = h(
+        'div',
+        { className: 'nvl-head' },
+        h('span', { className: 'nvl-title' }, '小说台账'),
+        h(
+          'span',
+          { className: 'nvl-meta' },
+          `生效 ${active.length}` + (inactive.length ? ` · 已消耗/作废 ${inactive.length}` : ''),
+        ),
+        inactive.length
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'nvl-th-btn',
+                onClick: () => setShowAll(v => !v),
+              },
+              showAll ? '只看生效' : '看全部',
+            )
+          : null,
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'nvl-th-btn',
+            onClick: () => (formOpen ? setFormOpen(false) : openEdit(null)),
+          },
+          formOpen ? '收起' : '+ 记一条',
+        ),
+      )
+
+      const form = formOpen
+        ? h(
+            'form',
+            {
+              onSubmit: saveEntry,
+              style: {
+                padding: '8px 12px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '6px',
+                borderBottom: '1px solid var(--dsw-alias-border-l1)',
+              },
+            },
+            h(
+              'div',
+              { style: { display: 'flex', gap: '6px' } },
+              h(
+                'select',
+                {
+                  className: 'nvl-select',
+                  value: category,
+                  onChange: e => setCategory(e.target.value),
+                },
+                CATEGORIES.map(c => h('option', { key: c, value: c }, c)),
+              ),
+              h('input', {
+                type: 'text',
+                placeholder: '项目名（如：陆昭现金 / 稳相胆）',
+                value: itemName,
+                onChange: e => setItemName(e.target.value),
+                style: { flex: 1, minWidth: 0, padding: '4px 6px', fontSize: '12px' },
+              }),
+            ),
+            h('input', {
+              type: 'text',
+              placeholder: '当前状态（如：79 城元 / 已消耗）',
+              value: stateVal,
+              onChange: e => setStateVal(e.target.value),
+              style: { padding: '4px 6px', fontSize: '12px' },
+            }),
+            h(
+              'div',
+              { style: { display: 'flex', gap: '6px' } },
+              h('input', {
+                type: 'text',
+                placeholder: '变更章（如 0001）',
+                value: chapterVal,
+                onChange: e => setChapterVal(e.target.value),
+                style: { width: '90px', padding: '4px 6px', fontSize: '12px' },
+              }),
+              h('input', {
+                type: 'text',
+                placeholder: '备注（如：贴身内袋）',
+                value: noteVal,
+                onChange: e => setNoteVal(e.target.value),
+                style: { flex: 1, minWidth: 0, padding: '4px 6px', fontSize: '12px' },
+              }),
+              h(
+                'button',
+                {
+                  type: 'submit',
+                  className: 'nvl-th-btn',
+                  disabled: busy === '__save__' || undefined,
+                },
+                busy === '__save__' ? '保存中…' : '保存',
+              ),
+            ),
+          )
+        : null
+
+      let body
+      if (status === 'loading') {
+        body = h('div', { className: 'nvl-empty' }, '读取中…')
+      } else if (status === 'error') {
+        body = h('div', { className: 'nvl-empty' }, h('span', { className: 'nvl-err' }, `读取失败：${error}`))
+      } else if (!rows.length) {
+        body = h(
+          'div',
+          { className: 'nvl-empty' },
+          '还没有状态台账。点右上角「+ 记一条」，或直接跟 AI 说「记一下陆昭现在有 3 枚下品灵石」。',
+        )
+      } else {
+        body = h(
+          'div',
+          { className: 'nvl-th-list' },
+          active.length ? h('div', { className: 'nvl-th-sec' }, '当前生效', active.map(rowOf)) : null,
+          showAll && inactive.length
+            ? h('div', { className: 'nvl-th-sec', 'data-done': 'true' }, '已消耗 / 作废', inactive.map(rowOf))
+            : null,
+        )
+      }
+
+      return h(
+        'div',
+        { className: 'nvl-pane' },
+        header,
+        form,
+        notice ? h('div', { className: 'nvl-hint', 'data-tone': notice.tone }, notice.text) : null,
+        body,
+        h(AskBar, {
+          head: '动态状态台账',
+          book: (novel.data && novel.data.book && novel.data.book.title) || '未命名',
+          context: active
+            .map(item => `[${item.category}] ${item.item}：${item.state}${item.chapter ? `（@${item.chapter}）` : ''}${item.note ? `｜${item.note}` : ''}`)
+            .join('\n'),
+          fallback: '这份台账里有没有和最新章节矛盾、或者漏记消耗的条目？',
+          placeholder: '想问我什么？比如「陆昭现在还剩多少钱」',
+        }),
+      )
+    }
+
     // 文风页：一套文风一张卡，卡里放统计出来的句法/用词 + 逐字锚点原文 + 禁忌清单。
     function AuditPane() {
   const audit = useJson('/audit', 15000)
@@ -3217,6 +3473,7 @@ function StylesPane() {
       { id: 'dsh-novel/settings', kind: 'novel-settings', title: '小说设定', chip: '设定', description: '地点、规矩、物品、术语', Pane: SettingsPane },
       { id: 'dsh-novel/outline', kind: 'novel-outline', title: '小说大纲', chip: '大纲', description: '查看与就地编辑大纲', Pane: OutlinePane },
       { id: 'dsh-novel/threads', kind: 'novel-threads', title: '小说伏笔', chip: '伏笔', description: '埋了什么、该在哪章收', Pane: ThreadsPane },
+      { id: 'dsh-novel/ledger', kind: 'novel-ledger', title: '小说台账', chip: '台账', description: '钱财、境界、道具去向、伤势与时间线', Pane: LedgerPane },
       { id: 'dsh-novel/style', kind: 'novel-style', title: '小说文风', chip: '文风', description: '照一本书的句子写', Pane: StylesPane },
       { id: 'dsh-novel/audit', kind: 'novel-audit', title: '小说巡检', chip: '巡检', description: '全书一次扫完：漏写、断档、欠场、到期', Pane: AuditPane },
       { id: 'dsh-novel/history', kind: 'novel-history', title: '小说版本', chip: '版本', description: '每章改过哪些版、回到哪一版', Pane: HistoryPane },
@@ -3257,7 +3514,7 @@ function StylesPane() {
         kind: TAB_KIND,
         title: '小说助手',
         chip: '小说',
-        description: '章节 / 章纲 / 事件 / 人物 / 设定 / 伏笔 / 文风 / 版本 / 大纲',
+        description: '章节 / 章纲 / 事件 / 人物 / 设定 / 伏笔 / 台账 / 文风 / 巡检 / 版本 / 大纲',
         Pane: NovelSections,
       },
     ]
