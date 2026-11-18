@@ -114,7 +114,7 @@ chapters/0001.md   正文，一章一个文件
 
 - 判据：**能被拍出来的写 `- 场景：`**（有地点、有对手、结束时状态变了）；只在人物脑子里发生的（回忆、推断、前情交待）写 `- 信息：`。
 - 回忆**不占场景位**：它挂在某个场景的「撞上什么」里（例：`撞上安全气囊弹开、玻璃碎进嘴里，他记得有人在车外敲了三下窗`）。整章都在前世时才当场景写。
-- 一章最多 3 条信息；只有信息行、没有场景行 = 结构错误（`info-only`）；正文里没落地会被 `info-missing` 点到。
+- 一章最多 3 条信息；只有信息行、没有场景行 = 结构错误（`info-only`）；`info-missing` 仅表示字面近似匹配未命中，属于非阻塞线索，须读全文判断，不要求照抄或补写。
 - 前世的**事实**（洪水、改制、谁死了）要落成 `settings/` 条目，不要只写在章纲或信息行里。
 
 ## 事件线（`events.md`）—— 跨章的主线 / 感情 / 反派
@@ -174,11 +174,23 @@ chapters/0001.md   正文，一章一个文件
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
 4. `novel_write({ chapter, content })` —— 落盘。目标字数仅供参考，超出不删减、不缩写、不提前收尾；先把当前场景的动作前提、空间过渡和因果后果写清。是否分章由情节自然节点决定，确需顺延尚未开始的后续场景时可传 `carryOver: true`，不能拆散当前动作链。
 5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。
-6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。按场景提交 `scenes`，用连续的 `startIndex/endIndex` 覆盖全部段落，每场记录 `layout`、`mechanism`、`timeline`、`actions`。每个关键动作记录段号 `index` 与 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对人物位置、通路、工具来源、状态变化前因、技术因果、耗时及危险禁令；同段多个关键动作分条列出。静态场景可用空动作数组，但须说明依据；不得脑补缺失步骤后登记完成。再填写 `checks` 的 `continuity`（连续性）、`timing`（时间压力）、`voice`（角色声口）、`narration`（设定投放、细节与解释）、`rhythm`（句段与冲突）、`facts`（事实与信息完整性），用 `novel_deai_review({ chapter, baseHash, checks, scenes, paragraphs })` 登记。每项 checks 提交 `{ verdict, detail, evidence, counterargument }`：verdict 取 supported/conflict/uncertain/not-applicable，至少一条 `{ source: "chapter", index, quote }` 正文逐字引文，确认矛盾至少两条不同引文；引用人物卡、设定、文风时注明 source 与 name，并先读取对应资料。说明最可能推翻结论的证据或缺失依据，不编造距离、耗时、器件结构或后文影响。发现矛盾和依据不足也应如实登记，工具保存为 blocked；记录完整不等于通过。旧阻塞项转为通过时另填对应 resolutions，说明修复依据或更正原因。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文、引用资料或启用文风变化后旧复核失效，未复核或仍有阻塞项不能标记 `final`。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
+6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。按场景提交 `scenes`，用连续的 `startIndex/endIndex` 覆盖全部段落，每场记录 `layout`、`mechanism`、`timeline`、`actions`。每个关键动作记录段号 `index` 与 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对人物位置、通路、工具来源、状态变化前因、技术因果、耗时及危险禁令；同段多个关键动作分条列出。静态场景可用空动作数组，但须说明依据；不得脑补缺失步骤后登记完成。再填写 `checks` 的 `continuity`（连续性）、`timing`（时间压力）、`voice`（角色声口）、`narration`（设定投放、细节与解释）、`rhythm`（句段与冲突）、`facts`（事实与信息完整性），用 `novel_deai_review({ chapter, baseHash, checks, observations, timeBudgets, scenes, paragraphs })` 登记。每项 checks 提交 `{ verdict, detail, evidence, counterargument }`：verdict 取 supported/conflict/uncertain/not-applicable，至少一条 `{ source: "chapter", index, quote }` 正文逐字引文，确认矛盾至少两条不同引文；引用人物卡、设定、文风时注明 source 与 name，并先读取对应资料。说明最可能推翻结论的证据或缺失依据，不编造距离、耗时、器件结构或后文影响。发现矛盾和依据不足也应如实登记，工具保存为 blocked；记录完整不等于通过。旧阻塞项转为通过时另填对应 resolutions，说明修复依据或更正原因。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文、引用资料或启用文风变化后旧复核失效，未复核或仍有阻塞项不能标记 `final`。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。
    - `novel_write` 写完也会自动跑一次节奏比对，返回里有警告就别装没看见。
    - 右栏章节列表里挂了「漂」红标的章，就是节奏已经偏离文风卡的章。
 7. 有新人物就 `novel_card`，有新设定就 `novel_setting`，有新伏笔就更新 `threads.md`
+
+生成或改写前核对 `novel_context` 内的 `materialPreflight`，也可调用只读的 `novel_preflight({ chapter })`。章纲与文风的字面命中只是候选，逐项核对语义约束。正文是当前表述，设定是声明规则，人物卡是人物资料，文风是表达约束，章纲/大纲/事件线是计划，threads 是计划与可能过时的历史备忘。来源不同不自动证明谁错，不擅自覆盖资料；章纲内心原句默认不照抄，保留意图与情绪按文风表达。上下文预算不够时增加装配预算或继续读取资料，不缩写正文。
+
+版本 6 必填 `observations`，无发现填 `[]`。每条填写 `aspect/classification/detail/evidence/counterargument`；classification 为 conflict（确定矛盾）、missing-basis（依据不足）、preference（表达偏好）。conflict 另填 `comparison: { entity, property, timeScope }`，至少两条不同证据，先排除同名异物、属性不同和时间变化。checks 的 conflict/uncertain 必须有对应观察；preference 单列为非阻塞建议。证据来源新增 threads/events，先读真实内容；备忘与正文不同先记缺失依据，不自动裁定谁错。追踪物件位置及状态，包含单据已填写/空白、佩戴/脱下、温度和交接。不同物件数量、“新”的模糊时间、人物自己的观察均不能直接当作矛盾。
+
+登记时还须提交 `timeBudgets`：无窗口填 `[]`；有窗口列出同单位的明示时间、串并行阶段和任务。任务区分明示、估算、未知，未知不编数字；明示数值要有对应的逐字时间引文。估算与未知只限制记账结论，不自动证明正文有缺陷或动作可行；具体时间疑点另行说明对应区间与关系。不把一息换算成秒，也不为消除阻塞而往正文添加伪精确耗时。
+
+按审稿包的 `sourceRequirements` 在对应维度引用人物卡、启用文风卡和相关设定；不能拿校准器件的说明代替角色声口或文风依据。检查工具回显的完整段落，不能用截取末句遮住反例。工具计算或来源覆盖产生的阻塞项不能用 supported 抹掉。
+
+工具返回 recorded 只代表模型判断已登记，不得转述为“语义复核已通过”。时间记账成立不代表动作一定能完成，不得为解除提示向正文塞入计时句。近似统计位于 heuristicNotes，未命中反应词不能作为补写身体动作的理由。作者只要求检查时，保持正文不变，报告明确矛盾、依据不足和判断边界。
+
+报告状态时照读工具回执的 status；存在阻塞项时为 blocked，不能把保存成功说成 recorded。机械及资料计数不是正文错误数。阶段已有明示时长时，不因阶段内缺少单步耗时就要求逐步标时；时间疑点须指出具体区间、动作关系或影响判断的缺失前提。记账相容仍不等于物理可行，修法也不能未经核实就声称不改变事实。
 
 ## 导入旧稿（已有的一整本 txt / 一堆 md）
 
