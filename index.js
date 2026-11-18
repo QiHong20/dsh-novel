@@ -16,44 +16,30 @@
 import { createHash } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
 import path from 'node:path'
+import { countChars, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, DIALOGUE_REVIEW_RULES, DEAI_RULES, styleStats, styleFit, interiorStats, payoffMoments, detectAiTone, CJK_STOP, styleAnchorText, aiSnippet, aiSentences } from './lib/text.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, hash as stageHash, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
+import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
+import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
+import { CHARACTERS_DIR } from './lib/book.js'
+import { CHARACTER_EXT } from './lib/book.js'
+import { characterSummary } from './lib/people.js'
+import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
+import { numberFromToken, parseCadence } from './lib/people.js'
+import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
+import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
+import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL } from './lib/beats.js'
+import { OUTLINE_FILE } from './lib/book.js'
+import { THREADS_FILE, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
+import { stampOf, stampToIso, shortHash } from './lib/book.js'
 
 export const name = 'novel'
 
 // tools: 注册 novel_* 工具；webServer: 给客户端挂只读数据路由。
 export const inject = ['tools', 'webServer']
 
-const BOOK_FILE = 'book.json'
-const CHAPTERS_DIR = 'chapters'
-const CHARACTERS_DIR = 'characters'
-const OUTLINE_FILE = 'outline.md'
-const THREADS_FILE = 'threads.md'
-const BEATS_FILE = 'beats.md'
-const EVENTS_FILE = 'events.md'
 const API_PREFIX = '/novel-api'
-const DEFAULT_CHAPTER_TARGET = 3000
 
-/** 章节字数：去掉所有空白后按字符计（中文场景比按词计更贴近直觉）。 */
-function countChars(text) {
-  return Array.from(String(text ?? '').replace(/\s+/gu, '')).length
-}
-
-/**
- * 章纲级「占位正文」：`（待写）重生在 1998 年…` 这种一句话梗概不是正文。
- * 它让「已写 N 章」和进度条虚高，也让改状态时把这一章错标成 draft。
- */
-function isPlaceholderText(text) {
-  const body = String(text ?? '').replace(/\s+/gu, '')
-  if (body === '') return false
-  if (!/^[（(【\[]*(待写|待补|待续|占位|TODO|todo|TBD)/u.test(body)) return false
-  return Array.from(body).length <= 300
-}
-
-function clampInt(value, fallback, min, max) {
-  const n = Number(value)
-  if (!Number.isFinite(n)) return fallback
-  return Math.min(max, Math.max(min, Math.round(n)))
-}
 
 /** 一次调用作用域里的书根（工具/路由各自解析，互不串书）。 */
 const rootContext = new AsyncLocalStorage()
@@ -103,135 +89,21 @@ function resolveRoot(config) {
   return process.cwd()
 }
 
-async function readText(file) {
-  try {
-    return await fsp.readFile(file, 'utf8')
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null
-    throw error
-  }
-}
 
-async function readJson(file) {
-  const raw = await readText(file)
-  if (raw === null) return null
-  try {
-    return JSON.parse(raw)
-  } catch {
-    throw new Error(`${path.basename(file)} 不是合法 JSON，请先修好它再继续`)
-  }
-}
 
 /** 原子写：先写同目录临时文件再 rename，正文不会被半截写完的进程留在盘上。 */
-async function writeFileAtomic(file, text) {
-  await fsp.mkdir(path.dirname(file), { recursive: true })
-  const temp = `${file}.tmp-${process.pid}-${Date.now()}`
-  await fsp.writeFile(temp, text, 'utf8')
-  await fsp.rename(temp, file)
-}
 
-async function writeJson(file, value) {
-  await fsp.mkdir(path.dirname(file), { recursive: true })
-  await fsp.writeFile(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
-}
 
 /** 章节文件相对根目录，统一成 posix 风格，避免 book.json 在 Windows 上写满反斜杠。 */
-function normalizeFile(file, id) {
-  const raw = typeof file === 'string' && file.trim() ? file.trim() : `${id}.md`
-  const posix = raw.replace(/\\/gu, '/')
-  return posix.includes('/') ? posix : `${CHAPTERS_DIR}/${posix}`
-}
 
-const CHAPTER_STATUS = ['planned', 'draft', 'final']
 
-function normalizeChapter(entry) {
-  const file = typeof entry.file === 'string' && entry.file.trim() ? entry.file : ''
-  const fallbackId = path.basename(file || 'chapter', path.extname(file || ''))
-  const id = String(entry.id ?? fallbackId)
-  const status = CHAPTER_STATUS.includes(entry.status) ? entry.status : 'draft'
-  return {
-    id,
-    title: typeof entry.title === 'string' && entry.title.trim() ? entry.title : id,
-    file: normalizeFile(entry.file, id),
-    status,
-    targetChars: Number.isFinite(Number(entry.targetChars)) ? Math.max(0, Math.round(Number(entry.targetChars))) : 0,
-    ...(typeof entry.note === 'string' && entry.note.trim() ? { note: entry.note } : {}),
-    ...(entry.deaiReview && typeof entry.deaiReview === 'object' ? { deaiReview: entry.deaiReview } : {}),
-  }
-}
 
 /**
  * 读出书的结构。
  * 有 book.json 就以它为准；没有就退回「扫 chapters/ 目录、按文件名排序」，
  * 这样用户直接往目录里扔 .md 也能被看见，不会因为缺元数据就一片空白。
  */
-async function loadBook(root) {
-  const bookPath = path.join(root, BOOK_FILE)
-  const raw = await readJson(bookPath)
-  const meta = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
-  const declared = Array.isArray(meta.chapters) ? meta.chapters.filter(item => item && typeof item === 'object') : []
 
-  let chapters = declared.map(normalizeChapter)
-
-  if (chapters.length === 0) {
-    let names = []
-    try {
-      names = await fsp.readdir(path.join(root, CHAPTERS_DIR))
-    } catch (error) {
-      if (!error || error.code !== 'ENOENT') throw error
-    }
-    chapters = names
-      .filter(file => /\.md$/iu.test(file))
-      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
-      .map(file => {
-        // 没有 book.json 时按文件名猜：`0003.md`、`0003 第三章 湖心亭.md`、`第三章.md` 都要认。
-        // 开头是数字就把数字当章 id（补齐四位），剩下的当标题；否则整段文件名叫章节名。
-        const stem = path.basename(file, path.extname(file)).trim()
-        const numbered = /^(\d{1,4})\s*[-_.、:：]?\s*(.*)$/u.exec(stem)
-        if (numbered) {
-          return normalizeChapter({
-            id: numbered[1].padStart(4, '0'),
-            title: numbered[2].trim() || `第 ${Number(numbered[1])} 章`,
-            file,
-          })
-        }
-        return normalizeChapter({ id: stem, title: stem, file })
-      })
-  }
-
-  return {
-    exists: raw !== null || chapters.length > 0,
-    bookPath,
-    raw: meta,
-    meta: {
-      title: typeof meta.title === 'string' && meta.title.trim() ? meta.title : '未命名作品',
-      author: typeof meta.author === 'string' ? meta.author : '',
-      genre: typeof meta.genre === 'string' ? meta.genre : '',
-      summary: typeof meta.summary === 'string' ? meta.summary : '',
-      targetChars: clampInt(meta.targetChars, DEFAULT_CHAPTER_TARGET, 200, 50000),
-      // 「没写」和「写了 3000」是两件事：前者是插件默认值，不该被当成作者的决定。
-      targetCharsSet: Number.isFinite(Number(meta.targetChars)) && Number(meta.targetChars) > 0,
-      style: typeof meta.style === 'string' ? meta.style.trim() : '',
-      chapters,
-    },
-  }
-}
-
-async function chapterStats(root, chapter, fallbackTarget) {
-  const text = (await readText(path.join(root, chapter.file))) ?? ''
-  const chars = countChars(text)
-  const target = chapter.targetChars > 0 ? chapter.targetChars : fallbackTarget
-  const placeholder = isPlaceholderText(text)
-  return {
-    ...chapter,
-    chars,
-    target,
-    missing: text === '',
-    placeholder,
-    written: chars > 0 && !placeholder,
-    status: (text === '' || placeholder) && chapter.status === 'draft' ? 'planned' : chapter.status,
-  }
-}
 
 /** 章节相对进度：实际字数 / 目标字数，用来在界面上标「偏短 / 已达标」。 */
 function chapterProgress(item) {
@@ -241,73 +113,19 @@ function chapterProgress(item) {
 
 // ---- 人物卡 --------------------------------------------------------------
 
-const CHARACTER_EXT = '.md'
 
-function safeCharacterName(name) {
-  const trimmed = String(name ?? '').trim()
-  if (!trimmed) throw new Error('人物名不能为空')
-  if (/[\\/:*?"<>|]/u.test(trimmed)) throw new Error(`人物名不能包含 \\ / : * ? " < > |：${trimmed}`)
-  return trimmed
-}
 
 /** 人物卡的「一句话」：正文里第一行非标题、非空的内容，截到 60 字。 */
-function characterSummary(text) {
-  const line = String(text ?? '')
-    .split(/\r?\n/u)
-    .map(item => item.trim())
-    .find(item => item && !item.startsWith('#'))
-  if (!line) return ''
-  const plain = line.replace(/^[-*+]\s*/u, '').replace(/\*\*/gu, '')
-  return Array.from(plain).slice(0, 60).join('')
-}
 
 // ---- 人物状态（生死/在场）时间线 --------------------------------------------
-const STATE_CODES = ['在世', '去世', '已故', '失踪', '假死', '复活', '远走']
-const DEAD_WORDS = /(去世|死亡|身亡|殁|阵亡|遇难|丧命|死去|丧生|断气|咽气|暴毙|被杀|身故)/u
-const ALIVE_CLAUSE = /(没死|未死|不死|假死|装死|没去世|未去世|没牺牲|没遇难|不是死|诈死)/gu
 
 /**
  * 从人物卡的「状态」小节读出状态时间线。
  * 格式：`- @0003 去世（雾港码头失足）`＝从第 3 章起进入这个状态，直到下一条状态为止。
  * 没写这个小节 = 一直活着。只认 `@NNNN` 起点，不解析自然语言时间。
  */
-function parseStates(text) {
-  const lines = String(text ?? '').split(/\r?\n/u)
-  const states = []
-  let inside = false
-  for (const line of lines) {
-    const heading = /^\s{0,3}#{1,6}\s*(.+?)\s*$/u.exec(line)
-    if (heading) {
-      const title = heading[1].replace(/[*_`]/gu, '').trim()
-      inside = /^(状态|时间线|状态时间线|生死|行踪)/u.test(title)
-      continue
-    }
-    if (!inside) continue
-    const bullet = /^\s{0,3}[-*+]\s+(.+)$/u.exec(line)
-    if (!bullet) continue
-    const raw = bullet[1].replace(/\*\*/gu, '').trim()
-    const split = /^@\s*(\d{3,4})\s*[：:，,]?\s*(.+)$/u.exec(raw)
-    if (!split) continue
-    const label = split[2].trim()
-    if (!label) continue
-    // 先认状态码（唯一可靠判据），认不出才退回关键词，并标记为老格式
-    const code = STATE_CODES.find(item => label.startsWith(item)) ?? ''
-    const dead = code === '' ? DEAD_WORDS.test(label.replace(ALIVE_CLAUSE, '')) : code === '去世' || code === '已故'
-    states.push({ chapter: split[1].padStart(4, '0'), label, code, legacy: code === '', dead })
-  }
-  states.sort((a, b) => a.chapter.localeCompare(b.chapter))
-  return states
-}
 
 /** 取「截至 limit（含）最后一个状态」；没写过状态就是活着。 */
-function stateAt(states, limit) {
-  let current = null
-  for (const item of states ?? []) {
-    if (limit && item.chapter > limit) break
-    current = item
-  }
-  return current
-}
 
 // ---- 写入前的格式校验（只提醒，不拒绝写入）-----------------------------------
 function sectionLines(text, pattern) {
@@ -341,6 +159,10 @@ function warnText(list) {
 
 function validateCardContent(content) {
   const warnings = []
+  const identity = cardIdentity(String(content || ''))
+  if (!/^[a-zA-Z0-9_-]+$/.test(identity.id)) warnings.push('缺少有效的稳定 ID：请在卡片顶部写 - ID：character-id')
+  if (!identity.role) warnings.push('缺少人物定位')
+  if (identity.importance === '未设置') warnings.push('缺少重要程度：核心/重要/一般/临时')
   const body = String(content ?? '')
   if (!/^\s{0,3}#{2,6}\s+/mu.test(body)) {
     warnings.push('这张卡没有任何二级标题：关系图和生死判定只读 `## 关系` 与 `## 状态` 两节，没有就什么都读不到。')
@@ -473,7 +295,7 @@ function validateBeatsContent(content) {
   const warnings = []
   const body = String(content ?? '')
   if (/^\s{0,3}#{1,6}\s+\d{3,4}/mu.test(body)) warnings.push('章纲里不要再写「## 数字」这种章标题：标题由插件生成（写了也会被剥掉），正文只写场景。')
-  const scenes = body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s*场景\s*[：:]/u.test(line)).length
+  const scenes = parseScenes(body).length || body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s*场景\s*[：:]/u.test(line)).length
   if (!scenes) warnings.push('一条场景都没写（应为 3–6 条：`- 场景：谁 → 在哪 → 想干什么 → 撞上什么`）。')
   else if (scenes > 8) warnings.push(`写了 ${scenes} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。（只是提醒，内容已完整保存，回合数/行数都没有上限。）`)
   return warnings
@@ -490,42 +312,10 @@ function validateChapterContent(content) {
 }
 
 /** 「三」这类中文数字也认：大纲里写「三章一爽点」是常态，写代码的人却总当成 sin=3。 */
-function numberFromToken(token) {
-  const raw = String(token ?? '').trim()
-  if (!raw) return 0
-  if (/^\d+$/u.test(raw)) return Number(raw)
-  const digits = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 }
-  if (raw === '十') return 10
-  const tenAt = raw.indexOf('十')
-  if (tenAt === -1) return digits[raw] ?? 0
-  const head = tenAt === 0 ? 1 : digits[raw.slice(0, tenAt)] ?? 0
-  const tail = raw.slice(tenAt + 1)
-  return head * 10 + (tail ? digits[tail] ?? 0 : 0)
-}
 
 /** 人物卡上的戏份承诺：「- 戏份：每 8 章至少出场一次」。 */
-function parseCadence(text) {
-  const hit = /戏份[^\n]*?每\s*([一二三四五六七八九十百零两\d]{1,3})\s*章/u.exec(String(text ?? ''))
-  if (!hit) return 0
-  const value = numberFromToken(hit[1])
-  return value >= 1 && value <= 60 ? value : 0
-}
 
 /** 大纲里的爽点规格：「三章一爽点」/「每 3 章至少一次爽点」。 */
-function parseSceneCadence(outlineText) {
-  const body = String(outlineText ?? '')
-  const patterns = [
-    /每\s*([一二三四五六七八九十两\d]{1,3})\s*章\s*(?:至少)?\s*(?:一次)?\s*爽点/u,
-    /([一二三四五六七八九十两\d]{1,3})\s*章\s*一\s*爽点/u,
-  ]
-  for (const pattern of patterns) {
-    const hit = pattern.exec(body)
-    if (!hit) continue
-    const value = numberFromToken(hit[1])
-    if (value >= 1 && value <= 20) return value
-  }
-  return 0
-}
 
 // 出场索引按「书的内容指纹」缓存：/characters 每 15 秒轮询一次，
 // 每次把几十章正文全读一遍太浪费，指纹没变就直接用上次的结果。
@@ -535,80 +325,12 @@ let appearanceCache = { key: '', value: null }
  * 谁在哪一章出场过。判据是「名字出现在正文里」——含人物卡上的旧称。
  * 只扫有正文的章（characters.written），空章和占位章不算出场。
  */
-async function appearanceIndex(root, chapters, cards, target = 0) {
-  // meta.chapters 上没有 written/chars（那是 snapshot 才补的），这里自己过一遍 chapterStats。
-  const written = []
-  for (const chapter of chapters) {
-    if (chapter.written === true) {
-      written.push({ chapter, chars: chapter.chars ?? 0 })
-      continue
-    }
-    if (chapter.written === false || chapter.placeholder === true) continue
-    const stats = await chapterStats(root, chapter, target)
-    if (stats.written) written.push({ chapter, chars: stats.chars })
-  }
-  const key = `${root}|${written.map(row => `${row.chapter.id}:${row.chars}`).join(',')}|${cards.map(card => card.name).join(',')}`
-  if (appearanceCache.key === key) return appearanceCache.value
-  const names = new Map()
-  for (const card of cards) {
-    const cardText = (await readText(path.join(root, card.file))) ?? ''
-    names.set(card.name, [card.name, ...parseCardAliases(cardText)].filter(Boolean))
-  }
-  const last = new Map()
-  for (const row of written) {
-    const chapter = row.chapter
-    const body = (await readText(path.join(root, chapter.file))) ?? ''
-    for (const card of cards) {
-      const candidates = names.get(card.name) ?? [card.name]
-      if (candidates.some(name => name && body.includes(name))) last.set(card.name, chapter.id)
-    }
-  }
-  const latestId = written.length ? written[written.length - 1].chapter.id : ''
-  const value = { last, latestId }
-  appearanceCache = { key, value }
-  return value
-}
 
 /** 把出场索引换算成「多久没露面」，给 /characters 与 novel_check 共用。 */
-function appearanceReport(lastMap, cards, uptoId) {
-  const report = {}
-  if (!uptoId) return report
-  for (const card of cards) {
-    if (!card.cadence) continue
-    const lastId = lastMap.get(card.name) ?? ''
-    const firstState = Array.isArray(card.states) && card.states.length ? card.states[0].chapter : ''
-    if (!lastId && firstState && uptoId < firstState) continue
-    const startNum = firstState ? Number(firstState) : 1
-    const gap = lastId ? Math.max(0, Number(uptoId) - Number(lastId)) : Math.max(1, Number(uptoId) - startNum + 1)
-    report[card.name] = { last: lastId, gap, cadence: card.cadence, due: gap >= card.cadence }
-  }
-  return report
-}
 
-async function listCharacters(root) {
-  let names = []
-  try {
-    names = await fsp.readdir(path.join(root, CHARACTERS_DIR))
-  } catch (error) {
-    if (!error || error.code !== 'ENOENT') throw error
-    return []
-  }
-  const cards = []
-  for (const file of names.filter(item => item.toLocaleLowerCase().endsWith(CHARACTER_EXT)).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))) {
-    const name = path.basename(file, CHARACTER_EXT)
-    const text = (await readText(path.join(root, CHARACTERS_DIR, file))) ?? ''
-    cards.push({
-      name,
-      file: `${CHARACTERS_DIR}/${file.replace(/\\/gu, '/')}`,
-      chars: countChars(text),
-      summary: characterSummary(text),
-      relations: parseRelations(text),
-      states: parseStates(text),
-      cadence: parseCadence(text),
-    })
-  }
-  return cards
-}
+/** 人物卡的「- 定位：」决定谁是主角、谁是女主——排序、装配、描写要求都靠它。 */
+/** 「- 记忆点：算珠；素色麻衣」——正文里反复认得出来的那几样东西。 */
+
 
 /**
  * 从人物卡的「关系」小节读出有向边。
@@ -618,191 +340,30 @@ async function listCharacters(root) {
  * 名字后面可以跟**起始章**标记：`- 老周 @0007：开始怀疑她` 表示这条关系从第 7 章起成立。
  * 没有标记 = 从开篇就成立。只记起点、不记终点（关系断了就把这行改写或删掉）。
  */
-function parseRelations(text) {
-  const lines = String(text ?? '').split(/\r?\n/u)
-  const relations = []
-  let inside = false
-  for (const line of lines) {
-    const heading = /^\s{0,3}#{1,6}\s*(.+?)\s*$/u.exec(line)
-    if (heading) {
-      const title = heading[1].replace(/[*_`]/gu, '').trim()
-      inside = /^(关系|人物关系|人物之间的关系|关系网)/u.test(title)
-      continue
-    }
-    if (!inside) continue
-    const bullet = /^\s{0,3}[-*+]\s+(.+)$/u.exec(line)
-    if (!bullet) continue
-    const raw = bullet[1].replace(/\*\*/gu, '').trim()
-    const split = /^([^：:]{1,28})[：:]\s*(.*)$/u.exec(raw)
-    if (!split) continue
-    let target = split[1].trim()
-    let from = ''
-    // 只认起始章：`@0007`。老数据写成 `@0003-0008` 也照样解析，但只取 0003 当起点，区间后半段忽略。
-    const stamp = /^(.*?)\s*@\s*(\d{3,4})(?:\s*[-~]\s*\d{3,4})?\s*$/u.exec(target)
-    if (stamp) {
-      target = stamp[1].trim()
-      from = stamp[2]
-    }
-    if (!target) continue
-    relations.push({ target, label: split[2].trim(), from })
-  }
-  return relations
-}
 
 /**
  * 把「有向关系」摊成图数据；目标没建卡的人物留成虚线幽灵节点。
  * `upto` 给了章节 id（四位字符串）就只看「截至这一章已经成立」的关系：
  * 起始章晚于 upto 的边不画。关系只记起点、没有终点，所以不存在「已结束」这回事。
  */
-function characterGraph(cards, upto) {
-  const limit = upto ? String(upto).padStart(4, '0') : ''
-  const nodes = cards.map(card => {
-    const current = stateAt(card.states, limit)
-    return {
-      id: card.name,
-      name: card.name,
-      summary: card.summary,
-      chars: card.chars,
-      ghost: false,
-      dead: Boolean(current && current.dead),
-      stateLabel: current ? current.label : '',
-      stateChapter: current ? current.chapter : '',
-      states: (card.states ?? []).map(item => ({ chapter: item.chapter, label: item.label, dead: item.dead })),
-    }
-  })
-  const byId = new Map(nodes.map(node => [node.id, node]))
-  const edges = []
-  const push = (from, to, label, ghost, mark) => {
-    if (!byId.has(to)) {
-      const node = { id: to, name: to, summary: '', chars: 0, ghost: true, dead: false, stateLabel: '', stateChapter: '', states: [] }
-      byId.set(to, node)
-      nodes.push(node)
-    }
-    if (ghost && !byId.get(to).ghost) return
-    const tail = byId.get(from)
-    const head = byId.get(to)
-    edges.push({ from, to, label, fromChapter: mark, dead: Boolean((tail && tail.dead) || (head && head.dead)) })
-  }
-  for (const card of cards) {
-    for (const relation of card.relations) {
-      if (limit && relation.from && relation.from > limit) continue
-      const mark = relation.from
-      if (byId.has(relation.target)) {
-        push(card.name, relation.target, relation.label, false, mark)
-        continue
-      }
-      // 「林小满」写成「小满」也要连上：取唯一包含匹配，含糊就不猜。
-      const fuzzy = cards.filter(other => other.name !== card.name && (other.name.includes(relation.target) || relation.target.includes(other.name)))
-      if (fuzzy.length === 1) push(card.name, fuzzy[0].name, relation.label, false, mark)
-      else push(card.name, relation.target, relation.label, true, mark)
-    }
-  }
-  return { nodes, edges }
-}
 
-async function readCharacter(root, name) {
-  const file = path.join(root, CHARACTERS_DIR, `${safeCharacterName(name)}${CHARACTER_EXT}`)
-  return (await readText(file)) ?? null
-}
 
-async function writeCharacter(root, name, content) {
-  const file = path.join(root, CHARACTERS_DIR, `${safeCharacterName(name)}${CHARACTER_EXT}`)
-  await fsp.mkdir(path.dirname(file), { recursive: true })
-  await fsp.writeFile(file, content, 'utf8')
-  return { name, file: `${CHARACTERS_DIR}/${path.basename(file)}`, chars: countChars(content) }
-}
 
 // ---- 设定（settings/*.md，一个条目一个文件）--------------------------------
 //
 // 和人物卡同构：名字就是文件名，正文第一行非标题非空行拿来当摘要。
 // 可选第一行写 `- 分类：地点 / 规矩 / 物品 / 术语`，右栏用来分组显示。
 
-const SETTINGS_DIR = 'settings'
 
-function settingCategory(text) {
-  for (const line of String(text ?? '').split(/\r?\n/u)) {
-    const match = /^\s*[-*+]?\s*分类\s*[：:]\s*(.+)$/u.exec(line)
-    if (match) return match[1].replace(/[*`]/gu, '').trim()
-  }
-  return ''
-}
 
-function settingSummary(text) {
-  for (const line of String(text ?? '').split(/\r?\n/u)) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    if (/^#{1,6}\s/u.test(trimmed)) continue
-    if (/^\s*[-*+]\s*分类\s*[：:]/u.test(trimmed)) continue
-    return Array.from(trimmed.replace(/^[-*+]\s*/u, '')).slice(0, 60).join('')
-  }
-  return ''
-}
 
-async function listSettings(root) {
-  let names = []
-  try {
-    names = await fsp.readdir(path.join(root, SETTINGS_DIR))
-  } catch (error) {
-    if (!error || error.code !== 'ENOENT') throw error
-    return []
-  }
-  const items = []
-  for (const file of names.filter(item => item.toLocaleLowerCase().endsWith(CHARACTER_EXT)).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))) {
-    const name = path.basename(file, CHARACTER_EXT)
-    const text = (await readText(path.join(root, SETTINGS_DIR, file))) ?? ''
-    items.push({
-      name,
-      file: `${SETTINGS_DIR}/${file.replace(/\\/gu, '/')}`,
-      chars: countChars(text),
-      summary: settingSummary(text),
-      category: settingCategory(text),
-    })
-  }
-  return items
-}
 
-async function readSetting(root, name) {
-  const file = path.join(root, SETTINGS_DIR, `${safeCharacterName(name)}${CHARACTER_EXT}`)
-  return (await readText(file)) ?? null
-}
 
-async function writeSetting(root, name, content) {
-  const safe = safeCharacterName(name)
-  const file = path.join(root, SETTINGS_DIR, `${safe}${CHARACTER_EXT}`)
-  await fsp.mkdir(path.dirname(file), { recursive: true })
-  await fsp.writeFile(file, content, 'utf8')
-  return { name: safe, file: `${SETTINGS_DIR}/${path.basename(file)}`, chars: countChars(content) }
-}
 
 // 「作废」比删除常用来得多：设定写错了但过程有价值——留证据，不再进装配包。
-const SETTING_VOID_RE = /^\s*[-*+]?\s*状态\s*[：:]\s*(作废|废弃|停用|不用了|已废)/mu
 
-async function setSettingStatus(root, name, status) {
-  const safe = safeCharacterName(name)
-  const file = path.join(root, SETTINGS_DIR, `${safe}${CHARACTER_EXT}`)
-  const current = (await readText(file)) ?? ''
-  const lines = current.replace(/\r\n/gu, '\n').split('\n').filter(line => !SETTING_VOID_RE.test(line))
-  if (status === 'deprecated') {
-    const categoryAt = lines.findIndex(line => /^\s*[-*+]?\s*分类\s*[：:]/u.test(line))
-    const at = categoryAt >= 0 ? categoryAt + 1 : Math.min(1, lines.length)
-    lines.splice(at, 0, '- 状态：作废')
-  }
-  const body = lines.join('\n').replace(/\n{3,}/gu, '\n\n')
-  await fsp.writeFile(file, body, 'utf8')
-  return { name: safe, status: status === 'deprecated' ? 'deprecated' : 'active', chars: countChars(body) }
-}
 
 // 删除不是硬删：挪进 settings/.trash/，作者后悔了还能捞回来。
-async function deleteSetting(root, name) {
-  const safe = safeCharacterName(name)
-  const file = path.join(root, SETTINGS_DIR, `${safe}${CHARACTER_EXT}`)
-  const stamp = stampOf()
-  const trashDir = path.join(root, SETTINGS_DIR, '.trash')
-  await fsp.mkdir(trashDir, { recursive: true })
-  const target = path.join(trashDir, `${safe}-${stamp}${CHARACTER_EXT}`)
-  await fsp.rename(file, target)
-  return { name: safe, file: `${SETTINGS_DIR}/.trash/${path.basename(target)}` }
-}
 
 // ---- 文风卡（styles/<名字>.md）--------------------------------------------
 //
@@ -813,7 +374,6 @@ async function deleteSetting(root, name) {
 const STYLES_DIR = 'styles'
 const STYLE_EXCERPTS = 5
 const STYLE_EXCERPT_CHARS = 480
-const CJK_STOP = new Set('的了着过是在有和与就都也还很太不没我你他她它们这那哪个上下来的地去得把被给对从到又再才只'.split(''))
 
 // 克隆时自动填的禁忌候选：这些词是「AI 腔」的典型症状，样本里没出现就别让它长出来。
 // 这不是审美判断，是减法：作者自己没写过的腔调，续写时最容易冒出来。
@@ -1113,98 +673,13 @@ function decodeManuscript(buffer) {
 }
 
 /** 只用统计量说清「这本书怎么说话」：句长、段长、对话占比、标点密度、高频双字词。 */
-function styleStats(text) {
-  const source = String(text ?? '').replace(/\r\n/gu, '\n')
-  const chars = countChars(source)
-  const sentences = source
-    .split(/[。！？!?…]+/u)
-    .map(item => item.replace(/\s+/gu, ''))
-    .filter(item => item.length >= 2)
-  const paragraphs = source
-    .split(/\n+/u)
-    .map(item => item.trim())
-    .filter(item => item.length >= 12)
-  const dialogue = paragraphs.filter(item => /[「『“"＂]/u.test(item)).length
-  const per1000 = mark => Math.round(((source.split(mark).length - 1) / Math.max(chars, 1)) * 10000) / 10
-  const average = list => (list.length ? Math.round((list.reduce((sum, item) => sum + item.length, 0) / list.length) * 10) / 10 : 0)
-
-  const counts = new Map()
-  for (const chunk of source.replace(/[^\u4e00-\u9fff]+/gu, ' ').split(/\s+/u)) {
-    for (let index = 0; index + 1 < chunk.length; index += 1) {
-      const gram = chunk.slice(index, index + 2)
-      if (CJK_STOP.has(gram[0]) || CJK_STOP.has(gram[1])) continue
-      counts.set(gram, (counts.get(gram) ?? 0) + 1)
-    }
-  }
-
-
-
-  return {
-    chars,
-    sentences: sentences.length,
-    paragraphs: paragraphs.length,
-    avgSentence: average(sentences),
-    avgParagraph: average(paragraphs),
-    dialogueRatio: paragraphs.length ? Math.round((dialogue / paragraphs.length) * 100) : 0,
-    per1000: {
-      comma: per1000('，'),
-      period: per1000('。'),
-      ellipsis: per1000('…'),
-      dash: per1000('—'),
-      semicolon: per1000('；'),
-      exclaim: per1000('！'),
-      question: per1000('？'),
-    },
-    words: [...counts.entries()]
-      .filter(([, count]) => count >= 3)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 16)
-      .map(([word, count]) => ({ word, count })),
-  }
-}
 
 /**
  * 文风贴合度：拿文风卡自己的锚点当基准，看这一章的节奏指标偏了多少。
  * 只比可数的东西（句长、段长、对话占比、每千字标点），不做「写得好不好」的判断。
  */
-function styleFit(text, cardText, refText) {
-  const refSource = refText && countChars(refText) > 3000 ? refText : styleAnchorText(cardText)
-  const ref = styleStats(refSource)
-  const act = styleStats(text)
-  const rows = []
-  // hard=false 的指标只记录、不报警。段均/对话段/逗号测的是排版与习惯，
-  // 读者读着顺就是顺；把它们当硬指标会把「段落比样本长一点」也判成跑偏。
-  const push = (key, label, refValue, actValue, tol, hard = true) => {
-    if (!refValue) return
-    const ratio = Math.round((actValue / refValue) * 100) / 100
-    const low = tol ? tol[0] : 0.65
-    const high = tol ? tol[1] : 1.55
-    rows.push({ key, label, ref: refValue, act: actValue, ratio, hard, flag: hard && (ratio < low || ratio > high) })
-  }
-  push('avgSentence', '句均字数', ref.avgSentence, act.avgSentence, [0.7, 1.45])
-  push('avgParagraph', '段均字数', ref.avgParagraph, act.avgParagraph, [0.7, 1.4], false)
-  push('dialogue', '含对话段占比', ref.dialogueRatio, act.dialogueRatio, [0.5, 2], false)
-  push('comma', '每千字逗号', ref.per1000.comma, act.per1000.comma, [0.6, 1.7], false)
-  push('period', '每千字句号', ref.per1000.period, act.per1000.period, [0.7, 1.5])
-  // 标点类指标：参考文本里本来就只出现几次的，比值没意义，先要求样本里够多。
-  if (ref.per1000.dash >= 1.5 && act.per1000.dash >= 1)
-    push('dash', '每千字破折号', ref.per1000.dash, act.per1000.dash, [0.35, 2.8], false)
-  if (ref.per1000.ellipsis >= 1.5 && act.per1000.ellipsis >= 1)
-    push('ellipsis', '每千字省略号', ref.per1000.ellipsis, act.per1000.ellipsis, [0.35, 2.8], false)
-  const flagged = rows.filter(row => row.flag)
-  return { ok: flagged.length === 0, rows, flagged, ref, act }
-}
 
 /** 从文风卡里取「锚点原文」小节的正文（去掉引用符号），用来当节奏基准。 */
-function styleAnchorText(cardText) {
-  const sections = String(cardText ?? '').split(/\n##\s+/u).slice(1)
-  for (const chunk of sections) {
-    const rows = chunk.split(/\r?\n/u)
-    if (!/^锚点原文/u.test(rows[0].trim())) continue
-    return rows.slice(1).map(line => line.replace(/^>\s?/u, '')).join('\n')
-  }
-  return ''
-}
 
 /** 均匀取几段原文当锚点 —— 形容词描述得再准，也不如让模型看见原句。 */
 function sampleExcerpts(text, count = STYLE_EXCERPTS, chars = STYLE_EXCERPT_CHARS) {
@@ -1247,7 +722,7 @@ function assembleNovelContext(value, budget) {
   const size = text => Array.from(text).length
   const rewrite = value.mode === 'rewrite'
   const scope = value.rewriteScope
-  const voiceRule = '人物的临场反应与对话必须贴合各自人物卡的「性格」（遇事第一反应、小动作、底线）与「说话」习惯，并在初登场或关键对峙时顺手带出「外貌锚点」（不堆砌五官清单），禁止千人一面或直接套用叙述腔。'
+  const voiceRule = '人物的临场反应与对话必须贴合各自人物卡的「性格」（遇事第一反应、小动作、底线）与「说话」习惯，并在重要人物首次正式登场时考虑自然带出「外貌锚点」（允许暗处或隐藏身份等例外，不堆砌五官清单），禁止千人一面或直接套用叙述腔。'
   const instructions = rewrite
     ? scope.partial
       ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
@@ -1270,16 +745,9 @@ function assembleNovelContext(value, budget) {
     )
   }
   add('beats', '本章章纲', value.beats.text, true)
+  add('stage', '场景人物认知与计划边界', value.stage?.text || '', true)
   const interiorLines = value.beats && Array.isArray(value.beats.interiors) ? value.beats.interiors : []
-  if (interiorLines.length) {
-    add(
-      'interiors',
-      '这一章他心里的话（逐字写进正文，别改写成旁白）',
-      interiorLines.map(item => '- 情绪：' + (item.mood || '（没写情绪）') + '\n  台词：' + (item.line || item.text)).join('\n') +
-        '\n\n这些是内心台词：正文里要把台词和情绪都用上（可拆开、可夹在动作里），但别把「暗爽」写成「他心里感到一阵喜悦」这种旁白。',
-      true,
-    )
-  }
+  if (interiorLines.length) add('interiors', '可选心理材料（遵守视角，不按数量填充）', interiorLines.map(item => item.text).join('\n') + '\n可用联想、短回忆或间接叙述；仅作者参考不得直接写入内心。只有明确指定的保留心声原句才需逐字保留。', true)
   const cognitionRows = value.beats && Array.isArray(value.beats.cognition) ? value.beats.cognition : []
   if (cognitionRows.length) {
     add(
@@ -1309,8 +777,9 @@ function assembleNovelContext(value, budget) {
   const required = blocks.filter(item => item.required)
   const minimum = size([head, ...required.map(item => item.text)].join('\n\n') + footer)
   if (minimum > budget) {
-    const prompt = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。未提供残缺正文，不可据此覆盖整章。增大 budget（最多 20000）；长章请用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写。若片段仍放不下，缩小 rewriteLimit 或增大 budget。`
-    return { ...value, chapterText: '', prompt, budget, budgetUsed: size(prompt), ready: false, minimumBudget: minimum, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
+    const prompt = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。未提供残缺正文，不可据此覆盖整章。增大 budget（最多 40000）；长章请用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写。若片段仍放不下，缩小 rewriteLimit 或增大 budget。`
+    const guidance = !rewrite && value.stage?.scenes?.length ? `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。请增加 budget（默认 12000，最多 40000），或用 novel_context({chapter:"${value.chapter.id}",scene:"${value.stage.scenes[0].id}",budget:20000}) 按场景装配（最多 40000）；不得忽略人物认知边界。` : prompt
+    return { ...value, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), ready: false, minimumBudget: minimum, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
   }
   for (const block of [...required, ...blocks.filter(item => !item.required)]) {
     if (size([...parts, block.text].join('\n\n') + footer) <= budget) {
@@ -1421,135 +890,17 @@ function styleRestrictionMatches(text, words) {
 // 列顺序固定；「回收」列是**计划**回收章，所以状态留空 = open（还没收）。
 // 只有显式写 done / closed 才算收掉；否则「到期未收」永远判不出来。
 
-function parseThreads(text) {
-  const rows = []
-  for (const line of String(text ?? '').split(/\r?\n/u)) {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith('|')) continue
-    const cells = trimmed.replace(/^\|/u, '').replace(/\|$/u, '').split('|').map(cell => cell.trim())
-    if (cells.length < 2) continue
-    if (cells.every(cell => /^:?-{2,}:?$/u.test(cell) || cell === '')) continue
-    if (cells[0] === '伏笔' || cells[0] === 'thread') continue
-    const [label, planted = '', payoff = '', status = ''] = cells
-    if (!label) continue
-    const state = status ? status.toLocaleLowerCase() : 'open'
-    rows.push({
-      thread: label,
-      planted: planted || '',
-      payoff: payoff || '',
-      status: state,
-      open: state !== 'closed' && state !== 'done',
-    })
-  }
-  return rows
-}
 
 /** 已写到的最后一章 id（用来判断「该收了但还没收」）。 */
-function latestWrittenId(chapters) {
-  let latest = ''
-  for (const chapter of chapters) {
-    if (!chapter.chars) continue
-    if (chapter.id > latest) latest = chapter.id
-  }
-  return latest
-}
 
 /** 给伏笔行补 due 标记：计划回收章已经到了（或过了）却还没收。 */
-function decorateThreads(rows, latest) {
-  return rows.map(item => ({
-    ...item,
-    due: Boolean(item.open && item.payoff && latest && item.payoff <= latest),
-  }))
-}
 
-async function loadThreads(root) {
-  const text = (await readText(path.join(root, THREADS_FILE))) ?? ''
-  return { present: text !== '', chars: countChars(text), rows: parseThreads(text) }
-}
 
 /**
  * 写入或更新伏笔表的一行，其余行一个字不动。
  * 匹配键是第一条单元格（伏笔描述）；未提供字段保留原值。
  */
-async function writeThread(root, patch) {
-  const file = path.join(root, THREADS_FILE)
-  const existing = (await readText(file)) ?? '# 伏笔表\n\n| 伏笔 | 埋设 | 回收 | 状态 |\n| --- | --- | --- | --- |\n'
-  const lines = existing.replace(/\r\n/gu, '\n').split('\n')
-  const isRow = line => /^\s*\|/u.test(line)
-  const isSeparator = line => /^\s*\|(\s*:?-{2,}:?\s*\|)+\s*$/u.test(line)
-  const splitCells = line =>
-    line
-      .trim()
-      .replace(/^\|/u, '')
-      .replace(/\|$/u, '')
-      .split('|')
-      .map(cell => cell.trim())
 
-  let headerIndex = lines.findIndex(line => isRow(line) && !isSeparator(line) && /伏笔|thread/u.test(line))
-  if (headerIndex < 0) {
-    if (lines.length && lines[lines.length - 1].trim()) lines.push('')
-    lines.push('| 伏笔 | 埋设 | 回收 | 状态 |', '| --- | --- | --- | --- |')
-    headerIndex = lines.length - 2
-  }
-
-  let start = headerIndex + 1
-  if (isSeparator(lines[start] ?? '')) start += 1
-  let lastRow = start - 1
-  for (let i = start; i < lines.length; i++) {
-    if (!isRow(lines[i]) || isSeparator(lines[i])) break
-    lastRow = i
-  }
-
-  // 先清掉模板留下的空占位行（|  |  |  |  |），否则新伏笔会追加在它下面
-  for (let i = lastRow; i >= start; i--) {
-    if (!isRow(lines[i]) || isSeparator(lines[i])) continue
-    if (splitCells(lines[i]).every(cell => cell === '')) {
-      lines.splice(i, 1)
-      lastRow -= 1
-    }
-  }
-
-  const target = String(patch.thread).trim()
-  let touched = -1
-  for (let i = start; i <= lastRow; i++) {
-    if (!isRow(lines[i]) || isSeparator(lines[i])) continue
-    if (splitCells(lines[i])[0] === target) {
-      touched = i
-      break
-    }
-  }
-
-  const previous = touched >= 0 ? splitCells(lines[touched]) : [target, '', '', '']
-  const cells = [
-    target,
-    patch.planted ?? previous[1] ?? '',
-    patch.payoff ?? previous[2] ?? '',
-    patch.status ?? previous[3] ?? '',
-  ]
-  const row = `| ${cells.map(cell => String(cell).trim() || ' ').join(' | ')} |`
-  if (touched >= 0) lines[touched] = row
-  else lines.splice(lastRow + 1, 0, row)
-
-  const next = lines.join('\n').replace(/\n{3,}/gu, '\n\n')
-  await fsp.writeFile(file, next, 'utf8')
-
-  const rows = parseThreads(next)
-  return { thread: target, row: rows.find(item => item.thread === target) ?? null, rows, replaced: touched >= 0 }
-}
-
-function validateThreadPatch(patch) {
-  const warnings = []
-  const checkId = (value, label) => {
-    if (value === undefined || value === '') return
-    if (!/^\d{3,4}$/u.test(String(value))) warnings.push(`${label}不是四位章 id（如 0003）：「${value}」这一列右栏读不到。`)
-  }
-  checkId(patch.planted, '埋设章')
-  checkId(patch.payoff, '回收章')
-  if (patch.status !== undefined && patch.status !== '' && !['open', 'done', 'closed'].includes(String(patch.status))) {
-    warnings.push(`状态只认 open / done / closed，收到「${patch.status}」会按 open 处理（留空＝open，收掉了才写 done）。`)
-  }
-  return warnings
-}
 
 // ---- 上下文装配 -----------------------------------------------------------
 
@@ -1617,65 +968,15 @@ function splitOutline(text) {
  * 二级标题写成 `## <章 id> <标题>`，正文就是这一章的 beat 列表。
  * 单独成文件而不是塞进 book.json，是为了让人和 AI 都能直接读写、diff 好看。
  */
-function parseBeatSections(text) {
-  const source = String(text ?? '').replace(/\r\n/gu, '\n')
-  const sections = []
-  let current = null
-  for (const line of source.split('\n')) {
-    if (/^##\s/u.test(line)) {
-      current = { heading: line.replace(/^##\s*/u, '').trim(), lines: [] }
-      sections.push(current)
-      continue
-    }
-    if (current) current.lines.push(line)
-  }
-  return sections.map(section => {
-    const body = section.lines.join('\n').trim()
-    const match = /^(\d{1,6})\b/u.exec(section.heading)
-    return {
-      id: match ? match[1].padStart(4, '0') : '',
-      heading: section.heading,
-      body,
-      chars: countChars(body),
-      marks: parseBeatMarks(body),
-      infos: parseBeatInfos(body),
-      shifts: parseBeatShifts(body),
-      interiors: parseBeatInteriors(body),
-    cognition: parseBeatCognition(body),
-    reactions: parseBeatReactions(body),
-      events: parseBeatEventRefs(body),
-    }
-  })
-}
 
 /* ── 内心反应（人物不能只是执行动作） ──────────────────────────────
  * 判据不是「有多少个形容词」，而是「得手/失手之后有没有一个身体或念头反应」。
  * 一处都不用：他心里、手心、喉咙、胸口、后悔、发狠、愣、咬牙……
  * 这些词机器认得，写得好不好机器不判。
  */
-const INTERIOR_RE = /(心里|心头|心中|暗自|心底|脑子里|觉得|想着|想起|后悔|不甘|发狠|喉咙|喉结|嗓子|咽了口|咽下|胸口|手心|掌心|指尖|手指|后背|耳朵|耳根|太阳穴|胃里|鼻头|眼眶|发烫|发凉|发紧|冷汗|愣|松了口气|咬牙|手抖|腿软|呼吸|心跳|空了一块)/u
 
-function interiorStats(text) {
-  const paras = String(text ?? '')
-    .split(/\n+/)
-    .map(item => item.trim())
-    .filter(item => item && !/^[「『"“][^」』"”]+[」』"”]$/u.test(item))
-  const hit = paras.filter(item => INTERIOR_RE.test(item)).length
-  return { paras: paras.length, hit, ratio: paras.length ? Math.round((hit / paras.length) * 1000) / 10 : 0 }
-}
 
 /** 章纲里的「- 位移：从「…」到「…」」——这一场结束时他心里变了什么。 */
-function parseBeatShifts(body) {
-  const rows = []
-  String(body ?? '')
-    .replace(/\r\n/gu, '\n')
-    .split('\n')
-    .forEach((line, index) => {
-      const match = /^\s*[-*+]?\s*位移\s*[：:]\s*(.+)$/u.exec(line)
-      if (match) rows.push({ index, text: match[1].trim().slice(0, 120) })
-    })
-  return rows
-}
 
 /**
  * 章纲里的「- 心里：想起他爸递二十块那一下」——这一场他要想到什么、感觉到什么。
@@ -1685,80 +986,26 @@ function parseBeatShifts(body) {
  * 只在文风卡里写「要加心理」，模型会在一模一样的位置加一模一样的句子——
  * 那才是工业产物。写进章纲，每章的念头就不一样了。
  */
-function parseBeatReactions(body) {
-  const lines = String(body ?? '').split(/\r?\n/u)
-  const hits = []
-  for (let index = 0; index < lines.length; index += 1) {
-    const found = /^\s*[-*+]?\s*(?:反应|对方反应)\s*[：:]\s*(.+)$/u.exec(lines[index])
-    if (found) hits.push({ index, text: found[1].trim() })
-  }
-  return hits
-}
 
 const INTERIOR_MOODS = ['暗爽', '得意', '憋屈', '火', '慌', '心凉', '发狠', '松口气', '不耐', '恶心', '钝痛', '疑惑', '心疼', '讽刺']
 
 /**
- * 「- 心里：情绪｜台词」：只有情绪没有台词会变成旁白复述，只有台词没有情绪读者抓不到态度。
+ * 「- 心里：情绪｜台词」：作为可选材料读取；不强制情绪或台词格式。
  */
 /**
  * 「- 认知：…」：这一章他此刻**不知道**什么。比人物卡更有效——人物卡说身份，认知说边界。
  */
-function parseBeatCognition(body) {
-  const rows = []
-  String(body ?? '')
-    .replace(/\r\n/gu, '\n')
-    .split('\n')
-    .forEach((line, index) => {
-      const match = /^\s*[-*+]?\s*(?:认知|知道什么|认知边界)\s*[：:]\s*(.+)$/u.exec(line)
-      if (match) rows.push({ index, text: match[1].trim().slice(0, 200) })
-    })
-  return rows
-}
 
-function parseBeatInteriors(body) {
-  const rows = []
-  String(body ?? '')
-    .replace(/\r\n/gu, '\n')
-    .split('\n')
-    .forEach((line, index) => {
-      const match = /^\s*[-*+]?\s*(?:心里|心理|念头|回忆)\s*[：:]\s*(.+)$/u.exec(line)
-      if (!match) return
-      const raw = match[1].trim()
-      const parts = raw.split(/[｜|]/u)
-      const mood = parts.length > 1 ? parts[0].trim() : ''
-      const words = (parts.length > 1 ? parts.slice(1).join('｜').trim() : raw).slice(0, 200)
-      rows.push({ index, text: raw.slice(0, 200), mood, line: words })
-    })
-  return rows
-}
 
 /**
  * 找「标了 → 爽点 / 转折 却没有反应」的场：
  * 按章纲那一行切段，去正文里找最像的段落，再看那一带有没有身体/念头。
  */
-const MONEY_RE = /(到账|入账|赚|挣|收钱|给钱|递过去|推过去|掏出|数出|三百|五百|一千|两千|合同|提成|分红|工资|净利|存折|涨|签字)/u
 
 /**
  * 「钱一动，人就该有反应」：找出这一章所有提到钱/得手的段落，看它们身上或紧跟着有没有身体、念头。
  * 不拿章纲去对位——章纲是抽象骨架，对位容易错位；这条检查只看正文里最确定的东西。
  */
-function payoffMoments(text) {
-  const paras = String(text ?? '').split(/\n+/).map(item => item.trim()).filter(Boolean)
-  const samples = []
-  let total = 0
-  let hit = 0
-  for (let i = 0; i < paras.length; i += 1) {
-    if (!MONEY_RE.test(paras[i])) continue
-    total += 1
-    const window = paras.slice(i, Math.min(paras.length, i + 3))
-    if (window.some(item => INTERIOR_RE.test(item))) {
-      hit += 1
-      continue
-    }
-    if (samples.length < 3) samples.push(paras[i].slice(0, 30))
-  }
-  return { total, hit, samples }
-}
 
 /* ── 节奏标记（爽点 / 钩子 / 转折） ────────────────────────────────
  * 爽点不单独建表：它是「这一场戏怎么演」的属性，写在场记后面最不容易丢。
@@ -1766,520 +1013,43 @@ function payoffMoments(text) {
  * 和既有的 `钩子：陈默说……`（标记+冒号，冒号后当备注）。
  * 宿主只解析、不存第二份；全局台账由 beatRhythm() 现算。
  */
-const BEAT_MARK = /(?:→|->|—>|=>)\s*(爽点|钩子|转折)\s*(?:[（(]([^）)]{0,24})[）)])?/gu
-const BEAT_MARK_COLON = /(?:^|[\s、，,。；;])(爽点|钩子|转折)\s*[：:]\s*([^\n]{0,24})/u
-const BEAT_MARK_TAIL = /(?:^|[\s、，,。；;])(爽点|钩子|转折)\s*(?:[（(]([^）)]{0,24})[）)])?\s*$/u
 
-function parseBeatMarks(body) {
-  const payoff = []
-  let hook = 0
-  let turn = 0
-  const lines = String(body ?? '').split('\n')
-  lines.forEach((line, index) => {
-    let kind = ''
-    let label = ''
-    BEAT_MARK.lastIndex = 0
-    const arrow = BEAT_MARK.exec(line)
-    if (arrow) {
-      kind = arrow[1]
-      label = (arrow[2] ?? '').trim()
-    } else {
-      // 也认「钩子：陈默说…」这种把标记写在句子里的写法（作者既有习惯）。
-      const colon = BEAT_MARK_COLON.exec(line)
-      if (colon) {
-        kind = colon[1]
-        label = (colon[2] ?? '').trim().replace(/[。；;，,、\s]+$/u, '')
-      } else {
-        const tail = BEAT_MARK_TAIL.exec(line.trim())
-        if (tail) {
-          kind = tail[1]
-          label = (tail[2] ?? '').trim()
-        }
-      }
-    }
-    if (!kind) return
-    if (kind === '爽点') payoff.push({ index, label })
-    else if (kind === '钩子') hook += 1
-    else turn += 1
-  })
-  return { payoff, hook, turn }
-}
 
-function beatHeading(chapter) {
-  return `${chapter.id} ${chapter.title}`
-}
 
 /** 先按章节 id 匹配，再退回标题包含（人可能顺手把「## 第三章 空铺」写成不带 id 的样子）。 */
-function matchBeatSection(sections, chapter) {
-  const id = String(chapter.id).padStart(4, '0')
-  const byId = sections.find(section => section.id === id)
-  if (byId) return byId
-  if (!chapter.title) return null
-  return sections.find(section => section.heading.includes(chapter.title)) ?? null
-}
 
 /** 「信息行」：这一章必须让读者新知道的事实。它不是场景（没地点、没对手、没有变化），
  *  所以单独记、单独查：章纲里可以写，但正文里没给出来就要报。
  */
-function parseBeatInfos(body) {
-  const infos = []
-  String(body ?? '')
-    .split('\n')
-    .forEach(line => {
-      const match = /^\s*[-*+]?\s*信息\s*[：:]\s*(.+)$/u.exec(line)
-      if (!match) return
-      const text = match[1].trim()
-      if (text) infos.push({ index: infos.length + 1, text })
-    })
-  return infos
-}
 
 /* ── 事件线（events.md） ────────────────────────────────────────────
  * 一章可以同时推进多条线，一条线跨很多章 —— 多对多，所以它和 threads.md
  * 一样配得上一份独立资产。定义写在 events.md，章纲里只留锚点
  * （「- 事件：主线-1、感情-2」），时间线由 eventTimeline() 现算，不落第二份。
  */
-function parseBeatEventRefs(body) {
-  const refs = []
-  String(body ?? '').split('\n').forEach(line => {
-    const match = /^\s*[-*+]?\s*事件\s*[：:]\s*(.+)$/u.exec(line)
-    if (!match) return
-    match[1].split(/[、,，/／;；\s]+/u).forEach(piece => {
-      const id = piece.trim().replace(/[。.、]$/u, '')
-      if (id && !refs.includes(id)) refs.push(id)
-    })
-  })
-  return refs
-}
 
-function parseChapterRange(text) {
-  const hit = String(text ?? '').match(/(\d{1,4})\s*(?:[-–—~～至到]\s*(\d{1,4}))?/u)
-  if (!hit) return { from: '', to: '' }
-  const from = hit[1].padStart(4, '0')
-  const to = hit[2] ? hit[2].padStart(4, '0') : from
-  return { from, to: to < from ? from : to }
-}
 
-function parseEventLines(text) {
-  const source = String(text ?? '').replace(/\r\n/gu, '\n')
-  const lines = []
-  let line = null
-  let event = null
-  const closeEvent = () => {
-    if (!line || !event) {
-      event = null
-      return
-    }
-    const body = event.raw.trim()
-    const pick = label => {
-      const hit = new RegExp('^\\s*[-*+]?\\s*' + label + '\\s*[：:]\\s*(.+)$', 'mu').exec(body)
-      return hit ? hit[1].trim() : ''
-    }
-    line.events.push({
-      id: event.id,
-      title: event.title,
-      from: event.from,
-      to: event.to,
-      because: pick('因为'),
-      so: pick('所以'),
-      irreplaceable: pick('不可替代'),
-      body,
-      chars: countChars(body),
-    })
-    event = null
-  }
-  for (const raw of source.split('\n')) {
-    if (/^###\s/u.test(raw)) {
-      closeEvent()
-      if (!line) continue
-      const title = raw.replace(/^###\s*/u, '').trim()
-      const head = /^([^\s（(]+)\s*(.*)$/u.exec(title) ?? [title, title, '']
-      const rest = head[2] ?? ''
-      const range = parseChapterRange(rest)
-      event = {
-        id: head[1].trim(),
-        title: rest.replace(/[（(][^）)]*[）)]/gu, '').trim(),
-        from: range.from,
-        to: range.to,
-        raw: '',
-      }
-      continue
-    }
-    if (/^##\s/u.test(raw)) {
-      closeEvent()
-      const title = raw.replace(/^##\s*/u, '').trim()
-      const split = /^([^：:]{1,10})[：:]\s*(.+)$/u.exec(title)
-      line = {
-        id: (split ? split[1] : title).trim(),
-        name: (split ? split[2] : title).trim(),
-        goal: '',
-        span: '',
-        raw: '',
-        events: [],
-      }
-      lines.push(line)
-      continue
-    }
-    if (event) { event.raw += raw + '\n'; continue }
-    if (line) line.raw += raw + '\n'
-  }
-  closeEvent()
-  for (const item of lines) {
-    const body = item.raw.trim()
-    const goal = /^\s*[-*+]?\s*目标\s*[：:]\s*(.+)$/mu.exec(body)
-    const span = /^\s*[-*+]?\s*(?:起点|跨度|区间)[^\n：:]*[：:]\s*(.+)$/mu.exec(body)
-    item.goal = goal ? goal[1].trim() : ''
-    item.span = span ? span[1].trim() : ''
-    delete item.raw
-  }
-  return lines
-}
 
-async function readEvents(root) {
-  const text = (await readText(path.join(root, EVENTS_FILE))) ?? ''
-  const lines = parseEventLines(text)
-  const events = []
-  for (const line of lines) {
-    for (const event of line.events) events.push({ ...event, lineId: line.id, lineName: line.name })
-  }
-  return { present: text.trim().length > 0, chars: countChars(text), text, lines, events }
-}
 
 /** 时间线：事件 → 覆盖哪些章；章 → 推了哪几条线。区间给默认，锚点做修正。 */
-function eventTimeline(board, chapters, beatSections) {
-  const lookup = new Map()
-  for (const line of board.lines) {
-    for (const event of line.events) lookup.set(event.id, { ...event, lineId: line.id, lineName: line.name })
-  }
-  const warnings = []
-  const perChapter = chapters.map(item => {
-    const section = beatSections ? matchBeatSection(beatSections, item) : null
-    const anchors = section && Array.isArray(section.events) ? section.events : []
-    return { id: item.id, title: item.title, written: item.written === true, anchors, hits: [] }
-  })
-  const byId = new Map(perChapter.map(item => [item.id, item]))
-  for (const item of perChapter) {
-    for (const id of item.anchors) {
-      const event = lookup.get(id)
-      if (!event) {
-        warnings.push(item.id + ' 锚了「' + id + '」，但 events.md 里没有这条事件')
-        continue
-      }
-      if (event.from && (item.id < event.from || item.id > event.to)) {
-        warnings.push(item.id + ' 锚了「' + id + '」，可它标的是 ' + event.from + '–' + event.to + ' 章')
-      }
-      item.hits.push({ lineId: event.lineId, lineName: event.lineName, eventId: event.id, title: event.title })
-    }
-    if (item.anchors.length > 4) {
-      warnings.push(item.id + ' 一章推了 ' + item.anchors.length + ' 条线，容易写成摘要而不是戏')
-    }
-  }
-  const lines = board.lines.map(line => {
-    const events = line.events.map(event => {
-      const covered = []
-      for (const item of perChapter) {
-        const inRange = event.from !== '' && item.id >= event.from && item.id <= event.to
-        if (inRange || item.anchors.includes(event.id)) covered.push(item.id)
-      }
-      const done = covered.filter(id => byId.get(id) && byId.get(id).written).length
-      return {
-        id: event.id,
-        title: event.title,
-        from: event.from,
-        to: event.to,
-        because: event.because,
-        so: event.so,
-        irreplaceable: event.irreplaceable,
-        chapters: covered,
-        written: done,
-        total: covered.length,
-        status: covered.length === 0 ? '未开始' : done === covered.length ? '已写完' : done === 0 ? '未动笔' : '进行中',
-      }
-    })
-    return {
-      id: line.id,
-      name: line.name,
-      goal: line.goal,
-      span: line.span,
-      events,
-      covered: events.filter(item => item.written > 0).length,
-      total: events.length,
-    }
-  })
-  return {
-    present: board.present,
-    lines,
-    chapters: perChapter,
-    warnings,
-    lineCount: lines.length,
-    eventCount: lines.reduce((sum, line) => sum + line.total, 0),
-    done: lines.reduce((sum, line) => sum + line.covered, 0),
-  }
-}
 
 /** 整段替换一条线（和 writeBeats 同语义：别的线一个字都不动）。 */
-async function writeEventLine(root, lineId, content) {
-  const file = path.join(root, EVENTS_FILE)
-  const existing =
-    (await readText(file)) ??
-    '# 事件线\n\n> 一条线一个 ## 小节，一个事件一个 ### 小节；事件标题写「### 主线-1 真相落地（1–3）」。\n'
-  const normalized = String(content ?? '').replace(/\r\n/gu, '\n').trim()
-  const blockText = /^##\s/u.test(normalized) ? normalized : '## ' + lineId + '\n\n' + normalized
-  const source = existing.replace(/\r\n/gu, '\n')
-  const rows = source.split('\n')
-  const heads = []
-  rows.forEach((row, index) => { if (/^##\s/u.test(row)) heads.push(index) })
-  const target = heads.find(index => rows[index].replace(/^##\s*/u, '').trim().startsWith(lineId))
-  let next
-  if (target === undefined) {
-    next = source.trimEnd() + '\n\n' + blockText + '\n'
-  } else {
-    const after = heads.filter(index => index > target)[0]
-    const head = rows.slice(0, target)
-    const tail = after === undefined ? [] : rows.slice(after)
-    next = head.concat(blockText.split('\n')).concat(tail).join('\n')
-  }
-  next = next.replace(/\n{3,}/gu, '\n\n')
-  await writeFileAtomic(file, next)
-  return { line: lineId, chars: countChars(blockText) }
-}
-async function readBeats(root, chapter) {
-  const text = (await readText(path.join(root, BEATS_FILE))) ?? ''
-  const sections = parseBeatSections(text)
-  const section = chapter ? matchBeatSection(sections, chapter) : null
-  return {
-    present: text.trim().length > 0,
-    sections,
-    section: section
-        ? {
-            heading: section.heading,
-            body: section.body,
-            chars: section.chars,
-            marks: section.marks,
-            infos: section.infos,
-            events: section.events,
-            interiors: section.interiors,
-    cognition: section.cognition,
-            reactions: section.reactions,
-            shifts: section.shifts,
-          }
-      : null,
-  }
-}
 
 /** 只替换这一章那一节，别的章一个字都不动；没有这一节就追加到文件末尾。 */
-async function writeBeats(root, chapter, content) {
-  const file = path.join(root, BEATS_FILE)
-  const existing = (await readText(file)) ?? '# 章纲\n\n> 每章一节，标题写 `## <章 id> <标题>`，正文写这一章要拍的场景。\n'
-  const raw = String(content ?? '').replace(/\r\n/gu, '\n').trim()
-  // 节标题由插件生成；粘进来的 `## 0003 …` 会变成两层标题，直接剥掉
-  const normalized = raw.replace(/^#{1,6}\s*\d{3,4}[^\n]*(?:\n+|$)/u, '').trim()
-  const lines = existing.replace(/\r\n/gu, '\n').split('\n')
-  const isHeading = line => /^##\s/u.test(line)
-  let start = -1
-  for (let i = 0; i < lines.length; i++) {
-    if (!isHeading(lines[i])) continue
-    const heading = lines[i].replace(/^##\s*/u, '').trim()
-    const id = (/^(\d{1,6})\b/u.exec(heading) || [])[1]
-    const hit = (id && id.padStart(4, '0') === String(chapter.id).padStart(4, '0'))
-      || (chapter.title && heading.includes(chapter.title))
-    if (hit) {
-      start = i
-      break
-    }
-  }
-  let end = lines.length
-  if (start >= 0) {
-    for (let i = start + 1; i < lines.length; i++) {
-      if (isHeading(lines[i])) {
-        end = i
-        break
-      }
-    }
-  }
-  const block = [`## ${beatHeading(chapter)}`, '', normalized, '']
-  if (start >= 0) lines.splice(start, end - start, ...block)
-  else {
-    if (lines.length && lines[lines.length - 1].trim()) lines.push('')
-    lines.push(...block)
-  }
-  const output = `${lines.join('\n').replace(/\n{3,}/gu, '\n\n').replace(/\s+$/u, '')}\n`
-  await fsp.writeFile(file, output, 'utf8')
-  return { heading: beatHeading(chapter), chars: countChars(normalized) }
-}
 
 /** 给状态条 / 右栏用：哪些章有章纲、几行。 */
-async function beatsCoverage(root, chapters) {
-  const { sections } = await readBeats(root, null)
-  const covered = []
-  for (const chapter of chapters) {
-    const section = matchBeatSection(sections, chapter)
-    if (section && section.chars > 0) covered.push(chapter.id)
-  }
-  return { present: sections.length > 0, total: chapters.length, covered, missing: chapters.filter(c => !covered.includes(c.id)).map(c => c.id) }
-}
 
 /**
  * 章纲到底落实了没有：逐条 beat 拿它和正文求「最长公共片段」，太短就算这场景可能没写。
  * 只是提醒，不改文件——真正判断要靠人；但没有这个提醒，模型很容易只写了第一条 beat 就收笔。
  */
-function beatCoverage(text, beatsText) {
-  const source = String(text ?? '')
-  const markerPattern = /^(?:信息|落点|钩子|爽点|转折|位移|反应|心里|心理|念头|回忆|认知|备注|注)\s*[：:]/u
-  const rawLines = String(beatsText ?? '')
-    .split('\n')
-    .map(line => line.replace(/^\s*[-*+]\s*/u, '').trim())
-    .filter(line => line.length >= 6 && !line.startsWith('#') && !markerPattern.test(line))
-  // 作者写了「- 场景：…」就只按场景算；没写就退回全部实体行（老章纲是散文式的）。
-  const scenes = rawLines.filter(line => /^场景\s*[：:]/u.test(line))
-  const entries = scenes.length ? scenes : rawLines
-  if (!entries.length || !source) return { total: entries.length, covered: 0, missing: [] }
-
-  const quotesOf = line => [...line.matchAll(/[「『"“]([^」』"”]{2,})[」』"”]/gu)].map(match => match[1])
-  const longestCommon = line => {
-    // 只比汉字/字母数字，标点和空格不参与，避免「撞上」「→」这类高频符号凑长度。
-    const a = [...line.replace(/[^\p{Script=Han}a-zA-Z0-9]/gu, '')]
-    const b = [...source.replace(/[^\p{Script=Han}a-zA-Z0-9]/gu, '')]
-    if (!a.length || !b.length) return 0
-    let best = 0
-    let previous = new Array(b.length + 1).fill(0)
-    for (let i = 1; i <= a.length; i += 1) {
-      const current = new Array(b.length + 1).fill(0)
-      for (let j = 1; j <= b.length; j += 1) {
-        if (a[i - 1] === b[j - 1]) {
-          current[j] = previous[j - 1] + 1
-          if (current[j] > best) best = current[j]
-        }
-      }
-      previous = current
-    }
-    return best
-  }
-
-  // 章纲是摘要、正文是散文，两者的公共片段常常只有三五个字。
-  // 所以再加一路「双字词命中率」：摘要里一半以上的双字词在正文里出现过，就认为这一场落地了。
-  // 宁可漏报也不误报——报警一次错一次，作者就会把这个检查当噪音关掉。
-  const STRUCT_WORDS = /(场景|落点|信息|钩子|爽点|转折|结果|然后|于是|接着|想要|目标|本章|这章|读者|收尾|结尾)/gu
-  const bigramRatio = line => {
-    const cleaned = String(line ?? '').replace(STRUCT_WORDS, '')
-    const han = cleaned.replace(/[^\u4e00-\u9fff]/gu, '')
-    if (han.length < 4) return 1
-    const grams = new Set()
-    for (let i = 0; i + 2 <= han.length; i += 1) grams.add(han.slice(i, i + 2))
-    let hit = 0
-    for (const gram of grams) if (source.includes(gram)) hit += 1
-    return grams.size ? hit / grams.size : 1
-  }
-
-  // 章纲写的是「谁 → 在哪 → 想干什么 → 撞上什么」这种抽象骨架，正文是具体场景，
-  // 整行比相似度必然很低。所以按 → 切段，逐段看有没有交集：多数段都沾到了，就算这场写了。
-  const segmentsOf = line =>
-    String(line ?? '')
-      .replace(/^场景\s*[：:]/u, '')
-      .split(/→|->|—>|=>/u)
-      .map(part => part.replace(STRUCT_WORDS, '').trim())
-      .filter(part => part.replace(/[^\u4e00-\u9fff]/gu, '').length >= 2)
-  const segmentRatio = line => {
-    const segments = segmentsOf(line)
-    // 没有「→」的条目（信息行、散文式章纲）不走分段判据，交给双字词命中率去判。
-    if (segments.length < 2) return 0
-    let hit = 0
-    for (const segment of segments) {
-      const han = segment.replace(/[^\u4e00-\u9fff]/gu, '')
-      let touched = false
-      for (let i = 0; i + 2 <= han.length; i += 1) {
-        if (source.includes(han.slice(i, i + 2))) {
-          touched = true
-          break
-        }
-      }
-      if (touched) hit += 1
-    }
-    return hit / segments.length
-  }
-
-  const missing = []
-  entries.forEach((entry, index) => {
-    const quoted = quotesOf(entry).filter(term => source.includes(term))
-    const shared = longestCommon(entry)
-    const ratio = bigramRatio(entry)
-    const segments = segmentRatio(entry)
-    const touched = quoted.length > 0 || shared >= 8 || ratio >= 0.45 || segments >= 0.6
-    if (!touched) missing.push({ index: index + 1, snippet: entry.slice(0, 28), ratio: Math.round(ratio * 100), segments: Math.round(segments * 100) })
-  })
-  return { total: entries.length, covered: entries.length - missing.length, missing }
-}
 
 /**
  * 节奏台账：爽点／钩子／转折的分布。**不存盘**——真相只在 beats.md 那几行字里，
  * 这里每次现算，所以永远不会和章纲打架。
  */
-async function beatRhythm(root, chapters) {
-  const { sections } = await readBeats(root, null)
-  const outlineText = (await readText(path.join(root, OUTLINE_FILE))) ?? ''
-  const gapLimit = parseSceneCadence(outlineText) || 2
-  const perChapter = chapters.map(chapter => {
-    const section = matchBeatSection(sections, chapter)
-    const marks = section && section.chars > 0 ? section.marks : { payoff: [], hook: 0, turn: 0 }
-    return {
-      id: chapter.id,
-      title: chapter.title,
-      hasBeats: Boolean(section && section.chars > 0),
-      payoff: marks.payoff.length,
-      labels: marks.payoff.map(item => item.label).filter(Boolean),
-      hook: marks.hook > 0,
-      turn: marks.turn,
-    }
-  })
-
-  // 断档只算「已经写了章纲」的章：没有章纲的章不算断档，那是还没规划。
-  let longestGap = 0
-  let run = 0
-  for (const item of perChapter) {
-    if (!item.hasBeats) continue
-    if (item.payoff > 0) run = 0
-    else {
-      run += 1
-      if (run > longestGap) longestGap = run
-    }
-  }
-  let currentGap = 0
-  for (let i = perChapter.length - 1; i >= 0; i -= 1) {
-    const item = perChapter[i]
-    if (!item.hasBeats) continue
-    if (item.payoff > 0) break
-    currentGap += 1
-  }
-
-  return {
-    perChapter,
-    total: perChapter.length,
-    withBeats: perChapter.filter(item => item.hasBeats).length,
-    payoff: perChapter.reduce((sum, item) => sum + item.payoff, 0),
-    withPayoff: perChapter.filter(item => item.payoff > 0).length,
-    hooks: perChapter.filter(item => item.hook).length,
-    turns: perChapter.reduce((sum, item) => sum + item.turn, 0),
-    longestGap,
-    currentGap,
-    gapLimit,
-  }
-}
 
 /** 计划层的「预算」：outline.md 的 `## 爽点节奏` 里写 `打脸×3` 这种，×N 求和。 */
-function payoffBudget(outlineText) {
-  const section = /(?:^|\n)##\s*爽点节奏[^\n]*\n([\s\S]*?)(?=\n##\s|$)/u.exec(String(outlineText ?? ''))
-  if (!section) return null
-  let total = 0
-  const items = []
-  for (const line of section[1].split('\n')) {
-    const hit = /[×xX*]\s*(\d{1,3})/u.exec(line)
-    if (!hit) continue
-    const name = line.replace(/^\s*[-*+]\s*/u, '').split(/[×xX*]/u)[0].trim()
-    total += Number(hit[1])
-    items.push({ name, count: Number(hit[1]) })
-  }
-  return total > 0 ? { total, items } : null
-}
 
 /** 写回 book.json：章节表是唯一真相，所以任何写操作都要顺手维护它；未知字段原样保留。 */
 async function scaffoldAgents(root) {
@@ -2312,31 +1082,6 @@ async function scaffoldAgents(root) {
   return { path: target, created: previous === null, updated: previous !== null && next !== previous, bytes: Buffer.byteLength(next) }
 }
 
-async function persistBook(root, meta, chapterList) {
-  const previous = (await readJson(path.join(root, BOOK_FILE))) ?? {}
-  const base = previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
-  const next = {
-    ...base,
-    version: 1,
-    title: meta.title,
-    author: meta.author,
-    genre: meta.genre,
-    summary: meta.summary,
-    chapters: chapterList.map(item => ({
-      id: item.id,
-      title: item.title,
-      file: item.file,
-      status: item.status,
-      ...(item.targetChars > 0 ? { targetChars: item.targetChars } : {}),
-      ...(item.note ? { note: item.note } : {}),
-      ...(item.deaiReview ? { deaiReview: item.deaiReview } : {}),
-    })),
-  }
-  // 只有作者明确设过目标字数才落盘；默认值留在内存里用，不写进文件。
-  if (meta.targetCharsSet) next.targetChars = meta.targetChars
-  else delete next.targetChars
-  await writeJson(path.join(root, BOOK_FILE), next)
-}
 
 // ---- 历史版本 ------------------------------------------------------------
 //
@@ -2346,21 +1091,10 @@ async function persistBook(root, meta, chapterList) {
 const HISTORY_DIR = '.history'
 
 /** 紧凑 ISO 时间戳（YYYYMMDDHHmmss，UTC），也就是历史文件名的后缀。 */
-function stampOf(date = new Date()) {
-  return date.toISOString().replace(/[-:T]/gu, '').slice(0, 14)
-}
 
 /** 由 stamp 反解 ISO；没有 json 元数据的老文件靠它推时间。 */
-function stampToIso(stamp) {
-  const hit = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/u.exec(stamp)
-  if (!hit) return ''
-  return `${hit[1]}-${hit[2]}-${hit[3]}T${hit[4]}:${hit[5]}:${hit[6]}Z`
-}
 
 /** 内容指纹：用来跳过「什么都没改」的重复快照。 */
-function shortHash(text) {
-  return createHash('sha1').update(text, 'utf8').digest('hex').slice(0, 12)
-}
 
 function historyDir(root) {
   return path.join(root, CHAPTERS_DIR, HISTORY_DIR)
@@ -2574,15 +1308,7 @@ async function auditBook(root) {
           .map(item => `${item.label} ${item.act}（锚点 ${item.ref}）`)
         add('warn', 'style-drift', label + '：节奏不像文风卡——' + worst.join('；'), row.id)
       }
-      // 内心反应密度：整本书一起看，才能看出「越写越像机器人」的趋势。
-      const refAudit = fitSampleAudit && fitSampleAudit.present && fitSampleAudit.chars > 3000 ? fitSampleAudit.text : styleAnchorText(styleRawAudit)
-      const baselineAudit = interiorStats(refAudit).ratio
-      if (baselineAudit >= 1) {
-        const act = interiorStats(chapterBody)
-        if (act.paras >= 8 && act.ratio < baselineAudit * 0.5) {
-          add('warn', 'no-interior', label + '：内心反应 ' + act.ratio + '%（基准 ' + baselineAudit + '%）——只有动作，看不见他在想什么', row.id)
-        }
-      }
+
     }
   }
   const written = rows.filter(row => row.written)
@@ -2685,7 +1411,9 @@ export function apply(ctx, config) {
   }
 
   /** 注册工具时统一包一层：先把会话根放进作用域，再跑工具本体。 */
+  const toolDefs = new Map()
   const registerTool = definition => {
+    toolDefs.set(definition.name, definition)
     const execute = definition.execute
     return ctx.tools.register({
       ...definition,
@@ -3332,6 +2060,12 @@ export function apply(ctx, config) {
       },
     },
     execute: async args => {
+      if (args.carryOver && args.chapter) {
+        const { meta } = await loadBook(rootNow())
+        const chapter = findChapter(meta.chapters, args.chapter)
+        const board = chapter ? await readBeats(rootNow(), chapter) : null
+        if (board?.section?.scenes?.length) throw new Error('结构化场景请用 novel_move_scene 整场顺延，再保存正文；不能按行拆分人物约束')
+      }
       const { meta } = await loadBook(rootNow())
       const chapters = [...meta.chapters]
       const mode = args.mode === 'patch' ? 'patch' : args.mode === 'append' ? 'append' : 'replace'
@@ -3400,25 +2134,12 @@ export function apply(ctx, config) {
       const chapterTarget = chapter.targetChars > 0 ? chapter.targetChars : meta.targetChars
       // 写完顺手对一遍章纲：漏掉的场景当场说出来，别等作者读完全章才发现。
       const warnings = validateChapterContent(body)
+      const stageAfterWrite = await stageContext(rootNow(), chapters, chapter.id)
+      warnings.push(...stageAfterWrite.warnings)
+      if (stageAfterWrite.scenes.length) warnings.push('写后请逐场核对实际认知与关系变化：novel_character_history propose 提交逐字正文依据，再确认；章纲计划不会自动进入历史。')
       const beat = await readBeats(rootNow(), chapter)
       let carriedOver = null
       if (beat.section && beat.section.chars > 0) {
-        // 章纲有「场」有「位移」，却一条「心里」都没写：正文十有八九会写成流水线。
-        const interiors = Array.isArray(beat.section.interiors) ? beat.section.interiors : []
-        if (interiors.length) {
-          const flat = interiors.filter(item => !item.mood || !INTERIOR_MOODS.includes(item.mood))
-          if (flat.length) {
-            warnings.push(
-              `章纲有 ${flat.length} 条「心里」只写了概述，没有情绪台词：${flat.slice(0, 2).map(item => '「' + item.text.slice(0, 24) + '」').join(' / ')}。改成「情绪｜台词」，情绪取 ${INTERIOR_MOODS.join('/')} 之一，台词写能直接抄进正文的口语——「他过了一遍规矩」是案情摘要，「卧槽，穿越者的标配吧这是」才是内心。`,
-            )
-          }
-        }
-        if (!interiors.length) {
-          warnings.push(
-            '章纲里一条「- 心里：」都没写。场景写的是"他做了什么"，心里写的是"他想到什么"——没有后者，' +
-              '正文只能按动作往下推，读者看到的是流水线。给这一章补 1–2 条心里标签写进章纲，再重写这一章。',
-          )
-        }
         const gap = beatCoverage(body, beat.section.body)
         const infoList = beat.section.infos ?? []
         const infoGap = infoList.length ? beatCoverage(body, infoList.map(item => item.text).join('\n')) : { missing: [] }
@@ -3759,14 +2480,42 @@ export function apply(ctx, config) {
   })
 
   registerTool({
+    name: 'novel_stage_edit',
+    description: '局部编辑章纲：先读取 novel_context 获得 stage.baseHash。提供 chapter、可选 scene/character、baseHash 和 fields。只更新指定对象的字段，保留其他人物、未知字段和正文。心理与登场字段：' + ROLE_FIELDS.join('、') + '。' + PRESENTATION_RULES,
+    parameters: { type: 'object', additionalProperties: false, required: ['chapter', 'baseHash', 'fields'], properties: { chapter: { type: 'string' }, scene: { type: 'string' }, character: { type: 'string' }, baseHash: { type: 'string' }, fields: { type: 'object', additionalProperties: { type: 'string' } } } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value)) },
+    execute: async args => editStageFields(rootNow(), args),
+    presentCall: args => ({ card: 'generic', title: '编辑章纲字段', kind: 'write', rawInput: args }),
+  })
+
+  registerTool({
+    name: 'novel_move_scene',
+    description: '将完整场景及人物约束移动到目标章节末尾，保留场景 ID 和故事时序；原位置认知记录失效，需重新核对。需要调整故事时间时再编辑章纲。',
+    parameters: { type: 'object', additionalProperties: false, required: ['scene', 'chapter'], properties: { scene: { type: 'string' }, chapter: { type: 'string' } } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: async args => moveScene(rootNow(), (await loadBook(rootNow())).meta.chapters, args.scene, args.chapter),
+    presentCall: args => ({ card: 'generic', title: '整场顺延', kind: 'write', rawInput: args }),
+  })
+
+  registerTool({
+    name: 'novel_character_history',
+    description: '人物认知与有向关系历史。inspect 查看；propose 提交正文提取候选（character/scene 为稳定 ID，kind 为已知/未知/误信/怀疑/关系/状态/呈现，content 内容、source 信息来源、evidence 逐字正文引文；关系必填 target，可给 event、supersedes）。confirm 需 character+id，仅在核对正文且作者确认或已授权核对流程后调用；revoke 撤销。计划不能直接确认为事实。来源改变需重新提取。',
+    parameters: historyParameters,
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: async args => updateHistory(rootNow(), (await loadBook(rootNow())).meta.chapters, args),
+    presentCall: args => ({ card: 'generic', title: '人物认知历史', kind: !args.action || args.action === 'inspect' ? 'read' : 'write', rawInput: args }),
+  })
+
+  registerTool({
     name: 'novel_context',
     description:
       '续写前的标准动作：一次拿到「本章大纲 + 上一章结尾 + 本章出场人物卡 + 未回收伏笔」的装配包，总长度受 budget 限制。写完这一章后可用 novel_write 落盘。',
     parameters: {
       type: 'object',
       properties: {
+        scene: { type: 'string', description: '稳定场景 ID；只装配该场的角色状态和章纲' },
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
-        budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 5000、改写 6000，最多 20000；不限制正文字数' },
+        budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 12000、改写 16000，最多 40000；不限制正文字数' },
         rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
         rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
@@ -3829,8 +2578,8 @@ export function apply(ctx, config) {
         ? chapters[index]
         : { id: nextChapterId(chapters), title: `第 ${Number(nextChapterId(chapters))} 章`, chars: 0, target: meta.targetChars, status: 'planned' }
 
-      // 续写也要完整带上文风锚点与设定细节，默认给到 5000；改写给到 6000。
-      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 6000 : 5000, 300, 20000)
+      // 续写也要完整带上文风锚点与设定细节：默认 12000，改写 16000（用户反馈 5000 装不下章纲+人物+文风）。
+      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 16000 : 12000, 300, 40000)
       const prev = chapters.slice(0, index).reverse().find(item => item.chars > 0)
       const prevText = prev ? (await readText(path.join(rootNow(), prev.file))) ?? '' : ''
       const prevTailText = tail(prevText, Math.max(300, Math.min(800, Math.round(budget * 0.3))))
@@ -3840,9 +2589,8 @@ export function apply(ctx, config) {
 
       // 章纲优先：有这一章的 beats 就按清单配额给它，大纲退成背景参考。
       const beats = await readBeats(rootNow(), current)
-      const beatsText = beats.section
-        ? beats.section.body
-        : ''
+      const stage = await stageContext(rootNow(), meta.chapters, current.id, args.scene)
+      const beatsText = args.scene ? stage.scenes[0].raw : (beats.section?.body || '')
       const sceneText = `${beatsText}\n${outlinePart}`
 
       // 节奏：把本章章纲上的爽点/钩子标记算出来，顺便看前面断了几章。
@@ -3898,14 +2646,19 @@ export function apply(ctx, config) {
         if (!picked.includes(card)) picked.push(card)
       }
       const characters = []
-      for (const card of picked.slice(0, 5)) {
+      const castIds = new Set(stage.scenes.flatMap(scene => scene.cast))
+      const ordered = (stage.scenes.length ? cards.filter(card => castIds.has(card.id)) : picked.slice(0, 5)).sort((a, b) => (a.rank || 9) - (b.rank || 9))
+      for (const card of ordered) {
         const content = await readCharacter(rootNow(), card.name)
         const state = stateAt(card.states, current.id)
         if (content !== null) {
           characters.push({
             name: card.name,
             state: state ? { chapter: state.chapter, label: state.label, dead: state.dead } : null,
-            content: content.trim(),
+            role: card.role || '',
+            rank: card.rank || 9,
+            hook: card.hook || '',
+            content: '作者侧稳定设定（不等于人物当前已知；当前认知以场景历史为准）：\n' + content.trim(),
           })
         }
       }
@@ -3976,6 +2729,7 @@ export function apply(ctx, config) {
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: { present: Boolean(beats.section), heading: beats.section ? beats.section.heading : '', text: beatsText, infos: beats.section ? beats.section.infos ?? [] : [] },
         rhythm,
+        stage,
         spine,
         outline: outlinePart,
         prevTail: prev ? { id: prev.id, title: prev.title, text: prevTailText } : { id: '', title: '', text: '' },
@@ -3986,7 +2740,7 @@ export function apply(ctx, config) {
         mode: rewrite ? 'rewrite' : 'continue',
         chapterText,
         settingsCount: settingItems.length,
-        warnings: contextWarnings,
+        warnings: [...contextWarnings, ...stage.warnings],
         pass: deai ? 'deai' : '',
         rewriteRules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
         aiTone: deai ? tone.signals : [],
@@ -3998,17 +2752,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_card',
-    description:
-      '维护人物卡（工作区 characters/ 目录，一人一个 .md，文件名就是人物名）。不传参数 = 列出所有人物卡；给 name 不给 content = 读这张卡；给 name 且给 content = 写这张卡（覆盖）。' +
-      '\n\n【格式约定·必须原样写这两节，否则关系图和生死判定都读不到】' +
-      '\n## 关系' +
-      '\n- 名字：说明                ← 从开篇就成立' +
-      '\n- 名字 @0004：说明          ← 第 4 章起才成立（只记起点，不记终点；关系变了就改写这行）' +
-      '\n## 状态' +
-      '\n- @0003 去世（怎么死的）    ← 第 3 章起进入这个状态，一直持续到下一条状态为止' +
-      '\n- @0050 现身（其实没死）    ← 不含死亡词的状态＝又活着了，这就是「复活」' +
-      '\n死亡词：去世/死亡/死/殁/阵亡/身亡/牺牲/遇难/丧命/不在了；写「没死/假死/装死」不算死。' +
-      '\n【- 外貌锚点：… / - 性格：… / - 说话：…（必写，防千人一面）】不要写「剑眉星目/冷静」这类套话或抽象形容词，按角色出身与经历分布有度地拉开差异：「外貌锚点」写 1–2 个视觉特征，气质神态、标志性饰物、体态（如眼角笑纹、银色袖扣）与有来历的伤疤或职业磨损（如虎口旧疤、义体接驳痕）按人设自然分配；「性格」写明遇事第一反应、小动作与底线（热忱护短、反差幽默、讲究体面、谨慎精明等光谱分布开）；「说话」写句长偏好、语气词习惯与忌讳，附 1–2 句逐字台词例句（如爽朗直白「这事包我身上！」或客气疏离「恐怕不太合乎规矩。」）。名字带 @ 的时间标记只能出现在「关系」和「状态」这两节里。',
+    description: '人物卡：name 读取；name+content 覆盖；不传参列出。顶部必填 - ID：稳定英文ID、- 定位：男主/女主/男二/女二/重要配角/反派等、- 重要程度：核心/重要/一般/临时。记录身份、长期目标、外貌锚点、性格（第一反应/底线）、说话习惯。作者秘密放 ## 作者侧秘密。人物 ID 不随姓名改变，出场与关系使用 ID 引用。动态认知、关系与成长用 novel_character_history 记录来源和生效场景，不用全局卡覆盖历史。格式参考 templates/character-card.md。' + PRESENTATION_RULES,
     parameters: {
       type: 'object',
       properties: {
@@ -4298,6 +3042,7 @@ export function apply(ctx, config) {
           ] : []),
         ]
         const semanticCount = value.issues.filter(item => item.kind.startsWith('semantic-') || item.kind === 'deai-review-pending').length
+        reviewLines.push(...(value.presentationReview || []).map(item => `表现安排待核对（非错误） ${item.scene}/${item.character}：${item.detail}`))
         const heading = `机械检查 ${value.issues.length - semanticCount} 项；已登记语义问题或待复核 ${semanticCount} 项（${value.chars} 字${value.target ? `，参考 ${value.target}` : ''}）。`
         if (!value.issues.length) return textRender([heading, ...reviewLines, '机械零命中与审稿登记均不代表语义结论一定正确。'].join('\n'))
         const lines = [heading]
@@ -4339,6 +3084,12 @@ export function apply(ctx, config) {
         }
       }
       const report = inspectText(text, { cards, target })
+      if (chapter) {
+        const stage = await stageContext(rootNow(), meta.chapters, chapter.id)
+        report.presentationReview = stage.reviews
+        report.issues.push(...stage.warnings.map(detail => ({ kind: 'stage-reference', detail })))
+        for (const scene of stage.scenes) for (const person of scene.characters) if (person.gap) report.issues.push({ kind: 'stage-history-gap', detail: `${scene.id}/${person.name}：${person.gap}` })
+      }
       const chapterReview = chapter && typeof args.text !== 'string'
       const reviewState = chapterReview ? await deaiReviewState(rootNow(), chapter, text, meta) : { status: 'untracked', findings: [] }
       const reviewed = reviewState.status === 'reviewed'
@@ -4392,7 +3143,7 @@ export function apply(ctx, config) {
         if (!has) {
           report.issues.push({
             kind: 'no-reaction-on-payoff',
-            detail: '这一场的爽点标的是「打脸」，但章纲里没写对手当场怎么反应：补一行「- 反应：他把烟塞回兜里，笑了一下，说「行，你有种」」——写表情、手上动作或一句撑场面的话，不写他的内心。',
+            detail: '这一场的爽点标的是「打脸」，但章纲里没写对手当场怎么反应：补一行「- 反应：他把烟塞回兜里，笑了一下，说「行，你有种」」——可用表情、动作或对白呈现；是否直接写内心遵守本场叙述视角，不强制增加心理段落。',
           })
           break
         }
@@ -4462,20 +3213,6 @@ export function apply(ctx, config) {
           }
         }
       }
-      // 章纲点了名要想到什么，正文却一段内心都没有——不管有没有文风卡都要查。
-      const interiorRows = beat && beat.section && Array.isArray(beat.section.interiors) ? beat.section.interiors : []
-      if (interiorRows.length) {
-        const inner = interiorStats(text)
-        if (inner.paras >= 5 && inner.hit === 0) {
-          report.issues.push({
-            kind: 'no-interior-plan',
-            detail:
-              `章纲里写了 ${interiorRows.length} 条内心材料，正文里一段都没落到：` +
-              interiorRows.slice(0, 3).map(item => `「${item.text}」`).join('、') +
-              '。这几条不是提示，是这一章必须出现的东西——挑一处写成他看到/想到的具体画面，别写成"他很后悔"。',
-          })
-        }
-      }
       const styleName = activeStyleName(meta)
       const styleRaw = styleName ? await readStyle(rootNow(), styleName) : null
       if (styleRaw) {
@@ -4502,34 +3239,17 @@ export function apply(ctx, config) {
             detail: `这一章的节奏不像文风卡「${styleName}」：${worst.join('；')}。要么重写这一章，要么改文风卡——别两边都不动。`,
           })
         }
-        // 内心反应：只比密度，不判好坏。基准优先用参考原文（够长才有代表性）。
-        const refText = fitSample && fitSample.present && fitSample.chars > 3000 ? fitSample.text : styleAnchorText(styleRaw)
-        const baseline = interiorStats(refText).ratio
-        if (baseline >= 1) {
-          const act = interiorStats(text)
-          if (act.paras >= 8 && act.ratio < baseline * 0.5) {
-            report.issues.push({
-              kind: 'no-interior',
-              detail:
-                `内心/身体反应太少：这一章 ${act.hit}/${act.paras} 段（${act.ratio}%），文风基准是 ${baseline}%。` +
-                '读者只看见他在做事、看不见他在想什么——得手、被压、丢脸之后，先给他一个身体感觉或一句念头，再写下一个动作。',
-            })
-          }
-        }
-
-        // 钱一动，人就该有反应：这是「像机器人」最典型的地方（钱到账 → 直接谈下一笔）。
-        const moments = payoffMoments(text)
-        if (moments.total >= 4 && moments.hit / moments.total < 0.3) {
+        // 对话密度：样本的 1.6 倍以上就该收——对话是配菜，不是主食。
+        const dialogueRow = (fit.rows || []).find(row => row.key === 'dialogue')
+        if (dialogueRow && dialogueRow.act >= 25 && dialogueRow.ratio >= 1.6) {
           report.issues.push({
-            kind: 'payoff-no-reaction',
-            detail:
-              `这一章有 ${moments.total} 段在写钱或得手，其中只有 ${moments.hit} 段带身体/念头反应（${Math.round((moments.hit / moments.total) * 100)}%）。` +
-              '读者只看见他收钱、给钱、算账——钱一动，先给他一句身体感觉或一个念头，再写下一个动作。' +
-              (moments.samples.length ? `比如这几段：「${moments.samples.join('」「')}」` : ''),
-            count: moments.total - moments.hit,
-            samples: moments.samples,
+            kind: 'dialogue-heavy',
+            detail: `含对白的段落占 ${dialogueRow.act}%，文风样本是 ${dialogueRow.ref}%（${dialogueRow.ratio} 倍）。对话是配菜不是主食：把一半改为动作、身体反应或旁白，或把两段问答压成一段。`,
           })
         }
+        // 只提供观察数据，不根据关键词密度要求增加心理段落。
+        report.interiorObservation = interiorStats(text)
+
       }
       // 事件线：串了区间、锚了不存在的事件、或者落在区间里却没锚，都要提醒。
       // 只有「按章查」才有章 id 可比；直接查一段文本时跳过这节（否则 chapter 是 undefined）。
@@ -4813,25 +3533,7 @@ export function apply(ctx, config) {
   // ---- 章纲（大纲之下、正文之上那一层）------------------------------------
   registerTool({
     name: 'novel_beats',
-    description:
-      '章纲：每章一节写在 beats.md（二级标题 `## <章 id> <标题>`），内容是这一章要拍的场景清单。不传参 = 看全书章纲覆盖情况；给 chapter = 读这一章的章纲；给 chapter + content = 覆盖写这一章（别的章一个字都不动）。写正文前先看章纲，比只看大纲更准。' +
-      '\n\n【格式约定】`## 0003 第三章 标题` 开头，下面 3–6 条 `- 场景：谁 → 在哪 → 想干什么 → 结果撞上什么`；一章只推进一件事，不要在一章里塞三个转折。写章纲时不写对白和描写，那不是它的活。\n\n【没有行数上限】只有「场景」数有建议值（3–6 场，超过 8 场插件会提醒拆章）；`- 心里：`/`- 反应：`/`- 信息：`/`- 落点：`/`- 钩子：` 都不算「场」，写多少都原样保存，插件不会丢弃任何一行。' +
-      '\n\n【- 心里：另起一行，紧跟在它所解释的那一场下面】格式 `- 心里：他想起…`，独立成条——' +
-      '塞在「场景：」那一行里不会被统计，装配包也不会单独列出来。' +
-      '①写主角（视角人物）的念头，不是配角的（写配角那是人物卡的事）；' +
-      '②每章 1–2 条，位置不固定，但必须在它解释的那场之后——别全堆到章末，堆到章末就变成每章一样的收尾；' +
-      '③**只写标签**：「- 心里：主角回忆」「- 心里：对比前世」「- 心里：算账」——具体画面让 AI 扩写时自己给，' +
-      '不要写「他感到很后悔」这种概括——概括会被模型原样抄成口水话。' +
-      '\n\n【- 反应：另起一行，紧跟在打脸 / 爽点那一场下面】格式「- 反应：他把烟塞回兜里，笑了一下，说「行，你有种」」。' +
-      '**只写标签，不写整句**：「- 反应：反派尴尬」「- 反应：反派嘴硬」「- 反应：前妻维护」「- 反应：旁人看戏」——扩写正文时 AI 自己铺表情和台词；视角不在对方身上，所以只写看得见的，不写他的内心。' +
-      '打脸的关键是对方那一瞬间露了怯；没有这一行，正文只会写「主角把烟推回去」，读者只觉得硬气，不觉得爽。' +
-      '每场可以写 1–3 条，**分不同的人写**：当场那个人（反派尴尬）、旁观的人（群众愣住 / 有人笑出声）、对方自己人之间（同伙互相看 / 有人往后缩）。一场里只有一个反应是不够的——打脸要让人看见周围都变了。' +
-      '\n\n【节奏标记·写在场景末尾，插件会统计】' +
-      '\n- `→ 爽点（类型）`：这一场给了读者情绪回报。类型取一个：打脸 / 翻盘 / 揭秘 / 情感兑现 / 强强对话 / 信息压制。' +
-      '\n- `→ 钩子`：章末留翻页理由，每章至少一个（也认 `钩子：…` 这种写法）。' +
-      '\n- `→ 转折`：这一场把方向拐了个弯。' +
-      '\n爽点是"这场戏怎么演"的属性，不是一本账：不要单独建爽点表、也不要只写在 outline 里。' +
-      '补标记不用重写整章章纲——先 novel_beats({ chapter }) 读到原文，把标记插在对应场景句末，再整节写回。',
+    description: '章纲写在 beats.md，每章 ## 章ID 标题。chapter 读取；chapter+content 覆盖当前章；无参数查看覆盖。每场用 ### 场景 scene-id：标题，写 - 时序：整数（故事先后，非章号）、- 故事时间：描述、- 地点：地点、- 视角：人物ID、- 出场：人物ID、人物ID、- 提及：仅被提到的人物ID、- 事件：具体事件ID、- 冲突：目标与阻力。角色块 #### 人物 character-id，写已知/未知/误信/怀疑及来源、目标、关系与情绪、表达意图、触发、计划变化。每个场景 ID 全书唯一；时序越大越晚，同场变化仅触发后生效。计划不是已发生事实，写后用 novel_character_history 提取并核对。节奏标记可用 → 爽点（类型）/ → 钩子 / → 转折。正文前用 novel_context({chapter,scene})；顺延用 novel_move_scene 保留整场约束。人物块可选字段：' + ROLE_FIELDS.join('、') + '。场景写 - 叙述方式：限知/全知/客观；视角写人物ID。' + PRESENTATION_RULES,
     parameters: {
       type: 'object',
       properties: {
@@ -4923,6 +3625,7 @@ export function apply(ctx, config) {
             chars: written.chars,
             present: written.chars > 0,
             infos: parseBeatInfos(args.content),
+            scenes: parseScenes(args.content, chapter.id),
           },
           coverage: await beatsCoverage(rootNow(), chapters),
           rhythm: rhythmSummary,
@@ -5289,6 +3992,7 @@ export function apply(ctx, config) {
             if (req.method === 'POST') {
               // 写入口只有下面这 12 个，且都要求自定义头（见下）。
               if (
+                route !== '/character-history' &&
                 route !== '/start-chapter' &&
                 route !== '/outline' &&
                 route !== '/beats' &&
@@ -5312,7 +4016,12 @@ export function apply(ctx, config) {
                 return
               }
               const payload = await readJsonBody(req, 256 * 1024)
-              if (route === '/outline') {
+              if (route === '/character-history') {
+                const { meta } = await loadBook(rootNow())
+                sendJson(res, 200, await updateHistory(rootNow(), meta.chapters, payload))
+                return
+              }
+    if (route === '/outline') {
                 if (typeof payload.content !== 'string') {
                   sendJson(res, 400, { error: '需要 content 字符串' })
                   return
@@ -5361,6 +4070,12 @@ export function apply(ctx, config) {
                 return
               }
               if (route === '/beats') {
+                if (payload.baseHash && payload.baseHash !== stageHash((await readText(path.join(rootNow(), BEATS_FILE))) || '')) { sendJson(res, 409, { error: '章纲已变化，请重新读取后保存' }); return }
+                if (payload.fields) {
+                  try { sendJson(res, 200, await editStageFields(rootNow(), payload)) }
+                  catch (error) { sendJson(res, 409, { error: error.message }) }
+                  return
+                }
                 if (typeof payload.content !== 'string') {
                   sendJson(res, 400, { error: '需要 content 字符串' })
                   return
@@ -5500,6 +4215,37 @@ export function apply(ctx, config) {
               sendJson(res, 200, await snapshot())
               return
             }
+            if (route === '/context') {
+              const chapter = (url.searchParams.get('chapter') || '').trim()
+              if (!chapter) { sendJson(res, 400, { error: '需要 chapter（哪一章）' }); return }
+              const definition = toolDefs.get('novel_context')
+              if (!definition) { sendJson(res, 500, { error: '装配包工具未注册' }); return }
+              const mode = url.searchParams.get('mode') === 'rewrite' ? 'rewrite' : 'continue'
+              const budget = Number(url.searchParams.get('budget')) || 12000
+              try {
+                const args = { chapter, mode, ...(budget ? { budget } : {}) }
+                const value = await definition.execute(args, {})
+                const rendered = (definition.output && typeof definition.output.render === 'function' ? definition.output.render(args, value) : [])
+                  .map(part => (part && part.type === 'text' ? part.text : ''))
+                  .filter(Boolean)
+                  .join('\n')
+                if (url.searchParams.get('format') === 'text') {
+                  res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+                  res.end(rendered)
+                  return
+                }
+                sendJson(res, 200, {
+                  chapter: value.chapter || { id: chapter },
+                  mode: value.mode || mode,
+                  chars: Array.from(rendered).length,
+                  budgetUsed: value.budgetUsed || 0,
+                  text: rendered,
+                })
+              } catch (error) {
+                sendJson(res, 400, { error: error && error.message ? error.message : String(error) })
+              }
+              return
+            }
             if (route === '/chapter') {
               const { meta } = await loadBook(rootNow())
               const chapter = findChapter(meta.chapters, url.searchParams.get('id'))
@@ -5563,6 +4309,18 @@ export function apply(ctx, config) {
               })
               return
             }
+            if (route === '/character-history') {
+              const { meta } = await loadBook(rootNow())
+              sendJson(res, 200, await updateHistory(rootNow(), meta.chapters, { action: 'inspect' }))
+              return
+            }
+            if (route === '/stage') {
+              const { meta } = await loadBook(rootNow())
+              const chapter = findChapter(meta.chapters, url.searchParams.get('chapter'))
+              if (!chapter) { sendJson(res, 404, { error: '章节不存在' }); return }
+              sendJson(res, 200, await stageContext(rootNow(), meta.chapters, chapter.id, url.searchParams.get('scene') || undefined))
+              return
+            }
             if (route === '/beats') {
               const { meta } = await loadBook(rootNow())
               const wanted = url.searchParams.get('chapter')
@@ -5573,16 +4331,21 @@ export function apply(ctx, config) {
               }
               const board = await readBeats(rootNow(), chapter)
               const rhythm = await beatRhythm(rootNow(), meta.chapters)
+              const castCards = await listCharacters(rootNow())
               sendJson(res, 200, {
                 present: board.present,
                 chapter: chapter ? { id: chapter.id, title: chapter.title } : null,
                 text: board.section ? board.section.body : '',
                 chars: board.section ? board.section.chars : 0,
+                baseHash: stageHash((await readText(path.join(rootNow(), BEATS_FILE))) || ''),
+                fields: { role: ROLE_FIELDS, scene: SCENE_FIELDS, chapter: CHAPTER_FIELDS },
                 sections: board.sections.map(section => ({
                   id: section.id,
                   heading: section.heading,
                   chars: section.chars,
                   text: section.body,
+                  scenes: section.scenes,
+                  overview: { ...chapterOverview(section.body, section.id), reviewCount: section.scenes.flatMap(scene => presentationChecks(scene, castCards)).length },
                   payoff: section.marks.payoff.length,
                   labels: section.marks.payoff.map(item => item.label).filter(Boolean),
                   hook: section.marks.hook > 0,
@@ -5648,7 +4411,7 @@ export function apply(ctx, config) {
                 sendJson(res, 404, { error: 'no such character' })
                 return
               }
-              sendJson(res, 200, { name: url.searchParams.get('name'), chars: countChars(content), content })
+              sendJson(res, 200, { name: url.searchParams.get('name'), ...cardIdentity(content), chars: countChars(content), content })
               return
             }
             if (route === '/settings') {
@@ -5895,18 +4658,6 @@ function readJsonBody(req, limit) {
 }
 
 /** 从人物卡里抠出「旧称 / 别名」这类登记行，供自检比对。 */
-function parseCardAliases(text) {
-  const aliases = []
-  const pattern = /(?:^|\n)[\s>*\-]*?(?:旧称|旧名|别名|原名|曾用名|改名前)\s*[：:]\s*([^\n]+)/gu
-  for (const match of String(text ?? '').matchAll(pattern)) {
-    for (const part of match[1].split(/[、,，/／|]/u)) {
-      // 先砍括号注释，再砍多余空白：`小满（父亲叫她小满…）` 只留「小满」。
-      const name = part.split(/[（(]/u)[0].trim()
-      if (name && name.length >= 1 && name.length <= 8) aliases.push(name)
-    }
-  }
-  return aliases
-}
 
 /** 说话人候选：中文小说里「某某说／道／问／点头」这类句式最稳，比全篇分词靠谱。 */
 const SPEAKER_STOPWORDS = new Set([
@@ -5931,141 +4682,14 @@ const looksLikeTailOfKnown = (name, knownNames) => [...knownNames].some(item => 
 // ── 「去 AI 味」检测 ─────────────────────────────────────────────
 // 规则抽自 qu-ai-wei（MIT）的 pattern catalog，只保留机器能判定的部分：
 // 「这段像不像 AI 写的」这种整体判断不给机器做，只报可数、可指认的信号。
-const AI_TONE_PHRASES = [
-  [/在[^。！？\n]{2,14}的(?:背景|时代|大环境|形势|浪潮)下/u, '空转开头「在…的背景下」'],
-  [/值得一提的(?:是|还有)/u, '「值得一提的是」'],
-  [/不仅[^。！？\n]{2,24}(?:而且|更是|还)/u, '机械递进「不仅…而且…」'],
-  [/(?:无疑|毫无疑问)(?:是|地)/u, '判词「无疑是」'],
-  [/(?:在一定程度|某种意义)上/u, '退让「在某种程度上」'],
-  [/(?:注入|赋能|赋予)[^。！？\n]{0,8}(?:活力|动能|动力|生机)/u, '官腔「注入活力」'],
-  [/(?:全方位|多维度|立体化|系统性地)/u, '「全方位 / 多维度」'],
-  [/(?:映入眼帘|尽收眼底|扑面而来)/u, '「映入眼帘 / 扑面而来」'],
-  [/(?:不禁|不由得)(?:让人|令人|使人)/u, '「不禁让人…」'],
-  [/(?:彰显|折射出|折射着|昭示)/u, '「彰显 / 折射出」'],
-  [/(?:总之|综上所述|总而言之)/u, '总结式收尾'],
-  [/(?:仿佛|似乎)(?:在|是)(?:诉说|倾述|讲述|低语)/u, '「仿佛在诉说」'],
-]
 
-const aiSnippet = (body, index, length) => {
-  const from = Math.max(0, index - 12)
-  const to = Math.min(body.length, index + length + 12)
-  return `${from > 0 ? '…' : ''}${body.slice(from, to).replace(/\s+/gu, ' ')}${to < body.length ? '…' : ''}`
-}
 
-const aiSentences = body => body.split(/[。！？!?…]/u).map(item => item.trim()).filter(item => item.length > 0)
 
 /**
  * @returns {{ signals: Array<{ kind: string, label: string, count: number, samples: string[] }>, total: number }}
  */
-function detectAiTone(text) {
-  const body = String(text ?? '')
-  const signals = []
-  const add = (kind, label, samples, count = samples?.length ?? 0) => {
-    if (!samples || samples.length === 0) return
-    signals.push({ kind, label, count, samples: samples.slice(0, 3) })
-  }
-  if (!body.trim()) return { signals, total: 0 }
-
-  for (const [pattern, label] of AI_TONE_PHRASES) {
-    const hits = []
-    for (const match of body.matchAll(new RegExp(pattern.source, 'gu'))) {
-      hits.push(aiSnippet(body, match.index ?? 0, match[0].length))
-    }
-    add('cliche', label, hits)
-  }
-
-  const paragraphs = body.split(/\n+/u).map(item => item.trim()).filter(item => item.length > 0)
-  const connectors = paragraphs.filter(item => /^(然而|因此|此外|同时|总之|首先|其次|再者|另外|与此)/u.test(item))
-  if (paragraphs.length >= 4 && connectors.length / paragraphs.length >= 0.3) {
-    add('connector-start', `有 ${connectors.length}/${paragraphs.length} 段以「然而 / 因此 / 同时」开头`, connectors.map(item => item.slice(0, 24)))
-  }
-  const paragraphLengths = paragraphs.map(item => countChars(item)).filter(item => item > 0)
-  if (paragraphLengths.length >= 5) {
-    const mean = paragraphLengths.reduce((sum, item) => sum + item, 0) / paragraphLengths.length
-    const variance = paragraphLengths.reduce((sum, item) => sum + (item - mean) ** 2, 0) / paragraphLengths.length
-    const deviation = mean > 0 ? Math.sqrt(variance) / mean : 0
-    if (deviation < 0.12) {
-      add('uniform-paragraph', `段落长度几乎一样（平均 ${Math.round(mean)} 字，波动只有 ${(deviation * 100).toFixed(0)}%）`, paragraphs.slice(0, 2).map(item => item.slice(0, 22)), 1)
-    }
-  }
-
-  const sentences = aiSentences(body)
-  if (sentences.length >= 20) {
-    const shorts = sentences.filter(item => countChars(item) <= 8)
-    if (shorts.length / sentences.length < 0.05) {
-      add('no-short', `${sentences.length} 句里只有 ${shorts.length} 句短句（≤8 字），请结合文风检查节奏，不要求强行插入短句`, sentences.filter(item => countChars(item) > 8).slice(0, 2), 1)
-    }
-    const groups = []
-    let bucket = [sentences[0]]
-    for (let index = 1; index < sentences.length; index += 1) {
-      const previous = bucket[bucket.length - 1]
-      const current = sentences[index]
-      const sameShift = current[0] === bucket[0][0] && Math.abs(countChars(current) - countChars(previous)) <= 2
-      if (sameShift) bucket.push(current)
-      else {
-        groups.push(bucket)
-        bucket = [current]
-      }
-    }
-    groups.push(bucket)
-    const parallels = groups.filter(group => group.length >= 3 && countChars(group[0]) >= 10)
-    if (parallels.length > 0) {
-      add('parallel-run', `有 ${parallels.length} 处连续三句以上字数齐平、开头相同`, parallels.slice(0, 3).map(group => group.slice(0, 3).join('｜')), parallels.length)
-    }
-  }
-
-  const quotes = [...body.matchAll(/[「『"“]([^」』"”]{2,})[」』"”]/gu)].map(match => match[1].trim())
-  if (quotes.length >= 5) {
-    const clean = quotes.filter(item => !/[，,]|…|—/u.test(item) && countChars(item) > 12)
-    if (clean.length / quotes.length >= 0.7) {
-      add('clean-dialogue', `有 ${clean.length}/${quotes.length} 句较长且缺少停顿标点，需结合语境判断是否生硬`, clean.slice(0, 2), clean.length)
-    }
-    if (quotes.length >= 8 && !quotes.some(quote => /[—…]/u.test(quote))) {
-      add('no-pause', '对话中缺少显式停顿标点，请结合角色和场景判断是否自然，不要求补破折号或省略号', quotes.slice(0, 2), 1)
-    }
-  }
-
-  // 相邻对话同句头复读（如「现在断，…」「现在断，…」）
-  const echoHits = []
-  let prevQuoteHead = ''
-  let prevQuoteFull = ''
-  for (const qm of body.matchAll(/[「『"“]([^」』"”\n]{2,})[」』"”]/gu)) {
-    const head = qm[1].replace(/[^\u4e00-\u9fff]/gu, '').slice(0, 3)
-    if (head.length >= 2 && head === prevQuoteHead) {
-      echoHits.push(`${prevQuoteFull.slice(0, 18)} ∥ ${qm[1].slice(0, 18)}`)
-    }
-    prevQuoteHead = head
-    prevQuoteFull = qm[1]
-  }
-  add('echo-dialogue', '连续引语同句头，需区分机械接龙与正常重复、确认或反驳', echoHits)
-
-  // 对称格言 / 镜像对比收尾（如「…看不出来。…看得出来。」「…先…，…再…」「不是…，是…」）
-  const symmetryHits = []
-  const SYMMETRY_PATTERNS = [
-    /([^。！？\n]{2,12})(?:看不出来|听不见|说不清|抓不住|管不了)。\s*[^。！？\n]{1,8}(?:看得出来|听得见|说得清|抓得住|管得了)/gu,
-    /[^。！？\n]{2,12}听得见，[^。！？\n]{2,12}听不见/gu,
-    /手上先[^，。！？\n]{1,8}，嘴上再[^，。！？\n]{1,8}/gu,
-    /不是[^，。！？\n]{2,12}，是[^。！？\n]{2,12}(?:[。！？]|$)/gu,
-  ]
-  for (const pat of SYMMETRY_PATTERNS) {
-    for (const m of body.matchAll(pat)) {
-      symmetryHits.push(aiSnippet(body, m.index ?? 0, m[0].length))
-    }
-  }
-  add('symmetry-aphorism', '对称句式，需结合语境区分空泛总结与有效对比', symmetryHits)
-
-  const total = signals.reduce((sum, item) => sum + item.count, 0)
-  return { signals, total }
-}
 
 /** 由会话模型结合完整场景审查对白，代码不推断人物意图或替换台词。 */
-const DIALOGUE_REVIEW_RULES = [
-  '对白场景钩子：先定位这句话所在的现场，再判断说法。',
-  '逐段区分实际对白、内心、引用和无法确定；实际对白逐轮核对谁对谁说、想让对方知道或做什么、对方已知什么、时间压力与手上动作，以及人物关系和说话习惯。没有明确依据时先补读，不补造人物动机。',
-  '检查表达能否当场被听懂：省略的对象、指代和后果是否清楚，是否为了狠话、金句或陌生搭配而让听者解码；正常省略、行话和人物特有表达可保留。先保留说话目的，再选择贴合现场的说法。',
-  '危机中检查解释是否有必要和时间，不一律缩成喊话；平静交涉允许完整表达、试探和绕弯。不把身份差异改成统一的日常口语，也不改变威胁程度、承诺、事实和事件结果。',
-  '复核的 paragraphs 中，带对话标签的段落填写 dialogue.kind；实际对白填写 speaker、listener、intent、pressure、assessment。多轮对白逐轮说明，同段混有实际对白与内心或引用时按实际对白审查；纯内心或引用在 reason 中解释分类依据。发现问题或无法确定时先如实登记 conflict/uncertain；修改后重新获取审稿包。',
-].join('\n')
 
 const DEAI_REVIEW_VERSION = 4
 
@@ -6111,17 +4735,6 @@ const SCENE_REVIEW_RULES = [
 ].join('\n')
 
 /** 写作约束与审稿钩子共用，避免只在改写后补救。 */
-const DEAI_RULES = [
-  '写作与语义审稿纪律：',
-  '1. 保留事实、情节、人物意图、数字、设定和有效信息；不补造因果、动机、动作，不把可能改成确定。台词可调整表达，不能改变其信息、承诺和人物关系。',
-  '2. 先读完整场景、人物卡和文风锚点，再判断具体问题。机械命中只作线索；正常重复、纠正、对比和长句可以保留，不以零命中为目标。',
-  '3. 对话按角色的身份、目的、认知和口癖区分；不把所有人统一改成短句、粗口、反问或抢话。仅当时间压力和人物状态需要时压缩解释。',
-  '4. 核对场景时间：倒计时、动作、观察、回忆和交涉是否相容；删减或调整拖慢现场的说明，不擅自修改倒计时数值或事件结果。',
-  '5. 检查细节是否反复证明同一标签、旁白是否重复解释已演出的意义、句段是否固定为动作—体感—总结、冲突是否只为剧情服务。保留有信息或声口价值的细节，不机械删修辞。',
-  '6. 优先级：事实原意 > 作者文风与角色声口 > 场景自然度 > 原句式。只修有问题的地方；对照原稿核实信息保留，并说明保留与修改的理由。',
-  DIALOGUE_REVIEW_RULES,
-  '场景与篇幅：先核对人物设备的相对位置、移动通路、工具来源、状态变化、安全约束和动作因果，再审表达；不以脑补步骤补救矛盾。空间过渡、动作前提和关键后果必须写清。目标字数只供参考，超出不删减、不缩写、不提前收尾；按情节决定分章，上下文预算不限制正文长度。紧张时按当前理解需要投放设定，不用格言总结或逐项感官报幕替代情节；技术与身体反应要有既有设定依据。',
-].join('\n')
 
 const DEAI_WORKFLOW = '先调用 novel_deai_pack({chapter}) 阅读全文和资料，按需补读设定。先查空间因果，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,checks,scenes,paragraphs}) 如实登记：checks 每项提交 verdict/detail/evidence/counterargument，至少引用一条对应段号的逐字正文，确认矛盾至少两条不同引文；scenes 连续覆盖全文并记录布局、机制、时间线和关键动作，paragraphs 逐段说明理由或问题并填写 dialogue。conflict/uncertain 保存为阻塞状态，不得伪装通过；需要修改时在已获授权范围内修订，修改后重新取包、复核。最后运行 novel_check，分别查看机械检查和语义状态；正文、引用资料或启用文风变化后旧复核失效。引文校验只证明引用存在，不证明推论正确。本流程替代旧版填表即完成、强制洗稿与按字数收尾要求。'
 
@@ -6403,49 +5016,6 @@ async function startChapter(root, wanted) {
   return { id: chapter.id, title: chapter.title, file: chapter.file, status: chapter.status, created, chars: stats.chars, target: stats.target }
 }
 
-function findChapter(chapters, wanted) {
-  const key = String(wanted ?? '').trim()
-  if (!key) return undefined
-  const lower = key.toLocaleLowerCase()
-  return (
-    chapters.find(item => item.id === key) ??
-    chapters.find(item => item.id.toLocaleLowerCase() === lower) ??
-    chapters.find(item => item.title === key) ??
-    chapters.find(item => item.file.toLocaleLowerCase().endsWith(`${lower}.md`)) ??
-    chapters.find(item => path.basename(item.file, '.md').toLocaleLowerCase() === lower)
-  )
-}
 
-function chapterNumberOf(title) {
-  const match = /第\s*([0-9]{1,4}|[零一二两三四五六七八九十百千]{1,8})\s*章/u.exec(String(title ?? ''))
-  if (!match) return 0
-  const raw = match[1]
-  if (/^[0-9]+$/u.test(raw)) return Number(raw)
-  let total = 0
-  let number = 0
-  for (const char of raw) {
-    if (char === '百') {
-      total += (number || 1) * 100
-      number = 0
-    } else if (char === '千') {
-      total += (number || 1) * 1000
-      number = 0
-    } else if (char === '十') {
-      total += (number || 1) * 10
-      number = 0
-    } else {
-      number = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 }[char] ?? 0
-    }
-  }
-  return total + number
-}
 
-function nextChapterId(chapters) {
-  let max = 0
-  for (const chapter of chapters) {
-    const match = /^0*(\d+)/u.exec(chapter.id)
-    if (match) max = Math.max(max, Number(match[1]))
-  }
-  return String(max + 1).padStart(4, '0')
-}
 

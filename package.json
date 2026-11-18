@@ -32,7 +32,9 @@
     ]
   },
   "files": [
+    "lib",
     "index.js",
+    "stage.js",
     "client.js",
     "cordis.patch.yml",
     "docs",

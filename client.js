@@ -342,6 +342,12 @@ window.__ModuleLoader__.load({
   line-height: 1.7; outline: none;
 }
 .nvl-editor:focus { border-color: var(--dsw-alias-brand-primary, #4d6bfe); }
+.nvl-beat-field { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+.nvl-beat-field input { width: 100%; min-width: 0; box-sizing: border-box; padding: 6px; color: inherit; background: var(--dsw-alias-background-base, transparent); border: 1px solid var(--dsw-alias-border-l1, #888); border-radius: 4px; }
+.nvl-beat-sec > strong { display: block; margin: 12px 0 5px; }
+.nvl-beat-editor { min-width: 0; overflow-wrap: anywhere; }
+.nvl-beats-foot { flex-wrap: wrap; }
+.nvl-beat-sec { overflow-wrap: anywhere; }
 .nvl-outline { flex: 1; min-height: 0; padding: 4px 12px 12px; overflow: auto; }
 .nvl-outline-sec { padding: 8px 0; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
 .nvl-outline-sec:last-child { border-bottom: 0; }
@@ -1968,166 +1974,199 @@ window.__ModuleLoader__.load({
     // 右栏到了再用 ctx.inject 延迟订阅（见 apply 末尾）。
     const inject = ['slots']
 
-    /** 右栏「小说章纲」页：按章节顺序列出每章的拍摄清单，可就地写 / 改（单独成页，不塞进正文页）。 */
-    function BeatsPane() {
-      const { data } = useNovel()
-      const { status, data: board, error, reload } = useJson('/beats')
-      const eventsFeed = useJson('/events', 20000)
-      const [editing, setEditing] = useState(null)
-      const [saving, setSaving] = useState(false)
-      const [notice, setNotice] = useState(null)
-
-      const byId = {}
-      for (const section of (board && board.sections) || []) byId[section.id] = section
-      const chapters = (data && data.chapters) || []
-      const coverage = (board && board.coverage) || { total: chapters.length, covered: [] }
-      const editingId = editing ? editing.id : null
-      const laneLines = (eventsFeed.data && eventsFeed.data.lines) || []
-      const laneHits = {}
-      for (const item of (eventsFeed.data && eventsFeed.data.chapters) || []) laneHits[item.id] = item.hits || []
-
-      const save = async () => {
-        if (!editing) return
-        setSaving(true)
-        setNotice(null)
-        try {
-          const value = await postJson(`${API}/beats`, { chapter: editing.id, content: editing.text })
-          await reload()
-          setEditing(null)
-          setNotice(`已保存 ${editing.id}（${value.chars} 字）`)
-        } catch (failure) {
-          setNotice(`保存失败：${failure instanceof Error ? failure.message : String(failure)}`)
-        } finally {
-          setSaving(false)
-        }
-      }
-
-      const rhythm = (board && board.rhythm) || null
-      const header = h(
-        'div',
-        { className: 'nvl-head' },
-        h('span', { className: 'nvl-title' }, '小说章纲'),
-        h('span', { className: 'nvl-meta' }, `章纲 ${coverage.covered.length}/${coverage.total} 章`),
-      )
-      const laneLegend = h(LaneLegend, { lines: laneLines })
-      // 节奏台账：不存盘，每次都从章纲那几行标记现算 —— 所以它永远不会和章纲打架。
-      const rhythmBar = rhythm
-        ? h(
-            'div',
-            { className: 'nvl-rhythm', 'data-tone': rhythm.currentGap >= (rhythm.gapLimit || 2) ? 'err' : 'ok' },
-            `爽点 ${rhythm.payoff}${rhythm.budget ? ` / 计划 ${rhythm.budget}` : ''}` +
-              ` · 有爽点的章 ${rhythm.withPayoff}/${rhythm.withBeats} · 钩子 ${rhythm.hooks} 章 · 最长断档 ${rhythm.longestGap} 章` +
-              (rhythm.currentGap >= (rhythm.gapLimit || 2) ? ` · ⚠ 已连续 ${rhythm.currentGap} 章没有爽点（每 ${rhythm.gapLimit || 2} 章至少要一次）` : ''),
-          )
-        : null
-
-      let body
-      if (status === 'loading') {
-        body = h('div', { className: 'nvl-empty' }, '读取中…')
-      } else if (status === 'error') {
-        body = h('div', { className: 'nvl-empty' }, h('span', { className: 'nvl-err' }, `读取失败：${error}`))
-      } else if (!chapters.length) {
-        body = h('div', { className: 'nvl-empty' }, '还没有章节：先让我建一本书')
-      } else {
-        body = chapters.map(chapter => {
-          const section = byId[chapter.id]
-          const filled = Boolean(section && section.chars > 0)
-          const isEditing = editingId === chapter.id
-          return h(
-            'div',
-            { className: 'nvl-beat-sec', key: chapter.id },
-            h(
-              'div',
-              { className: 'nvl-beat-head' },
-              h('span', { className: 'nvl-beat-title' }, `${chapter.id} ${chapter.title}`),
-              h(LaneStrip, { hits: laneHits[chapter.id] || [], lines: laneLines, written: Boolean(chapter.written) }),
-              filled
-                ? h(
-                    'span',
-                    { className: 'nvl-mark', title: (section.labels || []).join('、') || '章纲里没有写爽点类型' },
-                    `爽×${section.payoff ?? 0}${section.hook ? ' 钩' : ''}${section.infos && section.infos.length ? ` 信×${section.infos.length}` : ''}`,
-                  )
-                : null,
-              isEditing
-                ? null
-                : h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'nvl-ask-btn',
-                      onClick: () => {
-                        setNotice(null)
-                        setEditing({ id: chapter.id, text: filled ? section.text : '' })
-                      },
-                    },
-                    filled ? '编辑' : '写章纲',
-                  ),
-            ),
-            isEditing
-              ? h(
-                  'div',
-                  null,
-                  h('textarea', {
-                    className: 'nvl-beats-edit',
-                    value: editing.text,
-                    placeholder: '- 开场：…\n- 中段：…\n- 收尾：…',
-                    onChange: event => setEditing({ id: chapter.id, text: event.target.value }),
-                  }),
-                  h(
-                    'div',
-                    { className: 'nvl-beats-foot' },
-                    h(
-                      'button',
-                      { type: 'button', className: 'nvl-ask-btn', 'data-kind': 'primary', disabled: saving || undefined, onClick: save },
-                      saving ? '保存中…' : '保存',
-                    ),
-                    h(
-                      'button',
-                      {
-                        type: 'button',
-                        className: 'nvl-ask-btn',
-                        disabled: saving || undefined,
-                        onClick: () => {
-                          setEditing(null)
-                          setNotice(null)
-                        },
-                      },
-                      '取消',
-                    ),
-                  ),
-                )
-              : filled
-            ? h(MarkdownView, { text: section.text, className: 'nvl-beat-body' })
-            : h('div', { className: 'nvl-beat-body', 'data-empty': 'true' }, '（还没有章纲）'),
-          )
-        })
-      }
-
-      return h(
-        'div',
-        { className: 'nvl-pane' },
-        header,
-        rhythmBar,
-        laneLegend,
-        notice
-          ? h('div', { className: 'nvl-hint', 'data-tone': notice.startsWith('保存失败') ? 'err' : 'ok' }, notice)
-          : null,
-        h('div', { className: 'nvl-outline' }, body),
-        h(AskBar, {
-          head: editing ? `章纲讨论 ${editing.id}` : '章纲讨论',
-          book: data && data.book ? data.book.title : '',
-          context: editing
-            ? `这一章的拍摄清单：\n${clipText(editing.text, 1000)}`
-            : `当前章纲（每章一节）：\n${clipText(
-                ((board && board.sections) || []).map(section => `## ${section.heading}\n${section.text}`).join('\n\n'),
-                1400,
-              )}`,
-          fallback: '这套章纲的节奏有什么问题？哪一章的规划太满或太空？',
-          placeholder: '想问我什么？例如「第三章是不是缺一个转折」',
-          hint: '带上章纲发到主对话（Ctrl+Enter）',
-        }),
-      )
+    // Drafts survive secondary-page and top-tab navigation; each session has its own keys.
+    const beatDrafts = new Map()
+    const readBeatDraft = key => {
+      if (beatDrafts.has(key)) return beatDrafts.get(key)
+      try { return JSON.parse(sessionStorage.getItem('novel-beat-draft:' + key) || 'null') } catch { return null }
     }
+    const storeBeatDraft = (key, value) => {
+      beatDrafts.set(key, value)
+      try { sessionStorage.setItem('novel-beat-draft:' + key, JSON.stringify(value)) } catch {}
+    }
+    const dropBeatDraft = key => {
+      beatDrafts.delete(key)
+      try { sessionStorage.removeItem('novel-beat-draft:' + key) } catch {}
+    }
+    const beatDraftKey = (chapter, scene, character, raw) => JSON.stringify([currentSessionId, chapter, scene || '', character || '', !!raw])
+    function BeatFieldEditor({ chapter, scene, character, values, names, baseHash, raw, onSaved, onClose }) {
+      const key = beatDraftKey(chapter, scene, character, raw)
+      const [draft, setDraft] = useState(() => readBeatDraft(key) || { values: raw ? values : { ...values }, baseHash })
+      const [busy, setBusy] = useState(false)
+      const [notice, setNotice] = useState('')
+      const change = value => {
+        const next = { ...draft, values: value }
+        storeBeatDraft(key, next)
+        setDraft(next)
+      }
+      useEffect(() => {
+        const warn = event => { if (beatDrafts.size) { event.preventDefault(); event.returnValue = '' } }
+        window.addEventListener('beforeunload', warn)
+        return () => window.removeEventListener('beforeunload', warn)
+      }, [])
+      async function save() {
+        setBusy(true)
+        try {
+          const payload = { chapter, scene, character, baseHash: draft.baseHash }
+          if (raw) payload.content = draft.values
+          else payload.fields = Object.fromEntries(names.map(name => [name, draft.values[name] || '']))
+          await postJson(`${API}/beats`, payload)
+          dropBeatDraft(key)
+          await onSaved()
+          onClose()
+        } catch (error) { setNotice(`保存失败：${error.message}。草稿已保留；如版本冲突，请核对原始章纲后重新编辑。`) }
+        finally { setBusy(false) }
+      }
+      return h('div', { className: 'nvl-beat-editor' },
+        h('p', { className: 'nvl-hint' }, '字段按需填写。返回或切换页面会保留草稿；保存只更新当前对象。'),
+        raw ? h('textarea', { className: 'nvl-beats-edit', value: draft.values, onChange: e => change(e.target.value), 'aria-label': '原始章纲' }) : names.map(name => h('label', { key: name, className: 'nvl-beat-field' }, name,
+          h('input', { value: draft.values[name] || '', onChange: e => change({ ...draft.values, [name]: e.target.value }), 'aria-label': name }))),
+        h('div', { className: 'nvl-beats-foot' },
+          h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: save }, busy ? '保存中…' : '保存'),
+          h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: onClose }, '收起，保留草稿'),
+          h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => { dropBeatDraft(key); onClose() } }, '放弃草稿')),
+        h('p', { role: 'status' }, notice))
+    }
+
+    function BeatEvidence({ record }) {
+      const [text, setText] = useState('')
+      async function locate() {
+        try {
+          const value = await getJson(`${API}/chapter?id=${encodeURIComponent(record.chapter)}`)
+          const at = (value.content || '').indexOf(record.evidence)
+          setText(at < 0 ? '原文已变化，找不到引文。' : value.content.slice(Math.max(0, at - 120), at) + '【' + record.evidence + '】' + value.content.slice(at + record.evidence.length, at + record.evidence.length + 120))
+        } catch (e) { setText(e.message) }
+      }
+      return h('div', null, h('blockquote', null, record.evidence),
+        h('button', { className: 'nvl-ask-btn', onClick: locate }, `查看依据 ${record.chapter}/${record.scene}`),
+        text ? h('p', { style: { whiteSpace: 'pre-wrap' } }, text) : null)
+    }
+
+    function BeatDetail({ route, section, sectionHash, fields, onNavigate, onBack, onReload }) {
+      const { data, error, reload } = useJson(`/stage?chapter=${encodeURIComponent(route.chapter)}`, 15000)
+      const [editing, setEditing] = useState(null)
+      const [notice, setNotice] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [globalCard, setGlobalCard] = useState('')
+      const scenes = data?.scenes || []
+      const people = [...new Map(scenes.flatMap(s => s.characters).map(c => [c.id, c])).values()]
+      const names = Object.fromEntries(people.map(c => [c.id, c.name]))
+      const button = (text, click) => h('button', { type: 'button', className: 'nvl-ask-btn', onClick: click }, text)
+      const showFields = object => h(MarkdownView, { text: Object.entries(object || {}).map(([key, value]) => `- ${key}：${value}`).join('\n') || '（未安排，按本场需要填写）' })
+      const saved = async () => { await reload(); await onReload() }
+      async function review(record, action) {
+        setBusy(true)
+        try { await postJson(`${API}/character-history`, { action, character: record.character, id: record.id }); await reload(); setNotice('已更新。') }
+        catch (e) { setNotice(e.message) } finally { setBusy(false) }
+      }
+      const recordView = record => h('div', { key: record.id, className: 'nvl-beat-sec' },
+        h('strong', null, `${names[record.character] || record.character} · ${record.kind} · ${record.status === 'confirmed' && !record.valid ? '待复核' : record.status}`),
+        h('p', null, record.content), h('p', null, `信息来源：${record.source}`), h(BeatEvidence, { record }),
+        record.status === 'candidate' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'confirm') }, '已核对正文，确认') : null,
+        record.status !== 'revoked' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'revoke') }, '撤销') : null)
+      let body
+      if (!data) body = h('p', null, error || '读取中…')
+      else if (route.tab === 'people') body = people.map(person => h('div', { key: person.id, className: 'nvl-beat-sec' },
+        button(`${person.name} · ${person.role || '未设置定位'}`, () => onNavigate({ ...route, tab: 'person', person: person.id })),
+        h('p', null, scenes.filter(s => s.cast.includes(person.id)).map(s => s.title).join('、'))))
+      else if (route.tab === 'person') {
+        const person = people.find(p => p.id === route.person)
+        body = h('div', null,
+          h('h3', null, person?.name || route.person),
+          button('查看全局人物卡', async () => {
+            try { const value = await getJson(`${API}/character?name=${encodeURIComponent(person?.name || route.person)}`); setGlobalCard(value.content) }
+            catch (e) { setNotice(e.message) }
+          }),
+          globalCard ? h('details', { open: true }, h('summary', null, '全局人物卡 · 不等于当前认知'), h(MarkdownView, { text: globalCard })) : null,
+          ...scenes.filter(s => s.cast.includes(route.person)).map(scene => {
+            const role = scene.characters.find(c => c.id === route.person)
+            const key = `${scene.id}/${role.id}`
+            return h('section', { key, className: 'nvl-beat-sec' },
+              h('h4', null, scene.title), h('p', null, `视角：${names[scene.viewpoint] || scene.viewpoint || '待明确'}；${scene.narration || '依作品文风'}`),
+              button('查看场景', () => onNavigate({ ...route, tab: 'scene', scene: scene.id })),
+              h('strong', null, '入场认知与关系（已确认）'),
+              h('p', null, role.gap), ...role.history.map(recordView),
+              h('strong', null, '本场目标与计划'), showFields(Object.fromEntries(Object.entries(role.fields || {}).filter(([k]) => !Object.hasOwn(role.psychology || {}, k) && !Object.hasOwn(role.appearance || {}, k)))),
+              h('strong', null, '心理安排 · 服从视角权限'), showFields(role.psychology),
+              h('strong', null, '登场呈现 · 尚未落实的计划'), showFields(role.appearance),
+              h('strong', null, '读者此前已见的呈现（不等于角色认知）'), ...(role.presented || []).map(recordView),
+              button('编辑本场人物 / 恢复草稿', () => setEditing(key)),
+              editing === key ? h(BeatFieldEditor, { key, chapter: route.chapter, scene: scene.id, character: role.id, values: role.fields || {}, names: fields.role, baseHash: data.baseHash, onSaved: saved, onClose: () => setEditing(null) }) : null,
+              h('strong', null, '本场实际变化与呈现记录'), ...(data.records || []).filter(r => r.scene === scene.id && r.character === role.id).map(recordView))
+          }))
+      } else if (route.tab === 'events') body = h('div', null,
+        h('p', { className: 'nvl-hint' }, '仅列本章关联事件。事件文本是规划；确认记录只说明有依据的变化，不代表整个事件完成。'),
+        ...data.events.map(event => h('section', { key: event.id, className: 'nvl-beat-sec' },
+          h('h3', null, event.title || event.id), h(MarkdownView, { text: event.plan || '缺少事件定义' }),
+          ...event.scenes.map(id => button(`关联场景：${scenes.find(s => s.id === id)?.title || id}`, () => onNavigate({ ...route, tab: 'scene', scene: id }))),
+          h('h4', null, '已确认变化（按来源逐项核对）'), ...event.confirmed.map(recordView),
+          !event.confirmed.length ? h('p', null, '暂无有效确认记录，不推断事件是否已完成。') : null)),
+        button('查看全书事件线', () => onNavigate({ ...route, tab: 'allEvents' })))
+      else if (route.tab === 'allEvents') body = h(EventsPane)
+      else if (route.tab === 'review') body = h('div', null,
+        h('h3', null, '结构与来源问题'), ...(data.warnings || []).map((text, i) => h('p', { key: i }, text)),
+        h('h3', null, '表现安排 · 语义待核对，非自动错误'),
+        ...(data.reviews || []).map((item, i) => h('div', { key: i, className: 'nvl-beat-sec' }, h('p', null, item.detail), button(`${item.scene} / ${names[item.character] || item.character}`, () => onNavigate({ ...route, tab: 'person', person: item.character })))),
+        h('h3', null, '正文候选与待复核记录'), ...(data.records || []).filter(r => r.status === 'candidate' || (r.status === 'confirmed' && !r.valid)).map(recordView),
+        ...(data.impacts || []).map(impact => h('p', { key: impact.record }, `可能受影响：${impact.content} → ${impact.scenes.map(s => `${s.chapter}/${s.id}`).join('、')}`)))
+      else if (route.tab === 'scene') {
+        const scene = scenes.find(s => s.id === route.scene)
+        body = scene ? h('div', null, h('h3', null, scene.title), showFields(scene.fields),
+          ...scene.cast.map(id => button(names[id] || id, () => onNavigate({ ...route, tab: 'person', person: id }))),
+          h(BeatFieldEditor, { chapter: route.chapter, scene: scene.id, values: scene.fields, names: fields.scene, baseHash: data.baseHash, onSaved: saved, onClose: onBack })) : h('p', null, '场景已删除，请返回刷新。')
+      } else if (route.tab === 'chapter') body = h(BeatFieldEditor, { chapter: route.chapter, values: section?.overview?.fields || {}, names: fields.chapter, baseHash: sectionHash, onSaved: saved, onClose: onBack })
+      else if (route.tab === 'raw') body = h(BeatFieldEditor, { chapter: route.chapter, values: section?.text || '', raw: true, baseHash: sectionHash, onSaved: saved, onClose: onBack })
+      return h('div', { className: 'nvl-pane' },
+        h('div', { className: 'nvl-head' }, button('← 返回', onBack), h('span', null, `${route.chapter} / ${{ people: '本章人物', person: '人物详情', scene: '场景', events: '本章事件', allEvents: '全书事件线', review: '待核对', chapter: '章节目标', raw: '原始章纲' }[route.tab]}`)),
+        h('div', { className: 'nvl-outline' }, body, h('p', { role: 'status' }, notice)))
+    }
+
+    function BeatsPane() {
+      const { data: novel } = useNovel()
+      const { data: board, error, reload } = useJson('/beats')
+      const charactersFeed = useJson('/characters', 30000)
+      const characterNames = Object.fromEntries((charactersFeed.data?.characters || []).map(c => [c.id, c.name]))
+      const [stack, setStack] = useState([])
+      const scroll = React.useRef(null)
+      const savedScroll = React.useRef(0)
+      const route = stack[stack.length - 1]
+      const open = next => { if (!route) savedScroll.current = scroll.current?.scrollTop || 0; setStack(current => [...current, next]) }
+      const back = () => setStack(current => current.slice(0, -1))
+      useBackStep(!!route, back)
+      useEffect(() => { if (!route && scroll.current) scroll.current.scrollTop = savedScroll.current }, [route])
+      const sections = Object.fromEntries((board?.sections || []).map(s => [s.id, s]))
+      const fields = board?.fields || { role: [], scene: [], chapter: [] }
+      const button = (label, next) => h('button', { type: 'button', className: 'nvl-ask-btn', onClick: () => open(next) }, label)
+      return h('div', { className: 'nvl-pane' },
+        h('div', { className: 'nvl-pane', style: { display: route ? 'none' : 'flex' } },
+          h('div', { className: 'nvl-head' }, h('span', { className: 'nvl-title' }, '小说章纲'), h('span', { className: 'nvl-meta' }, `已规划 ${board?.coverage?.covered?.length || 0}/${board?.coverage?.total || 0} 章`)),
+          h('div', { className: 'nvl-outline', ref: scroll },
+            error ? h('p', null, error) : null,
+            !board ? h('p', null, '读取中…') : null,
+            ...(novel?.chapters || []).map(chapter => {
+              const section = sections[chapter.id]
+              const overview = section?.overview
+              return h('section', { key: chapter.id, className: 'nvl-beat-sec' },
+                h('h3', null, `${chapter.id} ${chapter.title}`),
+                overview?.fields?.本章目标 ? h('p', null, `本章目标：${overview.fields.本章目标}`) : null,
+                ...(overview?.scenes || []).map(scene => h('div', { key: scene.id, className: 'nvl-outline-sec' },
+                  h('strong', null, scene.title), h(MarkdownView, { text: scene.summary || '尚未填写冲突与结果' }),
+                  button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
+                  ...scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id })))),
+                overview?.fields?.收尾 ? h('p', null, `收尾：${overview.fields.收尾}`) : null,
+                !overview?.scenes?.length ? h('p', { className: 'nvl-hint' }, '暂无结构化场景，请通过原始章纲创建。') : null,
+                h('div', { className: 'nvl-beats-foot' },
+                  button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),
+                  button(`事件线 ${overview?.events?.length || 0}`, { chapter: chapter.id, tab: 'events' }),
+                  button(`表现核对 ${overview?.reviewCount || 0}`, { chapter: chapter.id, tab: 'review' }),
+                  button('章节目标', { chapter: chapter.id, tab: section ? 'chapter' : 'raw' }),
+                  button('原始章纲', { chapter: chapter.id, tab: 'raw' }),
+                  h('a', { className: 'nvl-ask-btn', href: apiPath(`${API}/context?chapter=${encodeURIComponent(chapter.id)}&format=text`), target: '_blank', rel: 'noreferrer' }, 'AI 装配包')))
+            }))),
+        route ? h(BeatDetail, { key: JSON.stringify(route), route, section: sections[route.chapter], sectionHash: board?.baseHash, fields, onNavigate: open, onBack: back, onReload: reload }) : null,
+        !route ? h(AskBar, { head: '章纲讨论', book: novel?.book?.title || '', context: clipText((board?.sections || []).map(s => `${s.heading}\n${(s.overview?.scenes || []).map(scene => scene.summary).join('\n')}`).join('\n\n'), 1400), fallback: '请检查章纲的剧情推进与人物动机，需要时读取人物和事件详情。', placeholder: '想讨论哪一章？', hint: '带上剧情骨架发到主对话' }) : null)
+    }
+
 
     /** 事件线颜色：按线在 events.md 里的顺序取色，图例和泳道点共用一套。 */
     const LANE_COLORS = ['#4d6bfe', '#e0483e', '#2f9e69', '#b7791f', '#7c5cff', '#0e7490']
