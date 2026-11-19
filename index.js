@@ -345,9 +345,19 @@ function validateBeatsContent(content) {
   const warnings = []
   const body = String(content ?? '')
   if (/^\s{0,3}#{1,6}\s+\d{3,4}/mu.test(body)) warnings.push('章纲里不要再写「## 数字」这种章标题：标题由插件生成（写了也会被剥掉），正文只写场景。')
-  const scenes = parseScenes(body).length || body.split(/\r?\n/u).filter(line => /^\s{0,3}[-*+]\s*场景\s*[：:]/u.test(line)).length
-  if (!scenes) warnings.push('一条场景都没写（应为 3–6 条：`- 场景：谁 → 在哪 → 想干什么 → 撞上什么`）。')
-  else if (scenes > 8) warnings.push(`写了 ${scenes} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。（只是提醒，内容已完整保存，回合数/行数都没有上限。）`)
+  const scenes = parseScenes(body)
+  if (!scenes.length) {
+    warnings.push('没有解析到结构化场景（必须使用 `### 场景 英文ID：标题` + `- 时序：10` + `- 出场：人物ID` + `#### 人物 人物ID`）。')
+  } else {
+    if (scenes.length > 8) warnings.push(`写了 ${scenes.length} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。（只是提醒，内容已完整保存。）`)
+    for (const scene of scenes) {
+      if (scene.time === null) warnings.push(`场景 ${scene.id} 缺少整数「- 时序：10」。`)
+      if (!scene.cast.length) warnings.push(`场景 ${scene.id} 缺少「- 出场：人物ID」。`)
+      for (const id of scene.cast) {
+        if (!scene.roles.some(r => r.id === id)) warnings.push(`场景 ${scene.id} 缺少「#### 人物 ${id}」约束块。`)
+      }
+    }
+  }
   return warnings
 }
 
@@ -4000,18 +4010,29 @@ export function apply(ctx, config) {
       }
 
       if (hasContent) {
-        const written = await writeBeats(rootNow(), chapter, args.content)
+        const normalizedContent = String(args.content ?? '').replace(/^(### 场景 [\w-]+)\s*:\s*/gm, '$1：')
+        const parsedScenes = parseScenes(normalizedContent, chapter.id)
+        if (!parsedScenes.length) {
+          throw new Error(
+            '章纲格式不符合结构化场景要求，右栏页面无法渲染，已拒绝写入。请使用：\n' +
+              '### 场景 s0001-scene1：场景标题\n' +
+              '- 时序：10\n- 故事时间：...\n- 地点：...\n- 视角：人物英文ID\n- 出场：人物英文ID\n- 冲突：...\n- 叙述方式：限知\n\n' +
+              '#### 人物 人物英文ID\n- 已知：...\n- 目标：...\n\n' +
+              '（注意：场景 ID 只能是英文/数字/连字符；如只改已有场景的单个字段，请改用 novel_stage_edit。）',
+          )
+        }
+        const written = await writeBeats(rootNow(), chapter, normalizedContent)
         return {
           written: true,
-          warnings: validateBeatsContent(args.content),
+          warnings: validateBeatsContent(normalizedContent),
           chapter: { id: chapter.id, title: chapter.title },
           beats: {
             heading: written.heading,
-            text: String(args.content).trim(),
+            text: normalizedContent.trim(),
             chars: written.chars,
             present: written.chars > 0,
-            infos: parseBeatInfos(args.content),
-            scenes: parseScenes(args.content, chapter.id),
+            infos: parseBeatInfos(normalizedContent),
+            scenes: parsedScenes,
           },
           coverage: await beatsCoverage(rootNow(), chapters),
           rhythm: rhythmSummary,

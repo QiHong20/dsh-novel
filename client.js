@@ -2156,7 +2156,13 @@ window.__ModuleLoader__.load({
                   button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
                   ...scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id })))),
                 overview?.fields?.收尾 ? h('p', null, `收尾：${overview.fields.收尾}`) : null,
-                !overview?.scenes?.length ? h('p', { className: 'nvl-hint' }, '暂无结构化场景，请通过原始章纲创建。') : null,
+                !overview?.scenes?.length
+                  ? (section?.text && section.text.trim()
+                      ? h('div', { className: 'nvl-outline-sec' },
+                          h(MarkdownView, { text: section.text }),
+                          h('p', { className: 'nvl-hint' }, '当前为简版章纲要点；开写前请用 novel_beats 展开为结构化场景（### 场景 英文ID：标题）。'))
+                      : h('p', { className: 'nvl-hint' }, '暂无章纲，请用 novel_beats 创建结构化场景。'))
+                  : null,
                 h('div', { className: 'nvl-beats-foot' },
                   button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),
                   button(`事件线 ${overview?.events?.length || 0}`, { chapter: chapter.id, tab: 'events' }),

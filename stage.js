@@ -49,7 +49,7 @@ export function cardIdentity(text) {
 }
 
 export function parseScenes(text, chapter = '') {
-  const starts = [...text.matchAll(/^### 场景 ([\w-]+)：([^\n]*)$/gm)]
+  const starts = [...text.matchAll(/^### 场景 ([\w-]+)\s*[：:]\s*([^\n]*)$/gm)]
   return starts.map((m, i) => {
     const raw = text.slice(m.index, starts[i + 1]?.index ?? text.length).trim()
     const head = raw.split(/^#### /m)[0]
@@ -187,7 +187,7 @@ export function patchStageText(text, args) {
   let end = chapters[chapters.indexOf(chapter) + 1]?.index ?? text.length
   let allowed = CHAPTER_FIELDS
   if (args.scene) {
-    const scenes = [...text.slice(start, end).matchAll(/^### 场景 ([\w-]+)：[^\n]*(?:\n|$)/gm)]
+    const scenes = [...text.slice(start, end).matchAll(/^### 场景 ([\w-]+)\s*[：:][^\n]*(?:\n|$)/gm)]
     const found = scenes.filter(m => m[1] === args.scene)
     if (found.length !== 1) throw new Error('场景不存在或重复')
     const scene = found[0]
@@ -304,7 +304,9 @@ export async function moveScene(root, chapters, sceneId, targetChapter) {
   const file = path.join(root, 'beats.md')
   const original = await read(file)
   let text = original.replace(/\r\n/g, '\n')
-  const start = text.indexOf(`### 场景 ${sceneId}：`)
+  const startMatch = new RegExp(`^### 场景 ${sceneId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[：:]`, 'm').exec(text)
+  if (!startMatch) throw new Error('在 beats.md 中找不到该场景标题')
+  const start = startMatch.index
   const endMatch = /^##(?:#)? /gm
   endMatch.lastIndex = start + 1
   const end = endMatch.exec(text)?.index ?? text.length
