@@ -3719,7 +3719,7 @@ export function apply(ctx, config) {
       properties: {
         chapter: { type: 'string' },
         baseHash: { type: 'string', description: '当前 novel_deai_pack 返回的整章哈希，发现矛盾也可登记' },
-        payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段。' },
+        payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段；顶层也可带 baseHash，直接参数缺省时采用文件里的值（chapter 仍要直接传）。' },
         checks: {
           type: 'object', additionalProperties: false,
           properties: Object.fromEntries(Object.entries(DEAI_REVIEW_ASPECTS).map(([key, description]) => [key, {
@@ -3875,14 +3875,18 @@ export function apply(ctx, config) {
       }
       const raw = (await readText(path.join(root, chapter.file))) ?? ''
       const packed = extractDeaiPack(raw, [])
-      if (!raw.trim() || args.baseHash !== packed.baseHash) throw new Error('正文为空或版本已变化，请重新调用 novel_deai_pack；未登记')
+      if (!raw.trim()) throw new Error(`第 ${chapter.id} 章正文为空，先写正文再登记复核；未登记`)
+      const submittedHash = args.baseHash || payload.baseHash
+      if (!submittedHash) throw new Error('缺少 baseHash：请传 novel_deai_pack 返回的 baseHash（写在 payloadFile 顶层也可以）。重新取包不会改变哈希，只有正文变化才会；未登记')
+      if (submittedHash !== packed.baseHash) throw new Error(`版本已变化：提交 ${String(submittedHash).slice(0, 12)}，当前正文 ${packed.baseHash.slice(0, 12)}；请重新调用 novel_deai_pack 取包后再登记；未登记`)
       const observations = reviewObservations(observationsInput, checks)
       let timing = calculateReviewTimeBudgets(timeBudgets, packed, checks)
       const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence])
       timing = calculateReviewTimeBudgets(timeBudgets, packed, checks, evidence.contexts)
       const coverage = await reviewSourceCoverage(root, meta, raw, checks)
       const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
-      if (!hasCompleteSceneReviews(scenes, packed.totalItems)) throw new Error('场景复核必须按顺序连续覆盖全文，并完整填写布局、机制、时间线与关键动作；未登记')
+      const sceneProblem = sceneReviewProblem(scenes, packed.totalItems)
+      if (sceneProblem) throw new Error(`场景复核未通过：${sceneProblem}；未登记`)
       const indices = new Set(Array.isArray(paragraphs) ? paragraphs.map(item => item?.index) : [])
       if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
       const byIndex = new Map(paragraphs.map(item => [item.index, item]))
@@ -5201,20 +5205,34 @@ const DEAI_REVIEW_ASPECTS = {
 
 /** 验证场景记录的结构与全文覆盖，物理和语义判断由会话审稿负责。 */
 function hasCompleteSceneReviews(scenes, totalItems) {
-  if (!Array.isArray(scenes) || !scenes.length) return false
+  return sceneReviewProblem(scenes, totalItems) === null
+}
+
+/** 返回第一条具体原因（null 表示通过），让调用方一眼看到是哪一场、哪个字段、哪个段号出了问题。 */
+function sceneReviewProblem(scenes, totalItems) {
+  if (!Array.isArray(scenes) || !scenes.length) return 'scenes 不能为空：按正文顺序提交全部场景'
   let nextIndex = 1
-  for (const scene of scenes) {
-    if (!scene || scene.startIndex !== nextIndex || !Number.isInteger(scene.endIndex) || scene.endIndex < scene.startIndex || scene.endIndex > totalItems) return false
-    if (['layout', 'mechanism', 'timeline'].some(key => typeof scene[key] !== 'string' || !scene[key].trim()) || !Array.isArray(scene.actions)) return false
+  for (const [position, scene] of scenes.entries()) {
+    const label = `第 ${position + 1} 场（startIndex=${scene?.startIndex ?? '缺失'}）`
+    if (!scene || typeof scene !== 'object') return `${label} 不是对象`
+    if (scene.startIndex !== nextIndex) return `${label} 起点必须是 ${nextIndex}：场景要从上一场 endIndex+1 开始，连续覆盖全文且不重叠`
+    if (!Number.isInteger(scene.endIndex) || scene.endIndex < scene.startIndex || scene.endIndex > totalItems) return `${label} endIndex 必须是 ${scene.startIndex}—${totalItems} 之间的整数`
+    const emptyField = ['layout', 'mechanism', 'timeline'].find(key => typeof scene[key] !== 'string' || !scene[key].trim())
+    if (emptyField) return `${label} 缺少 ${emptyField}`
+    if (!Array.isArray(scene.actions)) return `${label} 缺少 actions 数组`
     let actionIndex = scene.startIndex
-    for (const action of scene.actions) {
-      if (!action || !Number.isInteger(action.index) || action.index < actionIndex || action.index > scene.endIndex) return false
-      if (Object.keys(SCENE_ACTION_FIELDS).some(key => typeof action[key] !== 'string' || !action[key].trim())) return false
+    for (const [order, action] of scene.actions.entries()) {
+      const actionLabel = `${label} 第 ${order + 1} 个动作`
+      if (!action || !Number.isInteger(action.index)) return `${actionLabel} 缺少数值 index`
+      if (action.index < actionIndex) return `${actionLabel} index=${action.index} 小于上一个动作的 ${actionIndex}：动作须按段号顺序排列`
+      if (action.index > scene.endIndex) return `${actionLabel} index=${action.index} 超出本场 ${scene.startIndex}—${scene.endIndex}：放进该段所在的那一场`
+      const missing = Object.keys(SCENE_ACTION_FIELDS).find(key => typeof action[key] !== 'string' || !action[key].trim())
+      if (missing) return `${actionLabel} 缺少 ${missing}`
       actionIndex = action.index
     }
     nextIndex = scene.endIndex + 1
   }
-  return nextIndex === totalItems + 1
+  return nextIndex === totalItems + 1 ? null : `最后一场 endIndex 应为 ${totalItems}（当前只覆盖到 ${nextIndex - 1}）`
 }
 
 /** 逐维列出缺口，让调用方一次看清缺哪个维度、哪一项；不再只回一句笼统提示。 */
