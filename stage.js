@@ -85,21 +85,26 @@ export async function stageBook(root, chapters) {
   const sources = new Map()
   for (const chapter of chapters) sources.set(chapter.id, await read(path.resolve(root, chapter.file)))
   const warnings = []
+  const diagnostics = []
+  const warn = (detail, scope = {}) => {
+    warnings.push(detail)
+    diagnostics.push({ detail, ...scope })
+  }
   for (const [label, items] of [['人物', cards], ['场景', scenes]]) {
     const seen = new Set()
     for (const item of items) {
-      if (!item.id || seen.has(item.id)) warnings.push(`${label} ID 缺失或重复：${item.id || item.name}`)
+      if (!item.id || seen.has(item.id)) warn(`${label} ID 缺失或重复：${item.id || item.name}`, { global: true })
       seen.add(item.id)
     }
   }
   const eventText = await read(path.join(root, 'events.md'))
   const events = new Set([...eventText.matchAll(/^### (\S+)/gm)].map(m => m[1]))
   for (const scene of scenes) {
-    if (scene.time === null) warnings.push(`${scene.id}：缺少整数时序，不能推断故事时间`)
-    for (const id of scene.cast) if (!cards.some(c => c.id === id)) warnings.push(`${scene.id}：人物引用不存在 ${id}`)
-    for (const id of scene.events) if (!events.has(id)) warnings.push(`${scene.id}：事件引用不存在 ${id}`)
-    for (const role of scene.roles) if (!scene.cast.includes(role.id)) warnings.push(`${scene.id}：人物约束 ${role.id} 未列入出场`)
-    for (const id of scene.cast) if (!scene.roles.some(r => r.id === id)) warnings.push(`${scene.id}：${id} 缺少本场目标与认知约束`)
+    if (scene.time === null) warn(`${scene.id}：缺少整数时序，不能推断故事时间`, { chapter: scene.chapter, scene: scene.id })
+    for (const id of scene.cast) if (!cards.some(c => c.id === id)) warn(`${scene.id}：人物引用不存在 ${id}`, { chapter: scene.chapter, scene: scene.id })
+    for (const id of scene.events) if (!events.has(id)) warn(`${scene.id}：事件引用不存在 ${id}`, { chapter: scene.chapter, scene: scene.id })
+    for (const role of scene.roles) if (!scene.cast.includes(role.id)) warn(`${scene.id}：人物约束 ${role.id} 未列入出场`, { chapter: scene.chapter, scene: scene.id })
+    for (const id of scene.cast) if (!scene.roles.some(r => r.id === id)) warn(`${scene.id}：${id} 缺少本场目标与认知约束`, { chapter: scene.chapter, scene: scene.id })
   }
   for (const record of records) {
     const scene = scenes.find(s => s.id === record.scene)
@@ -113,7 +118,7 @@ export async function stageBook(root, chapters) {
   for (let n = 0; n < records.length; n++) for (const r of records) {
     if (r.valid && r.supersedes && !records.some(p => p.id === r.supersedes && p.valid)) r.valid = false
   }
-  for (const r of records) if (r.status === 'confirmed' && !r.valid) warnings.push(`认知 ${r.id} 来源或场景已变化，待复核；后续不得继承`)
+  for (const r of records) if (r.status === 'confirmed' && !r.valid) warn(`认知 ${r.id} 来源或场景已变化，待复核；后续不得继承`, { chapter: r.chapter, scene: r.scene, character: r.character, record: r.id, time: r.time, kind: r.kind })
   const impacts = records.filter(r => r.status === 'confirmed' && !r.valid).map(r => ({
     record: r.id, character: r.character, content: r.content,
     scenes: scenes.filter(s => s.cast.includes(r.character) && s.time !== null && s.time > r.time).map(s => ({ id: s.id, chapter: s.chapter, title: s.title })),
@@ -121,7 +126,7 @@ export async function stageBook(root, chapters) {
   const eventStarts = [...eventText.matchAll(/^### (\S+)([^\n]*)\n/gm)]
   const eventNodes = eventStarts.map((m, i) => ({ id: m[1], title: m[2].trim(),
     plan: eventText.slice(m.index + m[0].length, eventStarts[i + 1]?.index ?? eventText.length).split(/^## /m)[0].trim() }))
-  return { scenes, cards, records, sources, warnings, events, impacts, eventNodes, baseHash: hash(beats) }
+  return { scenes, cards, records, sources, warnings, diagnostics, events, impacts, eventNodes, baseHash: hash(beats) }
 }
 
 export function sceneState(book, scene) {
@@ -135,6 +140,7 @@ export function sceneState(book, scene) {
     return { id, name: card?.name || id, role: card?.role || '', importance: card?.importance || '',
       history, presented, ...scene.roles.find(r => r.id === id),
       constraints: scene.roles.find(r => r.id === id)?.constraints || '',
+      historyStatus: history.length ? 'recorded' : book.scenes.some(s => s.time !== null && scene.time !== null && s.time < scene.time && s.cast.includes(id)) ? 'unrecorded' : 'no-prior-scene',
       gap: history.length ? '' : '未记录：不代表明确未知。请核对正文或补充人物历史。' }
   })
 }
@@ -144,6 +150,13 @@ export async function stageContext(root, chapters, chapter, sceneId) {
   const scenes = book.scenes.filter(s => s.chapter === chapter && (!sceneId || s.id === sceneId))
   if (sceneId && scenes.length !== 1) throw new Error('场景不存在或 ID 重复')
   const views = scenes.map(scene => ({ ...scene, characters: sceneState(book, scene) }))
+  const scopedDiagnostics = book.diagnostics.filter(d => d.global ||
+    (d.chapter === chapter && (!sceneId || d.scene === sceneId)) ||
+    (d.record && scenes.some(s => s.id === d.scene || (s.cast.includes(d.character) &&
+      (d.kind === '呈现'
+        ? chapters.findIndex(c => c.id === d.chapter) <= chapters.findIndex(c => c.id === s.chapter)
+        : s.time !== null && (d.time == null || d.time < s.time))))))
+  const warnings = scopedDiagnostics.map(d => d.detail)
   const reviews = scenes.flatMap(scene => presentationChecks(scene, book.cards))
   const eventIds = [...new Set(scenes.flatMap(s => s.events))]
   const events = eventIds.map(id => ({ id, ...book.eventNodes.find(e => e.id === id),
@@ -156,9 +169,9 @@ export async function stageContext(root, chapters, chapter, sceneId) {
     PRESENTATION_RULES,
     ...views.map(s => `### ${s.id} ${s.title}（时序 ${s.time ?? '未明确'}；视角 ${s.viewpoint || '待明确'}；叙述方式 ${s.narration || '依作品文风，需核对'}）\n${s.characters.map(c =>
       `人物 ${c.name} (${c.id})｜${c.role}｜${c.importance}\n${c.gap}\n已确认入场历史：\n${c.history.map(r => `- [${r.kind}] ${r.content}${r.target ? `；对象：${r.target}` : ''}；来源：${r.source}；记录 ${r.id}；证据 ${r.chapter}/${r.scene}：${r.evidence}`).join('\n') || '（无）'}\n读者此前已见的呈现（不等于角色已知）：\n${c.presented.map(r => `- ${r.content}（${r.chapter}/${r.scene}）`).join('\n') || '未记录，不代表从未描写'}\n本场计划约束：\n${c.constraints || '未填写'}`).join('\n\n')}`),
-    ...book.warnings.map(w => `⚠ ${w}`),
+    ...warnings.map(w => `⚠ ${w}`),
   ].join('\n\n') : ''
-  return { scenes: views, warnings: book.warnings, impacts: book.impacts, reviews, events,
+  return { scenes: views, warnings, diagnostics: scopedDiagnostics, impacts: book.impacts, reviews, events,
     records: book.records.filter(r => r.chapter === chapter), baseHash: book.baseHash, text }
 }
 

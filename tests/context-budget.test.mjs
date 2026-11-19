@@ -58,3 +58,17 @@ test('极小预算有明确后续操作，片段索引校验', () => {
   assert.throws(() => select('正文', 3, 1), /范围/)
   assert.throws(() => select('正文', 0, 0), /正整数/)
 })
+
+test('表现包启用后人物卡必须完整装配，预算不足明确拒绝', () => {
+  const value = fixture('原文')
+  value.presentation = '从目标、认知与关系推演关键选择，不补造事实。'
+  value.characters = [{ name: '甲', content: '完整人物资料'.repeat(1000) }]
+  value.presentationExcerpts = '前文候选'.repeat(200)
+  const blocked = assemble(value, 3000)
+  assert.equal(blocked.ready, false)
+  const ready = assemble(value, 20000)
+  assert.equal(ready.ready, true)
+  assert.ok(ready.prompt.includes(value.characters[0].content))
+  assert.ok(ready.prompt.includes(value.presentationExcerpts))
+  assert.equal(ready.budgetUsed, Array.from(ready.prompt).length)
+})

@@ -21,6 +21,42 @@ async function fixture(t) {
 }
 const proposal = { action: 'propose', character: 'a', scene: 'first', kind: '已知', content: '看到信物', source: '亲眼看见', evidence: '甲看见信物。' }
 
+test('场景诊断按章节和场景归属过滤，不依赖 ID 前缀；全局冲突保留', async t => {
+  const { root, chapters } = await fixture(t)
+  const chapter = await stageContext(root, chapters, '0001')
+  assert.ok(chapter.warnings.some(w => w.startsWith('first：')))
+  assert.ok(!chapter.warnings.some(w => /later：|flashback：/.test(w)))
+  assert.ok(!chapter.text.includes('later：'))
+  await fs.appendFile(path.join(root, 'beats.md'), '\n### 场景 first：重复\n- 时序：99\n')
+  assert.ok((await stageContext(root, chapters, '0002')).warnings.some(w => /场景 ID 缺失或重复/.test(w)))
+})
+
+test('真实检查将历史覆盖与表现清单移出问题计数，首场历史不靠事后登记清零', async t => {
+  const { root, chapters } = await fixture(t)
+  const file = path.join(root, 'beats.md')
+  // Remove the flashback so first really has no earlier scene in story time.
+  await fs.writeFile(file, (await fs.readFile(file, 'utf8')).split('## 0003')[0].replace('- 目标：查清真相', '- 心理内容：犹疑\n- 视角权限：仅作者参考\n- 目标：查清真相'))
+  const tools = new Map()
+  apply({ tools: { register: definition => tools.set(definition.name, definition) }, effect() {} }, { root })
+  const tool = tools.get('novel_check')
+  const report = await tool.execute({ chapter: '0001' })
+  assert.equal(report.historyCoverage.length, 2)
+  assert.ok(report.historyCoverage.every(r => r.status === 'no-prior-scene'))
+  assert.equal(report.presentationReview.length, 1)
+  assert.ok(!report.issues.some(r => r.kind === 'stage-history-gap'))
+  assert.ok(!report.issues.some(r => r.detail.includes('later：')))
+  const rendered = JSON.stringify(tool.output.render({}, report))
+  assert.match(rendered, /人物表现审阅清单/)
+  assert.doesNotMatch(rendered, /表现安排待核对/)
+  const { record } = await updateHistory(root, chapters, proposal)
+  await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: record.id })
+  const first = await stageContext(root, chapters, '0001')
+  const later = await stageContext(root, chapters, '0002')
+  assert.equal(first.scenes[0].characters[0].historyStatus, 'no-prior-scene')
+  assert.equal(later.scenes[0].characters[0].historyStatus, 'recorded')
+  assert.equal(later.scenes[0].characters[1].historyStatus, 'unrecorded')
+})
+
 test('候选与计划不继承；确认后只有知情角色、较晚场景继承；倒叙不泄露', async t => {
   const { root, chapters } = await fixture(t)
   const { record } = await updateHistory(root, chapters, proposal)

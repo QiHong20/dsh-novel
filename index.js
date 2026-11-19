@@ -18,6 +18,7 @@ import { promises as fsp } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { countChars, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, DIALOGUE_REVIEW_RULES, DEAI_RULES, styleStats, styleFit, interiorStats, payoffMoments, detectAiTone, CJK_STOP, styleAnchorText, aiSnippet, aiSentences } from './lib/text.js'
+import { presentationContext, selectPresentationExcerpts, renderPresentationExcerpts } from './lib/presentation.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, hash as stageHash, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
@@ -40,7 +41,7 @@ export const name = 'novel'
 export const inject = ['tools', 'webServer']
 
 const API_PREFIX = '/novel-api'
-const PLUGIN_REVISION = 'review-hints-v1'
+const PLUGIN_REVISION = 'scoped-diagnostics-v2'
 
 const REVIEW_SOURCE_ROLES = {
   chapter: { role: 'written-content', label: '当前正文', policy: '核对叙述、对白和推断各自声称了什么；人物说法不自动成为作者事实。' },
@@ -856,10 +857,12 @@ function assembleNovelContext(value, budget) {
       true,
     )
   }
+  add('presentation', '本场人物表现：写前推演', value.presentation || '', true)
   add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
   add('style', `文风：${value.style.name}`, value.style.text, true)
   if (value.rhythm && value.rhythm.present) add('rhythm', '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
-  value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content))
+  value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content, Boolean(value.presentation)))
+  add('presentationExcerpts', '人物与情绪承接原文候选', value.presentationExcerpts || '')
   value.settings.forEach((item, i) => add(`setting-${i}`, `设定：${item.name}`, item.content))
   value.spine.forEach((item, i) => add(`event-${i}`, `事件：${item.id} ${item.title}`, `因为：${item.because}\n所以：${item.so}`))
   add('prevTail', '上一章结尾（节选）', value.prevTail.text)
@@ -878,8 +881,8 @@ function assembleNovelContext(value, budget) {
   const required = blocks.filter(item => item.required)
   const minimum = size([head, ...required.map(item => item.text)].join('\n\n') + footer)
   if (minimum > budget) {
-    const prompt = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。未提供残缺正文，不可据此覆盖整章。增大 budget（最多 40000）；长章请用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写。若片段仍放不下，缩小 rewriteLimit 或增大 budget。`
-    const guidance = !rewrite && value.stage?.scenes?.length ? `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。请增加 budget（默认 12000，最多 40000），或用 novel_context({chapter:"${value.chapter.id}",scene:"${value.stage.scenes[0].id}",budget:20000}) 按场景装配（最多 40000）；不得忽略人物认知边界。` : prompt
+    const prompt = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。未提供残缺正文，不可据此覆盖整章。增大 budget（最多 200000）；长章请用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写。若片段仍放不下，缩小 rewriteLimit 或增大 budget。`
+    const guidance = !rewrite && value.stage?.scenes?.length ? `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。请增加 budget（默认 60000，最多 200000），或用 novel_context({chapter:"${value.chapter.id}",scene:"${value.stage.scenes[0].id}",budget:20000}) 按场景装配（最多 200000）；不得忽略人物认知边界。` : prompt
     return { ...value, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), ready: false, minimumBudget: minimum, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
   }
   for (const block of [...required, ...blocks.filter(item => !item.required)]) {
@@ -2641,7 +2644,7 @@ export function apply(ctx, config) {
       properties: {
         scene: { type: 'string', description: '稳定场景 ID；只装配该场的角色状态和章纲' },
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
-        budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 12000、改写 16000，最多 40000；不限制正文字数' },
+        budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 60000、改写 80000，最多 200000；不限制正文字数' },
         rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
         rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
@@ -2705,11 +2708,11 @@ export function apply(ctx, config) {
         ? chapters[index]
         : { id: nextChapterId(chapters), title: `第 ${Number(nextChapterId(chapters))} 章`, chars: 0, target: meta.targetChars, status: 'planned' }
 
-      // 续写也要完整带上文风锚点与设定细节：默认 12000，改写 16000（用户反馈 5000 装不下章纲+人物+文风）。
-      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 16000 : 12000, 300, 40000)
+      // 同步放宽总预算和材料内部额度；单位是 Unicode 字符，不是字节或 token。
+      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 80000 : 60000, 300, 200000)
       const prev = chapters.slice(0, index).reverse().find(item => item.chars > 0)
       const prevText = prev ? (await readText(path.join(rootNow(), prev.file))) ?? '' : ''
-      const prevTailText = tail(prevText, Math.max(300, Math.min(800, Math.round(budget * 0.3))))
+      const prevTailText = tail(prevText, Math.max(300, Math.min(6000, Math.round(budget * 0.15))))
 
       const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
       const outlinePart = outlineExcerpt(outlineText, current, Math.max(200, Math.min(900, Math.round(budget * 0.35))))
@@ -2774,7 +2777,7 @@ export function apply(ctx, config) {
       }
       const characters = []
       const castIds = new Set(stage.scenes.flatMap(scene => scene.cast))
-      const ordered = (stage.scenes.length ? cards.filter(card => castIds.has(card.id)) : picked.slice(0, 5)).sort((a, b) => (a.rank || 9) - (b.rank || 9))
+      const ordered = (stage.scenes.length ? cards.filter(card => castIds.has(card.id)) : picked).sort((a, b) => (a.rank || 9) - (b.rank || 9))
       for (const card of ordered) {
         const content = await readCharacter(rootNow(), card.name)
         const state = stateAt(card.states, current.id)
@@ -2836,8 +2839,8 @@ export function apply(ctx, config) {
       // 改写时句子要「像」，锚点配额给得更大：卡里真正管用的是锚点，不是摘要。
       const rewrite = args.mode === 'rewrite'
       const styleBudget = rewrite
-        ? Math.max(800, Math.min(3000, Math.round(budget * 0.6)))
-        : Math.max(1100, Math.min(2800, Math.round(budget * 0.6)))
+        ? Math.max(800, Math.min(16000, Math.round(budget * 0.25)))
+        : Math.max(1100, Math.min(12000, Math.round(budget * 0.2)))
       const styleAssembly = assembleStylePrompt(styleRaw, styleBudget)
       const styleText = styleAssembly.text
 
@@ -2854,11 +2857,20 @@ export function apply(ctx, config) {
 
       const selected = rewriteSelection(rawChapter, args.rewriteStart, args.rewriteLimit)
       if (rewrite) chapterText = selected.text
+      // Chapter order, not filenames, defines the cutoff: never retrieve target or future prose.
+      const priorTexts = []
+      for (const chapter of chapters.slice(0, index)) {
+        if (chapter.chars > 0) priorTexts.push({ id: chapter.id, title: chapter.title, text: (await readText(path.join(rootNow(), chapter.file))) ?? '' })
+      }
+      const presentationSources = selectPresentationExcerpts(priorTexts, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
       const preflight = await materialPreflight(rootNow(), current, { beatsText, styleName, styleText: styleRaw ?? '' })
       return assembleNovelContext({
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: { present: Boolean(beats.section), heading: beats.section ? beats.section.heading : '', text: beatsText, infos: beats.section?.infos ?? [], interiors: beats.section?.interiors ?? [], cognition: beats.section?.cognition ?? [] },
         rhythm,
+        presentation: presentationContext(stage, characters, rewrite && selected.scope.partial),
+        presentationSources,
+        presentationExcerpts: renderPresentationExcerpts(presentationSources),
         stage,
         spine,
         outline: outlinePart,
@@ -3230,6 +3242,8 @@ export function apply(ctx, config) {
           workspaceRoot: { type: 'string' },
           mechanicalOk: { type: 'boolean', description: '仅表示本次机械检查是否有待处理项，不表示语义正确' },
           deaiReview: { type: 'object', additionalProperties: true, description: '模型审稿记录：pending 待登记，blocked 有矛盾或依据不足，recorded 已有有效记录，untracked 为直接检查文本；不提供自动语义通过认证' },
+          historyCoverage: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '非阻塞的人物入场历史覆盖状态，不是正文问题' },
+          presentationReview: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '人物表现审阅依据，不是已发现错误或必须清零的任务' },
           heuristicNotes: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '非阻塞统计线索；不能据此自动补动作、改台词或合并句子' },
           chars: { type: 'integer' },
           target: { type: 'integer' },
@@ -3266,7 +3280,11 @@ export function apply(ctx, config) {
           ] : []),
         ]
         const semanticCount = value.issues.filter(item => item.kind.startsWith('semantic-') || item.kind === 'deai-review-pending').length
-        reviewLines.push(...(value.presentationReview || []).map(item => `表现安排待核对（非错误） ${item.scene}/${item.character}：${item.detail}`))
+        if (value.presentationReview?.length) reviewLines.push(`人物表现审阅清单：${value.presentationReview.length} 条场景要求（见 presentationReview 明细）。这是审稿依据，不是已发现错误，不要求清零；已有审稿记录也不会删除章纲要求。`)
+        if (value.historyCoverage?.length) {
+          const first = value.historyCoverage.filter(item => item.status === 'no-prior-scene').length
+          reviewLines.push(`人物历史覆盖：${first} 处无更早出场场景，${value.historyCoverage.length - first} 处后续场景暂无有效入场记录（见 historyCoverage）。均为资料状态，不计入问题；只记录正文支持的实际变化，不为消除提示补造历史。`)
+        }
         const categories = new Map()
         for (const item of value.issues.filter(item => !item.kind.startsWith('semantic-') && item.kind !== 'deai-review-pending')) categories.set(item.kind, (categories.get(item.kind) ?? 0) + 1)
         const heading = `机械及资料待处理 ${value.issues.length - semanticCount} 项；审稿阻塞 ${value.deaiReview?.findings?.length ?? 0} 项；待登记提示 ${value.issues.filter(item => item.kind === 'deai-review-pending').length} 项；非阻塞线索 ${(value.heuristicNotes ?? []).length} 项（${value.chars} 字${value.target ? `，参考 ${value.target}` : ''}）。本工具不自动判定语义通过。`
@@ -3317,7 +3335,12 @@ export function apply(ctx, config) {
         const stage = await stageContext(rootNow(), meta.chapters, chapter.id)
         report.presentationReview = stage.reviews
         report.issues.push(...stage.warnings.map(detail => ({ kind: 'stage-reference', detail })))
-        for (const scene of stage.scenes) for (const person of scene.characters) if (person.gap) report.issues.push({ kind: 'stage-history-gap', detail: `${scene.id}/${person.name}：${person.gap}` })
+        report.historyCoverage = stage.scenes.flatMap(scene => scene.characters.filter(person => person.gap).map(person => ({
+          scene: scene.id, character: person.id, name: person.name, status: person.historyStatus,
+          detail: person.historyStatus === 'no-prior-scene'
+            ? '未找到更早出场场景，暂无入场历史属正常起点；不证明读者或角色首次见到，也不要求补造开篇前历史。'
+            : '更早有出场场景，但暂无有效入场历史；按需核对正文中的实际变化，不代表正文错误或角色明确未知。',
+        })))
       }
       report.heuristicNotes = []
       const chapterReview = chapter && typeof args.text !== 'string'
@@ -4592,7 +4615,11 @@ export function apply(ctx, config) {
               const definition = toolDefs.get('novel_context')
               if (!definition) { sendJson(res, 500, { error: '装配包工具未注册' }); return }
               const mode = url.searchParams.get('mode') === 'rewrite' ? 'rewrite' : 'continue'
-              const budget = Number(url.searchParams.get('budget')) || 12000
+              // 默认预算跟工具走，不要在路由里写死：工具改了默认值，预览必须跟着改，
+              // 否则会出现「预览说预算不足、AI 却能正常装配」的错位。
+              const declared = definition && definition.parameters && definition.parameters.properties
+                && definition.parameters.properties.budget && definition.parameters.properties.budget.default
+              const budget = Number(url.searchParams.get('budget')) || Number(declared) || (mode === 'rewrite' ? 80000 : 60000)
               try {
                 const args = { chapter, mode, ...(budget ? { budget } : {}) }
                 const value = await definition.execute(args, {})
