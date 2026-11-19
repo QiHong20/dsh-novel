@@ -3116,14 +3116,17 @@ export function apply(ctx, config) {
         payoff: typeof args.payoff === 'string' ? args.payoff : undefined,
         status: typeof args.status === 'string' ? args.status : undefined,
       })
-      return {
+      const result = {
         mode: 'write',
         thread: written.thread,
-        row: written.row,
         rows: written.rows,
         replaced: written.replaced,
         warnings: validateThreadPatch(args),
       }
+      // output.schema 声明 row 必须是对象；writeThread 找不到该行时返回 null，
+      // 直接把 null 交给 schema 会被判成「value.row 必须是对象」的无效输出。
+      if (written.row) result.row = written.row
+      return result
     },
     presentCall: args => ({
       card: 'generic',
@@ -3165,10 +3168,11 @@ export function apply(ctx, config) {
           warnings: { type: 'array', items: { type: 'string' } },
         },
       },
-      render: (_args, value) => {
+      render: (args, value) => {
         const formatRow = r => `- [${r.category}] ${r.item}：${r.state}${r.chapter ? `（@${r.chapter}${r.note ? `｜${r.note}` : ''}）` : r.note ? `（${r.note}）` : ''}`
         if (value.mode === 'write') {
           if (value.deleted) return textRender(`已从状态台账删除「${value.item}」。`)
+          if (args?.delete) return textRender(`台账里没有「${value.item}」，没有可删的条目。${warnText(value.warnings)}`)
           return textRender(`${value.replaced ? '已更新' : '已登记'}台账条目：${value.row ? formatRow(value.row) : value.item}。${warnText(value.warnings)}`)
         }
         const active = (value.rows || []).filter(r => r.active)
@@ -3200,15 +3204,18 @@ export function apply(ctx, config) {
         note: typeof args.note === 'string' ? args.note : undefined,
         delete: args.delete === true,
       })
-      return {
+      const result = {
         mode: 'write',
         item: written.item,
-        row: written.row,
         rows: written.rows,
         replaced: written.replaced,
         deleted: written.deleted,
         warnings: validateLedgerPatch(args),
       }
+      // 删除成功时该行已不在台账里，writeLedger 返回 row: null；
+      // schema 要求 row 为对象，因此没有行就不带这个字段，而不是塞 null。
+      if (written.row) result.row = written.row
+      return result
     },
     presentCall: args => ({
       card: 'generic',
