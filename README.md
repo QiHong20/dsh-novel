@@ -332,3 +332,14 @@ novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<�
 实际外貌呈现可通过 `novel_character_history` 的 `kind: "呈现"` 提交逐字正文依据并确认。它按章节阅读顺序供后文参考，不进入人物认知；来源变更后仍需复核。
 
 验证：`node --test tests/*.test.mjs`。可选浏览器验收脚本 `tests/stage-v2-browser.mjs` 使用外部目录安装的 React、esbuild、Playwright，不增加插件运行时依赖；用法见脚本注释。
+
+
+## 创作拷问（grill me）
+
+对 AI 说“拷问一下这个角色”“这段剧情多问问我”即可启用 `novel_grill`。默认深入追问，每轮一个问题、2–4 个选项及各自后果，同时支持自定义回答、组合选项、留白、暂停和改答。当前通过聊天文字展示问题和选项，不需要专用按钮。
+
+工具流程：`start({mode:"character"或"plot",topic,sources?})` → AI 根据资料调用 `ask` → 展示问题并等待用户 → `answer` → 继续深入。这里括号内容指对应 action 的参数；实际调用统一为 `novel_grill({action:"start",mode:"character",topic:"顾七的底线"})`。`sources` 是书稿内 Markdown 相对路径；不传时读取已有 outline.md、beats.md 及主题中点名的人物卡，其他相关资料可用 `refresh` 增加。深度可选 quick/deep/relentless，默认 deep。
+
+`list` 查看访谈，`inspect` 恢复材料，`pause/resume` 控制状态，`revise` 改答并标记下游待核对，`summarize` 阶段总结但不结束，`finish` 保存角色卡或章纲草案。除 start/list/inspect 外均带最新 `baseHash`。相关资料改变时需核对后 refresh；只有明确决定的用户回答及其逐字引文可进入草案 decisions，未选方案和留白不能认证为决定。引文校验不代替语义核对。
+
+访谈持久化在书稿 `.novel/grills/`，属于工作草稿，不是正式设定或正文。finish 不直接修改人物卡和章纲；AI 按用户授权通过现有编辑工具保存，无须对已有授权重复询问。访谈过程和未选方案不默认进入正文上下文。旧书无须更新 AGENTS.md，也能通过工具说明使用。

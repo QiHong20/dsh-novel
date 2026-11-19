@@ -19,6 +19,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { countChars, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, DIALOGUE_REVIEW_RULES, DEAI_RULES, styleStats, styleFit, interiorStats, payoffMoments, detectAiTone, CJK_STOP, styleAnchorText, aiSnippet, aiSentences } from './lib/text.js'
 import { presentationContext, selectPresentationExcerpts, renderPresentationExcerpts } from './lib/presentation.js'
+import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, hash as stageHash, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
@@ -1621,6 +1622,15 @@ export function apply(ctx, config) {
 
   /** 统一的工具结果渲染：模型读文字，界面读卡片标题。 */
   const textRender = text => [{ type: 'text', text }]
+
+  registerTool({
+    name: 'novel_grill',
+    description: '创作拷问（grill me）：作者想打磨角色、剧情、脑洞或要求多追问时使用。先查本书资料，start(mode:character/plot,topic,sources)；默认深入，每轮一题、2–4 个有后果的选项+自由回答。根据返回规则用 ask 保存并展示问题，收到作者实际回答后才 answer，不代答；继续追问行为、代价、例外和后果，不急着收束。list/inspect 恢复，pause/resume 暂停继续，revise 改答，summarize 不结束，finish 仅整理草案。非读取操作带最新 baseHash。已授权保存时使用现有人物卡和章纲工具完成，不把访谈候选当事实或人物历史。',
+    parameters: GRILL_PARAMETERS,
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(renderGrill(value)) },
+    execute: args => grill(rootNow(), args),
+    presentCall: args => ({ card: 'generic', title: '创作拷问', kind: ['list', 'inspect'].includes(args.action) ? 'read' : 'write', rawInput: args }),
+  })
 
   registerTool({
     name: 'novel_status',
