@@ -437,7 +437,7 @@ const STYLE_SCENE_CUES = [
 ]
 
 /** 文风按完整条目装配；预算含空白和标题，以 Unicode 字符计。 */
-function assembleStylePrompt(text, maxChars, sceneKinds = []) {
+function assembleStylePrompt(text, maxChars, sceneKinds = [], scenes = []) {
   const raw = String(text ?? '').replace(/\r\n/gu, '\n').replace(/^<!-- novel-style-calibration: .* -->$/gmu, '').trim()
   const sections = raw.split(/^##[ \t]+/mu)
   const candidates = []
@@ -458,7 +458,8 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
       // 有三级标题时以整段锚点为单位；旧卡无标题时按空行分组。
       const chunks = /^###[ \t]+/mu.test(body) ? body.split(/(?=^###[ \t]+)/mu) : body.split(/\n[ \t]*\n/u)
       chunks.filter(chunk => chunk.trim()).forEach((chunk, i) => {
-        add(`锚点原文 ${i + 1}`, `## ${heading}\n${chunk}`, 3)
+        const prose = chunk.replace(/^>[ \t\u3000]*(?:正文[ \t\u3000]+)?第[ \t\u3000]*[零〇一二三四五六七八九十百千万两\d]+[ \t\u3000]*[章节回][^。！？\r\n]*$/gmu, '')
+        add(`锚点原文 ${i + 1}`, `## ${heading}\n${prose}`, 3)
         candidates.at(-1).kind = chunk.match(/^###[ \t]+[^\n]*?【(通用|对白|动作|心理|过场)】/u)?.[1]
       })
       continue
@@ -483,7 +484,28 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
     ? candidates.filter(item => item.kind === sceneKinds[0]).slice(0, 2)
     : sceneKinds.map(kind => candidates.find(item => item.kind === kind)).filter(Boolean)
   const general = candidates.find(item => item.kind === '通用')
-  const selected = new Set(general ? [general, ...relevant] : relevant)
+  const tasks = [
+    { scene: /算账|谈价|还价|压价|议价|抵账|交易/u, anchor: /条件|若是|若不|代价|交易|答应|同意|好处|交换/gu,
+      guide: '用条件和应答的变化写筹码，交代谁让步及让步的缘由，保留本作账目。' },
+    { scene: /当众|围观|不认账|追责|对质|揭穿|赔偿|赔钱|赔[一二三四五六七八九十\d]/u, anchor: /众人|围观|欺人太甚|不可能|若是不从|脸色|全场|喝道/gu,
+      guide: '交代谁掌握主动。证据或行动亮出后，按章纲写出在场者反应如何改变交锋。' },
+    { scene: /不该有|异响|异常|发现|察觉|线索|秘密|真相/u, anchor: /诡异|不可能|居然|竟然|一怔|一滞|一缩|旋即|显出|定眼一看/gu,
+      guide: '按发现前的判断、异常显露和当下反应安排信息，物件来历按章纲留白。' },
+  ]
+  const sceneMatches = scenes.map(scene => {
+    const task = tasks.find(item => item.scene.test(scene.text))
+    if (!task) return { title: scene.title, anchors: relevant.filter(item => scene.kinds.includes(item.kind)).slice(0, 2) }
+    const ranked = candidates.filter(item => item.kind).map(item => ({
+      item,
+      score: (item.text.match(task.anchor)?.length ?? 0) -
+        (/赛程|淘汰赛|(?:\d+|[一二三四五六七八九十]+)场比试|首轮比赛/u.test(item.text) ? 4 : 0),
+    })).sort((a, b) => b.score - a.score)
+    const best = ranked[0]
+    return { title: scene.title, anchors: best?.score >= 2 ? [best.item] : [], guide: task.guide }
+  })
+  const primary = [...new Set(sceneMatches.flatMap(item => item.anchors))]
+  const selected = new Set(scenes.length ? [...primary, ...(general ? [general] : [])]
+    : general ? [general, ...relevant] : relevant)
   const anchorOrder = new Map([...selected].map((item, index) => [item, index]))
   candidates.sort((a, b) => a.priority - b.priority || Number(Boolean(a.kind)) - Number(Boolean(b.kind)) ||
     (anchorOrder.get(a) ?? candidates.length) - (anchorOrder.get(b) ?? candidates.length))
@@ -495,7 +517,7 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
   for (const item of candidates) {
     const next = [...parts, item.text].join('\n\n')
     const entry = { id: item.id, label: item.label, priority: item.priority, chars: length(item.text), ...(item.kind ? { kind: item.kind } : {}) }
-    if (relevant.length && item.kind && !selected.has(item)) {
+    if ((scenes.length || relevant.length) && selected.size && item.kind && !selected.has(item)) {
       omitted.push({ ...entry, reason: '优先使用通用锚点和匹配当前场景的锚点' })
     } else if (length(next) <= budget) {
       parts.push(item.text)
@@ -504,7 +526,13 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
       omitted.push({ ...entry, reason: '文风预算不足，完整条目未截断；可增大 budget 或用 novel_style 读取完整卡片' })
     }
   }
-  return { text: parts.join('\n\n'), included, omitted, budget, used: length(parts.join('\n\n')) }
+  const includedIds = new Set(included.map(item => item.id))
+  const sceneGuide = sceneMatches.flatMap(item => {
+    const available = item.anchors.filter(anchor => includedIds.has(anchor.id))
+    if (!available.length && !item.guide) return []
+    return [`- ${item.title}：${available.length ? `对照${available.map(anchor => anchor.label).join('、')}。` : '同类锚点可从原文补读。'}${item.guide ?? '比较旁白和信息揭示的方式。'}`]
+  })
+  return { text: parts.join('\n\n'), included, omitted, budget, used: length(parts.join('\n\n')), sceneGuide }
 }
 
 // 视角需区分对白与旁白，全文代词频次仅供复核。
@@ -1114,7 +1142,7 @@ function styleSceneScores(text) {
 function sampleExcerpts(text, count = STYLE_EXCERPTS, chars = STYLE_EXCERPT_CHARS) {
   const rows = String(text ?? '').replace(/\r\n?/gu, '\n').split('\n')
   const windows = []
-  const chapterHeading = /^(?:#{1,6}\s*)?第\s*[零〇一二三四五六七八九十百千万两\d]+\s*[章回节](?:\s*[^。！？]{0,48})$/u
+  const chapterHeading = /^(?:#{1,6}\s*)?(?:正文\s+)?第\s*[零〇一二三四五六七八九十百千万两\d]+\s*[章回节](?:\s*[^。！？]{0,48})$/u
   const segmentSize = Math.max(24, Math.ceil(rows.length / 8))
   let chapter = 0
   let start = -1
@@ -1297,13 +1325,13 @@ function assembleNovelContext(value, budget) {
     )
   }
   add('presentation', '本场人物表现：写前推演', value.presentation || '', true)
-  add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
   if (value.style.text) {
-    const sceneGuide = value.style.sceneGuide?.length ? '\n\n## 本章各场的文风锚点\n' + value.style.sceneGuide.join('\n') : ''
+    const sceneGuide = value.style.sceneGuide?.length ? '## 本章分场写法\n' + value.style.sceneGuide.join('\n') + '\n\n' : ''
     add('style', `文风：${value.style.name}`,
       '按标签、适用条件和例外使用文风偏好。每场先从同类锚点找出旁白如何铺陈与收束、人物判断如何进入叙述、揭示前后如何组织反应，再把这些写法用到本作的人物和事实。对白的长短只是一项线索。保留样本有作用的长复句、叙述起伏和反应，按现场压力决定取舍。相同场景下作者校准偏好优先。遵守本作的章纲与叙述权限，勿移用参考作品的人名、事件和独特原句。\n\n' +
-      value.style.text + sceneGuide, true)
+      sceneGuide + value.style.text, true)
   }
+  add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
   if (value.rhythm && value.rhythm.present) add('rhythm', scene ? '本场节奏' : '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
   value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content, Boolean(value.presentation)))
   add('presentationExcerpts', '人物与情绪承接原文候选', value.presentationExcerpts || '')
@@ -3334,20 +3362,14 @@ export function apply(ctx, config) {
       const styleBudget = rewrite
         ? Math.max(800, Math.min(16000, Math.round(budget * 0.25)))
         : Math.max(1100, Math.min(12000, Math.round(budget * 0.2)))
-      const sceneStyles = stage.scenes.map(scene => ({
-        title: scene.title,
-        kinds: styleSceneScores(scene.raw.split(/^####[ \t]+/mu)[0]).slice(0, 2).map(item => item.kind),
-      }))
-      const sceneKinds = [...new Set(sceneStyles.flatMap(item => item.kinds))]
-      const styleAssembly = assembleStylePrompt(styleRaw, styleBudget, sceneKinds)
-      const styleText = styleAssembly.text
-      const anchors = styleAssembly.included.filter(item => item.label.startsWith('锚点原文'))
-      const sceneGuide = sceneStyles.flatMap(item => {
-        const related = anchors.filter(anchor => item.kinds.includes(anchor.kind))
-        const fallback = anchors.find(anchor => anchor.kind === '通用' || !anchor.kind)
-        const picked = related.length ? related : fallback ? [fallback] : []
-        return picked.length ? [`- ${item.title}：对照${picked.map(anchor => anchor.label).join('、')}，仅迁移与本场任务相符的叙述方式。`] : []
+      const sceneStyles = stage.scenes.map(scene => {
+        const text = scene.raw.split(/^####[ \t]+/mu)[0]
+        const focus = [scene.title, ...text.split('\n').filter(line => /^[-*+]\s*(?:冲突|目标|结果|转折|落点)\s*[：:]/u.test(line))].join('\n')
+        return { title: scene.title, text: focus, kinds: styleSceneScores(text).slice(0, 2).map(item => item.kind) }
       })
+      const sceneKinds = [...new Set(sceneStyles.flatMap(item => item.kinds))]
+      const styleAssembly = assembleStylePrompt(styleRaw, styleBudget, sceneKinds, sceneStyles)
+      const styleText = styleAssembly.text
 
       // 改写模式要带回这一章现有的正文：没有它，「按文风重写」就变成「重新写一遍」。
       let chapterText = ''
@@ -3386,7 +3408,7 @@ export function apply(ctx, config) {
         settings,
         ledger: ledgerRows,
         threads: threadRows,
-        style: { name: styleName, present: Boolean(styleText), ...styleAssembly, sceneGuide },
+        style: { name: styleName, present: Boolean(styleText), ...styleAssembly },
         mode: rewrite ? 'rewrite' : 'continue',
         chapterText,
         settingsCount: settingItems.length,

@@ -105,6 +105,26 @@ test('多场章纲优先装配每种场景各一段锚点', () => {
   assert.equal(result.included.filter(item => item.kind).map(item => item.kind).join('、'), '对白、动作、心理')
 })
 
+test('当众验证和异常发现按叙事任务选样本，排除赛程概述', () => {
+  const content = [
+    '## 锚点原文',
+    '### 锚点 1【动作】', '> 正文 第五百六十五章 第二轮', '> 第一日共二十五场比试，淘汰赛依次结束了。',
+    '### 锚点 2【通用】', '> 话音落下，围观众人脸色一变。有人喝道：先让他把证据拿出来。',
+    '### 锚点 3【对白】', '> “不可能！”她一怔，定眼一看，那道暗纹居然动了。',
+  ].join('\n')
+  const scenes = [
+    { title: '当众验炉', text: '当众验证证据，掌柜不认账。', kinds: ['动作'] },
+    { title: '废料堆', text: '挑铜时听见不该有的声音。', kinds: [] },
+  ]
+  const result = assemble(content, 2000, ['动作'], scenes)
+  assert.ok(result.sceneGuide[0].includes('锚点原文 2'))
+  assert.ok(result.sceneGuide[0].includes('反应如何改变交锋'))
+  assert.ok(result.sceneGuide[1].includes('锚点原文 3'))
+  assert.ok(result.sceneGuide[1].includes('异常显露'))
+  assert.ok(!result.text.includes('淘汰赛'))
+  assert.ok(!assemble(content, 2000).text.includes('正文 第五百六十五章'))
+})
+
 test('审稿不能用文风规则条款替代锚点原文证据', async () => {
   const start = source.indexOf('async function reviewSourceCoverage')
   const end = source.indexOf('async function readReviewSource', start)
