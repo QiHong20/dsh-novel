@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'dsh-novel/chapters'
     const TAB_KIND = 'novel-chapters'
     const API = '/novel-api'
+    const STYLE_FILE_MAX_BYTES = 32 * 1024 * 1024
 
     // 一个 dsh web 进程里可能有多个工作区/会话。宿主按「会话 cwd」找书，
     // 所以每个请求都要告诉它「我是哪个会话」——否则右栏只会显示进程目录那本书。
@@ -470,12 +471,14 @@ window.__ModuleLoader__.load({
 .nvl-primary[disabled], .nvl-ghost[disabled] { opacity: .5; cursor: default; }
 .nvl-style-sec { padding: 8px 0; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
 .nvl-style-sec:last-child { border-bottom: 0; }
+.nvl-style-row { display: flex; align-items: center; gap: 8px; }
+.nvl-style-row > .nvl-ghost { flex-shrink: 0; }
 .nvl-style-head {
-  display: flex; align-items: baseline; gap: 6px; width: 100%;
+  display: flex; align-items: baseline; gap: 6px; flex: 1; min-width: 0;
   padding: 0; border: 0; background: none; cursor: pointer; text-align: left;
   font: inherit; color: inherit;
 }
-.nvl-style-name { font-size: 12.5px; font-weight: 600; }
+.nvl-style-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 600; }
 .nvl-style-head[data-open="true"] .nvl-style-name { color: var(--dsw-alias-brand-primary, #4d6bfe); }
 .nvl-style-on {
   padding: 0 5px; border-radius: 4px; font-size: 10.5px; line-height: 15px;
@@ -488,9 +491,34 @@ window.__ModuleLoader__.load({
 .nvl-style-sum { margin-top: 2px; font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 .nvl-style-body { margin-top: 6px; }
 .nvl-style-editor { width: 100%; min-height: 220px; }
-.nvl-style-actions { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.nvl-style-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
 .nvl-style-hint { font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .nvl-style-new { display: flex; gap: 6px; align-items: center; padding: 10px 0 4px; }
+.nvl-style-dialog {
+  box-sizing: border-box; width: min(360px, calc(100vw - 32px)); padding: 16px;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, Canvas); color: var(--dsw-alias-label-primary, CanvasText);
+  font: inherit; font-size: 13px; overflow-wrap: anywhere;
+}
+.nvl-style-dialog::backdrop { background: rgba(0, 0, 0, .4); }
+.nvl-style-dialog h2 { margin: 0; font-size: 15px; }
+.nvl-style-dialog .nvl-style-actions { justify-content: flex-end; }
+.nvl-style-calibration { margin: 6px 0 12px; }
+.nvl-calibration-card {
+  min-width: 0; margin: 8px 0; padding: 10px; border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px; background: var(--dsw-alias-bg-layer-1); font-size: 12px;
+}
+.nvl-calibration-card legend { padding: 0 4px; font-weight: 600; }
+.nvl-calibration-card blockquote { margin: 0 0 8px; padding-left: 8px; border-left: 2px solid var(--dsw-alias-border-l1); }
+.nvl-calibration-option { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; cursor: pointer; }
+.nvl-calibration-option input { flex-shrink: 0; margin: 2px 0 0; }
+.nvl-calibration-option small { display: block; color: var(--dsw-alias-label-secondary); }
+.nvl-calibration-option p { white-space: pre-wrap; }
+.nvl-calibration-custom { box-sizing: border-box; width: 100%; margin-top: 6px; }
+.nvl-style-calibration-dialog { width: min(680px, calc(100vw - 32px)); max-height: 85vh; }
+.nvl-style-trial { margin: 10px 0; }
+.nvl-trial-variants { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); }
+.nvl-trial-variant { min-width: 0; padding: 10px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .nvl-set-head {
   display: flex; align-items: baseline; gap: 6px; width: 100%;
   padding: 0; border: 0; background: none; cursor: pointer; text-align: left;
@@ -820,7 +848,6 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** 点 planned 章节 = 让它变成能写的章：建空文件 + 登记 book.json + 状态转 draft。 */
     async function postJson(url, body) {
       const response = await fetch(apiPath(url), {
         method: 'POST',
@@ -830,6 +857,30 @@ window.__ModuleLoader__.load({
       const value = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`)
       return value
+    }
+
+    function readStyleFileBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => {
+          const result = reader.result
+          if (typeof result !== 'string' || !result.includes(',')) {
+            reject(new Error('无法编码原文文件，请重新选择'))
+            return
+          }
+          resolve(result.slice(result.indexOf(',') + 1))
+        }
+        reader.onerror = reader.onabort = () => reject(new Error('无法读取原文文件，请重新选择'))
+        reader.readAsDataURL(file)
+      })
+    }
+
+    async function styleClonePayload(file, name) {
+      // 桌面端和宿主共享文件系统，可直接读取用户选中的文件。
+      const source = globalThis.__DSH_HOST_PATHS__?.pathFor(file)
+      return source
+        ? { source, name }
+        : { file: { name: file.name, data: await readStyleFileBase64(file) }, name }
     }
 
     // ------------------------------------------------------------ 和主对话打通
@@ -2922,10 +2973,153 @@ window.__ModuleLoader__.load({
       placeholder: '想问哪一条？',
       fallback: '这些提醒里，哪些必须先修？按顺序给我改法。' }))
 }
-function StylesPane() {
+    function StyleCalibration({ detail, onSaved }) {
+      const [answers, setAnswers] = useState({})
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+      const formId = React.useId()
+      const { name, baseHash, questions } = detail
+      const confirmed = questions.filter(item => item.answer && !item.answer.skip).length
+      const choose = (id, answer) => setAnswers(current => ({ ...current, [id]: answer }))
+      const incomplete = Object.values(answers).some(answer => typeof answer?.custom === 'string' && !answer.custom.trim())
+      const submit = async event => {
+        event.preventDefault()
+        if (busy || incomplete || !Object.keys(answers).length) return
+        setBusy(true)
+        setError('')
+        const session = currentSessionId
+        try {
+          const value = await postJson(`${API}/style-calibration`, { name, baseHash, answers })
+          if (session === currentSessionId) {
+            setAnswers({})
+            onSaved(value)
+          }
+        } catch (failure) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setBusy(false)
+        }
+      }
+      return h('form', { className: 'nvl-style-calibration', onSubmit: submit },
+        h('strong', null, `文风校准 · 已确认 ${confirmed}/${questions.length}`),
+        ...questions.map(question => {
+          const changed = Object.hasOwn(answers, question.id)
+          const answer = changed ? answers[question.id] : question.answer
+          const custom = typeof answer?.custom === 'string'
+          const group = `${formId}-${question.id}`
+          const option = (key, label, checked, value, effect, rule, example) => h('label', { className: 'nvl-calibration-option', key },
+            h('input', { type: 'radio', name: group, checked, onChange: () => choose(question.id, value) }),
+            h('span', null, label, example ? h('p', null, example) : null, effect ? h('small', null, effect) : null,
+              checked && rule && !answer?.local ? h('small', null, `写入偏好：${rule}`) : null),
+          )
+          return h('fieldset', { className: 'nvl-calibration-card', key: question.id, disabled: busy },
+            h('legend', null, `【${question.verification ? '偏好验证 · ' : ''}${question.scope}】${question.question}`),
+            question.scenario ? h('p', null, question.scenario) : null,
+            ...question.evidence.map(({ startLine, quote }) => h('blockquote', { key: startLine }, `原文第 ${startLine} 行「${quote}」`)),
+            ...question.options.map(({ label, effect, rule, example }, index) =>
+              option(index, example ? `${index === 0 ? 'A' : 'B'} · ${label}` : label, answer?.option === index, { option: index }, effect, rule, example)),
+            question.options[answer?.option]?.example ? h('label', { className: 'nvl-calibration-option' },
+              h('input', { type: 'checkbox', checked: answer.local === true, onChange: event => choose(question.id, { option: answer.option, local: event.target.checked }) }),
+              h('span', null, '仅记录本场试写的选择'),
+            ) : null,
+            option('adaptive', '由场景决定', answer?.adaptive === true, { adaptive: true }, '按当时人物、节奏和信息量取舍。这个答案不会写入固定偏好。'),
+            option('custom', '自定义', custom, { custom: '' }),
+            custom ? h('input', {
+              className: 'nvl-input nvl-calibration-custom', 'aria-label': '填写自己的写法', placeholder: '填写自己的写法',
+              maxLength: 180, value: answer.custom, onChange: event => choose(question.id, { custom: event.target.value }),
+            }) : null,
+            option('skip', '暂时跳过', answer?.skip === true, { skip: true }),
+          )
+        }),
+        h('button', { className: 'nvl-primary', type: 'submit', disabled: busy || incomplete || !Object.keys(answers).length }, busy ? '保存中…' : '保存校准'),
+        error ? h('p', { role: 'alert', className: 'nvl-err' }, `保存校准失败：${error}`) : null,
+      )
+    }
+
+    function StyleTrial({ detail, chapters }) {
+      const [chapter, setChapter] = useState('')
+      const [scene, setScene] = useState(null)
+      const [scenes, setScenes] = useState([])
+      const [loading, setLoading] = useState(false)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+      const [result, setResult] = useState(null)
+      const [revealed, setRevealed] = useState(false)
+      useEffect(() => {
+        if (!chapter) return
+        let current = true
+        setLoading(true)
+        getJson(`${API}/style-trial?chapter=${encodeURIComponent(chapter)}`).then(value => {
+          if (!current) return
+          setScenes(value.scenes)
+          setScene(value.scenes[0]?.id ?? null)
+        }).catch(failure => {
+          if (current) setError(failure instanceof Error ? failure.message : String(failure))
+        }).finally(() => {
+          if (current) setLoading(false)
+        })
+        return () => { current = false }
+      }, [chapter])
+      const reset = () => {
+        setResult(null)
+        setRevealed(false)
+        setError('')
+      }
+      const generate = async () => {
+        if (busy || scene === null) return
+        reset()
+        setBusy(true)
+        const session = currentSessionId
+        try {
+          const value = await postJson(`${API}/style-trial`, { name: detail.name, baseHash: detail.baseHash, chapter, scene })
+          if (session === currentSessionId) setResult(value)
+        } catch (failure) {
+          setError(failure instanceof Error ? failure.message : String(failure))
+        } finally {
+          setBusy(false)
+        }
+      }
+      return h('details', { className: 'nvl-style-trial' },
+        h('summary', null, '用本书章纲对照试写'),
+        h('div', { className: 'nvl-style-actions' },
+          h('select', {
+            className: 'nvl-input', 'aria-label': '试写章节', value: chapter, disabled: busy,
+            onChange: event => {
+              setChapter(event.target.value)
+              setScene(null)
+              setScenes([])
+              setLoading(false)
+              reset()
+            },
+          }, h('option', { value: '' }, '选择章节'),
+          ...chapters.map(item => h('option', { key: item.id, value: item.id }, `${item.id} ${item.title}`))),
+          scene !== null ? h('select', {
+            className: 'nvl-input', 'aria-label': '试写场景', value: scene, disabled: busy,
+            onChange: event => { setScene(event.target.value); reset() },
+          }, ...scenes.map(item => h('option', { key: item.id, value: item.id }, item.title))) : null,
+          h('button', { className: 'nvl-primary', type: 'button', disabled: loading || busy || scene === null, onClick: () => void generate() },
+            loading ? '读取章纲…' : busy ? '试写中…' : '生成两版'),
+        ),
+        error ? h('p', { role: 'alert', className: 'nvl-err' }, error) : null,
+        result ? h('div', null,
+          h('p', { className: 'nvl-hint' }, '先比较两版的声口、叙述距离和信息揭示，再查看哪一版使用了文风卡。'),
+          h('div', { className: 'nvl-trial-variants' }, ...result.variants.map((variant, index) =>
+            h('article', { className: 'nvl-trial-variant', key: index },
+              h('strong', null, `${index === 0 ? 'A' : 'B'}${revealed ? (variant.styled ? ' · 应用当前文风卡' : ' · 基准') : ''}`),
+              h('p', null, variant.text),
+            ),
+          )),
+          !revealed ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setRevealed(true) }, '揭晓版本') : null,
+        ) : null,
+      )
+    }
+
+    function StylesPane() {
       const { status, data, error, reload } = useJson('/styles', 20000)
       const novel = useNovel(30000)
       const [open, setOpen] = useState(null)
+      const openStyle = React.useRef(null)
+      openStyle.current = open
       useBackStep(Boolean(open), () => {
         setOpen(null)
         setEditing(null)
@@ -2935,13 +3129,57 @@ function StylesPane() {
       const [saving, setSaving] = useState(false)
       const [notice, setNotice] = useState(null)
       const [draftName, setDraftName] = useState('')
-      const [draftSource, setDraftSource] = useState('')
+      const [draftFile, setDraftFile] = useState(null)
+      const fileInput = React.useRef(null)
       const [cloning, setCloning] = useState(false)
       const [sample, setSample] = useState(null)
-      const [confirmDelete, setConfirmDelete] = useState('')
+      const [deleteTarget, setDeleteTarget] = useState(null)
+      const [deleting, setDeleting] = useState('')
+      const deleteDialog = React.useRef(null)
+      const dialogTitleId = React.useId()
+      const [calibrationTarget, setCalibrationTarget] = useState('')
+      const [preparingCalibration, setPreparingCalibration] = useState(false)
+      const calibrationDialog = React.useRef(null)
+      const calibrationTitleId = React.useId()
+
+      useEffect(() => {
+        const dialog = deleteDialog.current
+        if (deleteTarget && dialog && !dialog.open) dialog.showModal()
+      }, [deleteTarget])
+      useEffect(() => {
+        const dialog = calibrationDialog.current
+        if (calibrationTarget && detail.name === calibrationTarget && detail.questions?.length && dialog && !dialog.open) dialog.showModal()
+      }, [calibrationTarget, detail.name, detail.questions?.length])
 
       const items = (data && data.styles) || []
       const active = (data && data.active) || ''
+      const book = novel.data?.book?.title || ''
+      const chapters = novel.data?.chapters ?? []
+      const saveCalibration = value => {
+        setDetail(current => current.name === detail.name && current.baseHash === detail.baseHash ? { ...current, ...value } : current)
+        setNotice(`已保存「${detail.name}」的校准答案`)
+        void reload()
+      }
+      const prepareCalibration = async () => {
+        if (preparingCalibration || !detail.name || !detail.baseHash) return
+        const { name, baseHash } = detail
+        const session = currentSessionId
+        setPreparingCalibration(true)
+        setNotice('AI 正在准备校准短稿…')
+        try {
+          const value = await postJson(`${API}/style-calibration-prepare`, { name, baseHash })
+          if (session !== currentSessionId) return
+          setDetail(current => current.name === name && current.baseHash === baseHash ? { ...current, ...value } : current)
+          if (value.questions?.length) {
+            if (openStyle.current === name) setCalibrationTarget(name)
+            setNotice(`已为「${name}」生成 ${value.questions.length} 道校准题`)
+          }
+        } catch (failure) {
+          if (session === currentSessionId) setNotice(`生成校准题失败：${failure instanceof Error ? failure.message : String(failure)}`)
+        } finally {
+          setPreparingCalibration(false)
+        }
+      }
 
       const toggle = async name => {
         if (open === name) {
@@ -2954,7 +3192,7 @@ function StylesPane() {
         setDetail({ status: 'loading', content: '', error: null })
         try {
           const value = await getJson(`${API}/style?name=${encodeURIComponent(name)}`)
-          setDetail({ status: 'ready', content: value.content ?? '', error: null })
+          setDetail({ status: 'ready', name, content: value.content ?? '', baseHash: value.baseHash, questions: value.questions, error: null })
         } catch (failure) {
           setDetail({ status: 'error', content: '', error: failure instanceof Error ? failure.message : String(failure) })
         }
@@ -2990,9 +3228,9 @@ function StylesPane() {
         setSaving(true)
         setNotice(null)
         try {
-          const value = await postJson(`${API}/style`, { name: editing.name, content: editing.text })
+          const value = await postJson(`${API}/style`, { name: editing.name, content: editing.text, baseHash: editing.baseHash })
           await reload()
-          setDetail({ status: 'ready', content: editing.text, error: null })
+          setDetail({ status: 'ready', name: editing.name, content: editing.text, baseHash: value.baseHash, questions: value.questions, error: null })
           setEditing(null)
           setNotice(`已保存「${editing.name}」（${value.chars} 字）`)
         } catch (failure) {
@@ -3008,79 +3246,92 @@ function StylesPane() {
         const template = `# 文风卡：${name}\n\n- 来源：\n- 一句话：\n- 视角与时态：\n\n## 句法\n\n- \n\n## 用词\n\n- \n\n## 对话\n\n- \n\n## 意象\n\n- \n\n## 禁忌（不要出现）\n\n- \n\n## 锚点原文\n\n### 锚点 1\n\n\n### 锚点 2\n\n\n### 锚点 3\n`
         setNotice(null)
         try {
-          await postJson(`${API}/style`, { name, content: template })
+          const value = await postJson(`${API}/style`, { name, content: template })
           await reload()
           setDraftName('')
           setOpen(name)
-          setEditing({ name, text: template })
+          setDetail({ status: 'ready', name, content: template, baseHash: value.baseHash, questions: value.questions, error: null })
+          setEditing({ name, text: template, baseHash: value.baseHash })
           setNotice(`已新建「${name}」，先把锚点原文粘进去再保存`)
         } catch (failure) {
           setNotice(`新建失败：${failure instanceof Error ? failure.message : String(failure)}`)
         }
       }
 
-      // 一条龙克隆：给个原文路径，插件自己读原文、算节奏、切锚点、写卡、存原文、设为当前。
-      // 名字留空就用文件名。
-      const cloneFromSource = async () => {
-        const source = draftSource.trim()
-        if (!source) return
+      const cloneFromFile = async () => {
+        if (!draftFile || cloning) return
+        if (draftFile.size === 0 || draftFile.size > STYLE_FILE_MAX_BYTES) {
+          setNotice(draftFile.size === 0 ? '克隆失败：原文文件为空' : '克隆失败：原文文件超过 32 MB')
+          return
+        }
         setCloning(true)
-        setNotice(null)
+        setNotice('正在读取样本并让 AI 提炼文风…')
+        const session = currentSessionId
         try {
-          const value = await postJson(`${API}/style-clone`, {
-            source,
-            ...(draftName.trim() ? { name: draftName.trim() } : {}),
-          })
+          const payload = await styleClonePayload(draftFile, draftName.trim())
+          const value = await postJson(`${API}/style-clone`, payload)
+          if (!value.name) throw new Error('宿主没有返回文风卡，请重新打开文风页后检查')
+          if (!Number.isInteger(value.ruleCount) || value.ruleCount < 1) throw new Error('宿主还未加载 AI 克隆，请完全退出并重启 DeepSeek Harness')
+          if (session !== currentSessionId) return
           await reload()
           setDraftName('')
-          setDraftSource('')
+          setDraftFile(null)
+          if (fileInput.current) fileInput.current.value = ''
           setOpen(value.name)
           setEditing(null)
           setDetail({ status: 'loading', content: '', error: null })
           try {
             const card = await getJson(`${API}/style?name=${encodeURIComponent(value.name)}`)
-            setDetail({ status: 'ready', content: card.content ?? '', error: null })
+            if (session !== currentSessionId) return
+            setDetail({ status: 'ready', name: value.name, content: card.content ?? '', baseHash: card.baseHash, questions: card.questions, error: null })
+            if (value.questionCount && card.questions?.length) setCalibrationTarget(value.name)
           } catch (failure) {
             setDetail({ status: 'error', content: '', error: failure instanceof Error ? failure.message : String(failure) })
           }
-          const warns = (value.warnings || []).length
+          const warnings = value.warnings ?? []
           setNotice(
-            `已克隆「${value.name}」→ ${value.chars} 字，原文留档 ${value.sample ? value.sample.chars : 0} 字` +
+            `已完成 AI 文风克隆「${value.name}」，提炼 ${value.ruleCount} 条规则，原文留档 ${value.sample ? value.sample.chars : 0} 字` +
               (value.active ? '，已设为当前文风' : '') +
-              (warns ? `（${warns} 条格式提醒，展开看看）` : '——缺的只有「视角与时态」，补一句就好'),
+              (value.questionCount ? `，有 ${value.questionCount} 项待校准` : '') +
+              (!value.questionCount ? '，本次未生成校准题' : '') +
+              (warnings.length ? `。 ${warnings.join(' ')}` : ''),
           )
         } catch (failure) {
-          setNotice(`克隆失败：${failure instanceof Error ? failure.message : String(failure)}`)
+          const message = failure instanceof TypeError
+            ? '宿主连接中断，请先在文风列表确认本次是否已生成'
+            : failure instanceof Error ? failure.message : String(failure)
+          setNotice(`克隆失败：${message}`)
         } finally {
           setCloning(false)
         }
       }
 
-      // 删除：点第一次变成「再点一次确认删」，3 秒内不点就复原（和版本页一个手感）。
-      const remove = async name => {
-        if (confirmDelete !== name) {
-          setConfirmDelete(name)
-          window.setTimeout(() => {
-            setConfirmDelete(current => (current === name ? '' : current))
-          }, 3000)
+      const remove = async () => {
+        if (!deleteTarget || deleting) return
+        const { name, session } = deleteTarget
+        deleteDialog.current?.close()
+        if (session !== currentSessionId) {
+          setNotice('删除失败：会话已切换，请重新选择文风卡')
           return
         }
-        setConfirmDelete('')
+        setDeleting(name)
         setNotice(null)
         try {
           const value = await postJson(`${API}/style-delete`, { name })
+          if (session !== currentSessionId) return
           await reload()
-          if (open === name) {
-            setOpen(null)
-            setEditing(null)
-            setSample(null)
-          }
+          if (session !== currentSessionId) return
+          setOpen(current => current === name ? null : current)
+          setEditing(current => current?.name === name ? null : current)
+          setSample(current => current?.name === name ? null : current)
           setNotice(
             `已删除「${name}」：${(value.removed || []).length} 个文件挪进了 styles/.trash/` +
               (value.wasActive ? '；这本书现在是「没有启用文风」状态' : ''),
           )
         } catch (failure) {
-          setNotice(`删除失败：${failure instanceof Error ? failure.message : String(failure)}`)
+          if (session === currentSessionId) setNotice(`删除失败：${failure instanceof Error ? failure.message : String(failure)}`)
+        } finally {
+          setDeleting('')
         }
       }
 
@@ -3100,7 +3351,7 @@ function StylesPane() {
           'div',
           { className: 'nvl-empty' },
           '还没有文风卡。',
-          h('div', null, '跟助手说「照这本书的写法给我做一套文风：D:\\books\\某某.txt」，它会读样本、算句长和对话比例、抄几段原文，写成一张卡。'),
+          h('div', null, '选择原文文件后，点击「克隆文风」由当前会话模型分析样本并生成文风卡。'),
         )
       } else {
         body = items.map(item => {
@@ -3110,24 +3361,47 @@ function StylesPane() {
             'div',
             { className: 'nvl-style-sec', key: item.name },
             h(
-              'button',
-              { type: 'button', className: 'nvl-style-head', 'data-open': expanded ? 'true' : 'false', onClick: () => void toggle(item.name) },
-              h('span', { className: 'nvl-style-name' }, item.name),
-              item.active ? h('span', { className: 'nvl-style-on' }, '在用') : null,
-              item.sampleChars ? h('span', { className: 'nvl-style-chip' }, `原文 ${item.sampleChars} 字`) : null,
-              h('span', { className: 'nvl-style-chars' }, `${item.chars} 字`),
+              'div',
+              { className: 'nvl-style-row' },
+              h(
+                'button',
+                { type: 'button', className: 'nvl-style-head', 'aria-expanded': expanded, 'data-open': expanded ? 'true' : 'false', onClick: () => void toggle(item.name) },
+                h('span', { className: 'nvl-style-name', title: item.name }, item.name),
+                item.active ? h('span', { className: 'nvl-style-on' }, '在用') : null,
+                item.sampleChars ? h('span', { className: 'nvl-style-chip' }, `原文 ${item.sampleChars} 字`) : null,
+                h('span', { className: 'nvl-style-chars' }, `${item.chars} 字`),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button', className: 'nvl-ghost', 'aria-label': `删除文风 ${item.name}`,
+                  disabled: Boolean(deleting) || cloning || (saving && isEditing),
+                  onClick: () => setDeleteTarget({ name: item.name, active: item.active, session: currentSessionId }),
+                },
+                deleting === item.name ? '删除中…' : '删除',
+              ),
             ),
             item.summary ? h('div', { className: 'nvl-style-sum' }, item.summary) : null,
             expanded
               ? h(
                   'div',
                   { className: 'nvl-style-body' },
+                  !isEditing && detail.name === item.name && detail.questions?.length && calibrationTarget !== item.name
+                    ? h(StyleCalibration, { key: detail.baseHash, detail, onSaved: saveCalibration })
+                    : null,
+                  !isEditing && detail.name === item.name && item.sampleChars && !detail.questions?.length &&
+                  /^## (?:AI 提炼的文风规则|作者校准规则|已确认的文风规则)[ \t]*$/mu.test(detail.content)
+                    ? h('button', { type: 'button', className: 'nvl-ghost', disabled: preparingCalibration, onClick: () => void prepareCalibration() },
+                        preparingCalibration ? '生成校准题中…' : '生成校准题')
+                    : null,
+                  !isEditing && detail.name === item.name && chapters.length
+                    ? h(StyleTrial, { key: detail.baseHash, detail, chapters }) : null,
                   isEditing
                     ? h('textarea', {
                         className: 'nvl-editor nvl-style-editor',
                         value: editing.text,
                         spellCheck: false,
-                        onChange: event => setEditing({ name: editing.name, text: event.target.value }),
+                        onChange: event => setEditing({ ...editing, text: event.target.value }),
                       })
                     : detail.status === 'loading'
                       ? h('div', { className: 'nvl-empty' }, '读取中…')
@@ -3160,7 +3434,7 @@ function StylesPane() {
                       : [
                           h(
                             'button',
-                            { type: 'button', className: 'nvl-ghost', onClick: () => setEditing({ name: item.name, text: detail.content }), key: 'edit' },
+                            { type: 'button', className: 'nvl-ghost', disabled: detail.status !== 'ready', onClick: () => setEditing({ name: item.name, text: detail.content, baseHash: detail.baseHash }), key: 'edit' },
                             '编辑',
                           ),
                           item.sampleChars
@@ -3170,16 +3444,6 @@ function StylesPane() {
                                 sample && sample.name === item.name ? '收起原文' : '看原文',
                               )
                             : null,
-                          h(
-                            'button',
-                            {
-                              type: 'button',
-                              className: confirmDelete === item.name ? 'nvl-danger' : 'nvl-ghost',
-                              onClick: () => void remove(item.name),
-                              key: 'delete',
-                            },
-                            confirmDelete === item.name ? '再点一次确认删' : '删除',
-                          ),
                         ].filter(Boolean),
                   ),
                 )
@@ -3204,14 +3468,21 @@ function StylesPane() {
             { className: 'nvl-style-new' },
             h('input', {
               className: 'nvl-input',
-              value: draftSource,
-              placeholder: '原文路径，例如 D:\\books\\某本.txt（名字留空就用文件名）',
-              onChange: event => setDraftSource(event.target.value),
+              type: 'file',
+              accept: '.txt,.md,.markdown,text/plain,text/markdown',
+              'aria-label': '选择文风参考原文',
+              title: '选择 TXT 或 Markdown 文件，最大 32 MB',
+              ref: fileInput,
+              disabled: cloning,
+              onChange: event => {
+                setDraftFile(event.target.files?.[0] ?? null)
+                setNotice(null)
+              },
             }),
             h(
               'button',
-              { type: 'button', className: 'nvl-primary', disabled: !draftSource.trim() || cloning, onClick: () => void cloneFromSource() },
-              cloning ? '克隆中…' : '克隆文风',
+              { type: 'button', className: 'nvl-primary', disabled: !draftFile || cloning, onClick: () => void cloneFromFile() },
+              cloning ? 'AI 提炼中…' : '克隆文风',
             ),
           ),
           h(
@@ -3220,20 +3491,51 @@ function StylesPane() {
             h('input', {
               className: 'nvl-input',
               value: draftName,
-              placeholder: '新文风的名字，例如「湖城夜行」',
+              placeholder: '文风名称（留空使用文件名）',
+              disabled: cloning,
               onChange: event => setDraftName(event.target.value),
             }),
-            h('button', { type: 'button', className: 'nvl-ghost', disabled: !draftName.trim(), onClick: () => void create() }, '新建空卡'),
+            h('button', { type: 'button', className: 'nvl-ghost', disabled: !draftName.trim() || cloning, onClick: () => void create() }, '新建空卡'),
           ),
           notice ? h('div', { className: 'nvl-hint', 'data-tone': notice.includes('失败') ? 'err' : 'ok' }, notice) : null,
         ),
         h(AskBar, {
           head: '文风讨论',
-          book: (novel.data && novel.data.book && novel.data.book.title) || '',
+          book,
           context,
-          fallback: '这套文风哪里不像？给我三条能立刻改的具体做法。',
-          placeholder: '想问我什么？比如「对话是不是太书面了」',
+          fallback: '请读取正在看的文风卡，未展开时读取当前在用的卡，指出最值得校准的写法和需要回看的原文证据。',
+          placeholder: '例如「这次试写的旁白太贴近人物了」',
         }),
+        h(
+          'dialog',
+          {
+            ref: calibrationDialog, className: 'nvl-style-dialog nvl-style-calibration-dialog',
+            'aria-labelledby': calibrationTitleId, onClose: () => setCalibrationTarget(''),
+          },
+          h('h2', { id: calibrationTitleId }, `校准「${calibrationTarget}」`),
+          calibrationTarget && detail.name === calibrationTarget && detail.questions?.length
+            ? h(StyleCalibration, { key: detail.baseHash, detail, onSaved: value => {
+                saveCalibration(value)
+                calibrationDialog.current?.close()
+              } })
+            : null,
+          h('button', { type: 'button', className: 'nvl-ghost', onClick: () => calibrationDialog.current?.close() }, '稍后校准'),
+        ),
+        h(
+          'dialog',
+          {
+            ref: deleteDialog, className: 'nvl-style-dialog', 'aria-labelledby': dialogTitleId,
+            'aria-describedby': `${dialogTitleId}-description`, onClose: () => setDeleteTarget(null),
+          },
+          h('h2', { id: dialogTitleId }, '删除文风'),
+          h('p', { id: `${dialogTitleId}-description` }, `确定删除「${deleteTarget?.name ?? ''}」吗？文风卡和已留档的参考原文将移入回收站。${deleteTarget?.active ? '这套文风也将停止使用。' : ''}`),
+          h(
+            'div',
+            { className: 'nvl-style-actions' },
+            h('button', { type: 'button', className: 'nvl-ghost', autoFocus: true, onClick: () => deleteDialog.current?.close() }, '取消'),
+            h('button', { type: 'button', className: 'nvl-danger', disabled: !deleteTarget || Boolean(deleting), onClick: () => void remove() }, '确认删除'),
+          ),
+        ),
       )
     }
 
