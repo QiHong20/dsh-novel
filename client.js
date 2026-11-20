@@ -350,6 +350,7 @@ window.__ModuleLoader__.load({
 .nvl-beats-foot { flex-wrap: wrap; }
 .nvl-beat-sec { overflow-wrap: anywhere; }
 .nvl-outline { flex: 1; min-height: 0; padding: 4px 12px 12px; overflow: auto; }
+.nvl-context-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }
 .nvl-outline-sec { padding: 8px 0; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
 .nvl-outline-sec:last-child { border-bottom: 0; }
 .nvl-outline-title { font-weight: 600; margin-bottom: 4px; }
@@ -605,7 +606,10 @@ window.__ModuleLoader__.load({
       // 这里以前漏了 apiPath：列表走 useJson 带了 session，详情走 getJson 没带，
       // 于是同一个进程里「列表能看、点进去 404」。所有读请求统一补上会话参数。
       const response = await fetch(apiPath(url), { headers: { accept: 'application/json' } })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null)
+        throw new Error(typeof failure?.error === 'string' ? failure.error : `HTTP ${response.status}`)
+      }
       return response.json()
     }
 
@@ -2165,6 +2169,7 @@ window.__ModuleLoader__.load({
       else if (route.tab === 'scene') {
         const scene = scenes.find(s => s.id === route.scene)
         body = scene ? h('div', null, h('h3', null, scene.title), showFields(scene.fields),
+          button('本场 AI 装配包', () => onNavigate({ chapter: route.chapter, tab: 'context', scene: scene.id })),
           ...scene.cast.map(id => button(names[id] || id, () => onNavigate({ ...route, tab: 'person', person: id }))),
           h(BeatFieldEditor, { chapter: route.chapter, scene: scene.id, values: scene.fields, names: fields.scene, baseHash: data.baseHash, onSaved: saved, onClose: onBack })) : h('p', null, '场景已删除，请返回刷新。')
       } else if (route.tab === 'chapter') body = h(BeatFieldEditor, { chapter: route.chapter, values: section?.overview?.fields || {}, names: fields.chapter, baseHash: sectionHash, onSaved: saved, onClose: onBack })
@@ -2172,6 +2177,96 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'nvl-pane' },
         h('div', { className: 'nvl-head' }, button('← 返回', onBack), h('span', null, `${route.chapter} / ${{ people: '本章人物', person: '人物详情', scene: '场景', events: '本章事件', allEvents: '全书事件线', review: '待核对', chapter: '章节目标', raw: '原始章纲' }[route.tab]}`)),
         h('div', { className: 'nvl-outline' }, body, h('p', { role: 'status' }, notice)))
+    }
+
+    function BeatContext({ route, chapter, scenes, onBack }) {
+      const [mode, setMode] = useState('continue')
+      const [scene, setScene] = useState(route.scene ?? '')
+      const [budget, setBudget] = useState(0)
+      const [session, setSession] = useState(currentSessionId)
+      const [refresh, setRefresh] = useState(0)
+      const [state, setState] = useState(null)
+      const [notice, setNotice] = useState(null)
+      const params = new URLSearchParams({ chapter: route.chapter, mode })
+      if (mode === 'continue' && scene) params.set('scene', scene)
+      if (budget) params.set('budget', budget)
+      const url = `${API}/context?${params}`
+      const key = JSON.stringify([session, url, refresh])
+      useEffect(() => {
+        const onSession = () => setSession(currentSessionId)
+        window.addEventListener('nvl-session', onSession)
+        return () => window.removeEventListener('nvl-session', onSession)
+      }, [])
+      useEffect(() => {
+        let current = true
+        getJson(url).then(value => {
+          if (current && session === currentSessionId) setState({ key, value })
+        }).catch(error => {
+          if (current && session === currentSessionId) setState({ key, error: error instanceof Error ? error.message : String(error) })
+        })
+        return () => { current = false }
+      }, [url, key, session])
+      const current = state?.key === key ? state : null
+      const value = current?.value
+      const ready = Boolean(value?.ready && value.text)
+      const report = (text, ok = true) => setNotice({ key, text, ok })
+      const copy = async () => {
+        if (!ready || session !== currentSessionId) return
+        try {
+          await navigator.clipboard.writeText(value.text)
+          report('已复制完整装配包')
+        } catch {
+          report('复制失败，可在预览中手动选中文字', false)
+        }
+      }
+      const send = async () => {
+        if (!ready || session !== currentSessionId) return
+        const task = mode === 'rewrite' ? '请按上面的装配包改写本章，先在对话中展示改写稿。'
+          : value.scene ? '请按上面的装配包只写选定场景，先在对话中展示正文。'
+            : '请按上面的装配包写本章正文，先在对话中展示。'
+        const how = await sendToComposer(`${value.text}\n\n${task}`)
+        if (how === 'composer') report('已放入主对话输入框，按回车发送')
+        else if (how === 'copied') report('装配包和写作任务已复制，可粘贴到主对话')
+        else report('无法写入输入框或复制，可在预览中手动选中文字', false)
+      }
+      const changeScope = setter => event => {
+        setBudget(0)
+        setter(event.target.value)
+      }
+      return h('div', { className: 'nvl-pane' },
+        h('div', { className: 'nvl-head' },
+          h('button', { type: 'button', className: 'nvl-ask-btn', onClick: onBack }, '← 返回'),
+          h('span', { className: 'nvl-title' }, 'AI 装配包'),
+          h('span', { className: 'nvl-meta' }, chapter?.title || route.chapter),
+        ),
+        h('div', { className: 'nvl-outline' },
+          h('div', { className: 'nvl-beats-foot' },
+            h('select', { className: 'nvl-select', value: mode, 'aria-label': '装配模式', onChange: changeScope(setMode) },
+              h('option', { value: 'continue' }, '续写'),
+              h('option', { value: 'rewrite', disabled: !chapter?.chars }, '整章改写'),
+            ),
+            mode === 'continue' && (scenes.length || scene) ? h('select', { className: 'nvl-select', value: scene, 'aria-label': '装配范围', onChange: changeScope(setScene) },
+              h('option', { value: '' }, '整章'),
+              scene && !scenes.some(item => item.id === scene) ? h('option', { value: scene, disabled: true }, '所选场景已变化') : null,
+              ...scenes.map(item => h('option', { key: item.id, value: item.id }, item.title)),
+            ) : null,
+            h('button', { type: 'button', className: 'nvl-ghost', disabled: !current, onClick: () => setRefresh(count => count + 1) }, '重新装配'),
+          ),
+          !current ? h('p', { role: 'status' }, '正在装配…') : null,
+          current?.error ? h('p', { role: 'alert', className: 'nvl-err' }, `装配失败：${current.error}`) : null,
+          value ? h('div', null,
+            ready ? h('div', { className: 'nvl-beats-foot' },
+              h('button', { type: 'button', className: 'nvl-primary', onClick: () => void send() }, '放入主对话'),
+              h('button', { type: 'button', className: 'nvl-ghost', onClick: () => void copy() }, '复制装配包'),
+              h('span', { className: 'nvl-meta' }, `${value.chars}/${value.budget} 字符${value.style ? ` · 文风：${value.style}` : ''}`),
+            ) : value.minimumBudget <= 200000 && budget < 200000
+                ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(200000) }, '提高预算后重试')
+                : null,
+            notice?.key === key ? h('p', { role: 'status', className: 'nvl-hint', 'data-tone': notice.ok ? 'ok' : 'err' }, notice.text) : null,
+            h('pre', { className: 'nvl-context-preview' }, value.text),
+          ) : null,
+        ),
+      )
     }
 
     function BeatsPane() {
@@ -2220,9 +2315,10 @@ window.__ModuleLoader__.load({
                   button(`表现核对 ${overview?.reviewCount || 0}`, { chapter: chapter.id, tab: 'review' }),
                   button('章节目标', { chapter: chapter.id, tab: section ? 'chapter' : 'raw' }),
                   button('原始章纲', { chapter: chapter.id, tab: 'raw' }),
-                  h('a', { className: 'nvl-ask-btn', href: apiPath(`${API}/context?chapter=${encodeURIComponent(chapter.id)}&format=text`), target: '_blank', rel: 'noreferrer' }, 'AI 装配包')))
+                  button('AI 装配包', { chapter: chapter.id, tab: 'context' })))
             }))),
-        route ? h(BeatDetail, { key: JSON.stringify(route), route, section: sections[route.chapter], sectionHash: board?.baseHash, fields, onNavigate: open, onBack: back, onReload: reload }) : null,
+        route?.tab === 'context' ? h(BeatContext, { key: JSON.stringify(route), route, chapter: novel?.chapters?.find(item => item.id === route.chapter), scenes: sections[route.chapter]?.overview?.scenes ?? [], onBack: back })
+          : route ? h(BeatDetail, { key: JSON.stringify(route), route, section: sections[route.chapter], sectionHash: board?.baseHash, fields, onNavigate: open, onBack: back, onReload: reload }) : null,
         !route ? h(AskBar, { head: '章纲讨论', book: novel?.book?.title || '', context: clipText((board?.sections || []).map(s => `${s.heading}\n${(s.overview?.scenes || []).map(scene => scene.summary).join('\n')}`).join('\n\n'), 1400), fallback: '请检查章纲的剧情推进与人物动机，需要时读取人物和事件详情。', placeholder: '想讨论哪一章？', hint: '带上剧情骨架发到主对话' }) : null)
     }
 

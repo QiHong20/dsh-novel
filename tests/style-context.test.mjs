@@ -3,6 +3,7 @@ import { Readable } from 'node:stream'
 import vm from 'node:vm'
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { styleAnchorText } from '../lib/text.js'
 
 // 测试纯装配函数，无需启动 DSH 或改变生产模块导出。
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
@@ -94,6 +95,31 @@ test('场景上下文保留核心规则、通用锚点和匹配锚点，说明�
   assert.ok(assemble(content, 1000).text.includes('她扑向门口。'))
 })
 
+test('多场章纲优先装配每种场景各一段锚点', () => {
+  const content = '# 文风卡：测试\n## 叙述主声\n- 旁白跟随人物判断。\n## 锚点原文\n'
+    + '### 锚点 1【对白】\n> “等等。”\n### 锚点 2【对白】\n> “再说一遍。”\n'
+    + '### 锚点 3【动作】\n> 他扑向门口。\n### 锚点 4【心理】\n> 她重新思量了片刻。'
+  const result = assemble(content, 2000, ['对白', '动作', '心理'])
+  assert.ok(result.text.includes('旁白跟随人物判断'))
+  assert.ok(!result.text.includes('再说一遍'))
+  assert.equal(result.included.filter(item => item.kind).map(item => item.kind).join('、'), '对白、动作、心理')
+})
+
+test('审稿不能用文风规则条款替代锚点原文证据', async () => {
+  const start = source.indexOf('async function reviewSourceCoverage')
+  const end = source.indexOf('async function readReviewSource', start)
+  const coverage = vm.runInNewContext(`${source.slice(start, end)}; reviewSourceCoverage`, {
+    listCharacters: async () => [], listSettings: async () => [],
+    activeStyleName: () => '测试', readStyle: async () => card, styleAnchorText,
+  })
+  const checks = { rhythm: { verdict: 'supported', evidence: [{ source: 'style', name: '测试', quote: '第三条：避免解释台词' }] } }
+  const missing = await coverage('/book', {}, '正文', checks)
+  assert.equal(missing.findings[0].verdict, 'uncertain')
+  assert.match(missing.findings[0].detail, /锚点原文/u)
+  checks.rhythm.evidence[0].quote = '他站起来，推开门。'
+  assert.equal((await coverage('/book', {}, '正文', checks)).findings.length, 0)
+})
+
 test('AI 规则核验原文行号，追加去重并进入写作上下文', () => {
   const raw = '“你去过？”\r\n他等了一会。\r\n“先说你是怎么知道的。”'
   const candidate = {
@@ -150,6 +176,7 @@ test('模型只选择已展示的行号，插件给规则和校准题回填原�
       const evidence = calls.length === 1 ? [1, 3] : [2, 4]
       const text = JSON.stringify({
         rules: [{ scope: '对白', ...preference, evidence, contrast: [5] }],
+        narrative: [{ facet: '旁白声调', pattern: '让叙述紧贴听见和看见的反应。', evidence: [2, 4] }],
         questions: [{ ...modelQuestion, evidence: [2, 4] }, { ...modelQuestion, evidence: [2] }],
       })
       yield { type: 'block-end', block: { type: 'text', text } }
@@ -157,13 +184,15 @@ test('模型只选择已展示的行号，插件给规则和校准题回填原�
     },
   }
   const agent = { session: { id: 'test-session' }, model: { current: () => ({ provider: 'test-provider', model: 'test-model' }) } }
-  const { rules, questions } = await generate(llm, agent, excerpts, raw)
+  const { rules, narrative, questions } = await generate(llm, agent, excerpts, raw)
   assert.equal(rules.length, 1)
   assert.match(rules[0].rule, /当双方在试探筹码时.*读者缺少理解动作的前提时可以调整/u)
   assert.equal(rules[0].evidence[0].quote, '“先说你是怎么知道的。”')
   assert.equal(rules[0].evidence[1].startLine, 4)
   assert.equal(rules[0].evidence[1].quote, '她没接话。')
   assert.equal(rules[0].contrast[0].quote, '他把前因一口气交代了。')
+  assert.equal(narrative[0].facet, '旁白声调')
+  assert.equal(narrative[0].evidence[1].startLine, 4)
   assert.equal(questions.length, 1)
   assert.equal(questions[0].scenario, modelQuestion.scenario)
   assert.equal(questions[0].evidence[1].quote, '她没接话。')

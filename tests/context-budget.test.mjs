@@ -3,11 +3,15 @@ import vm from 'node:vm'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { parseBeatInfos, parseBeatInteriors, parseBeatCognition } from '../lib/beats.js'
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
 const start = source.indexOf('function assembleNovelContext(')
 const end = source.indexOf('/** 禁忌分为', start)
-const { assemble, select, edit } = vm.runInNewContext(`${source.slice(start, end)}; ({assemble:assembleNovelContext,select:rewriteSelection,edit:applyChapterEdit})`, { createHash })
+const { assemble, select, edit, contextArgs, beatScope } = vm.runInNewContext(
+  `${source.slice(start, end)}; ({assemble:assembleNovelContext,select:rewriteSelection,edit:applyChapterEdit,contextArgs:contextRequestArgs,beatScope:contextBeatScope})`,
+  { createHash, parseBeatInfos, parseBeatInteriors, parseBeatCognition },
+)
 const fixture = text => {
   const selected = select(text)
   return { mode: 'rewrite', chapter: { id: '0001', title: '测试', target: 3000 }, chapterText: selected.text, rewriteScope: selected.scope,
@@ -26,6 +30,42 @@ test('长章完整输入，预算不足时不返回可覆盖的残缺正文', ()
   assert.equal(blocked.chapterText, '')
   assert.ok(blocked.prompt.includes('rewriteStart'))
   assert.ok(blocked.budgetUsed <= 6000)
+})
+
+test('预览请求传递场景、模式和局部范围，默认预算仍由工具决定', () => {
+  const defaults = contextArgs(new URLSearchParams({ chapter: '0001' }))
+  assert.equal(defaults.mode, 'continue')
+  assert.equal(defaults.budget, undefined)
+  const scoped = contextArgs(new URLSearchParams('chapter=0001&scene=proof&mode=rewrite&rewriteStart=0&rewriteLimit=200&pass=deai'))
+  assert.equal(scoped.scene, 'proof')
+  assert.equal(scoped.mode, 'rewrite')
+  assert.equal(scoped.rewriteStart, 0)
+  assert.equal(scoped.rewriteLimit, 200)
+  assert.equal(scoped.pass, 'deai')
+  assert.throws(() => contextArgs(new URLSearchParams('chapter=0001&budget=')), /整数/u)
+})
+
+test('第一章后续场景只显示本场装配，跳过开篇纪律', () => {
+  const value = { ...fixture(''), mode: 'continue', scene: { id: 'proof', title: '当众验炉', opening: false } }
+  value.beats = { text: '核对炉壁砂眼。', interiors: [{ text: '对方在等他出错。' }] }
+  const result = assemble(value, 8000)
+  assert.equal(result.ready, true)
+  assert.match(result.prompt, /当众验炉/u)
+  assert.match(result.prompt, /本次只处理选定场景/u)
+  assert.match(result.prompt, /对方在等他出错/u)
+  assert.ok(!result.prompt.includes('第一章开篇纪律'))
+})
+
+test('分场装配保留章级认知，按选中场景提取心理和信息', () => {
+  const first = '### 场景 start：开场\n- 心理：陌生人的来意不明。'
+  const second = '### 场景 proof：验炉\n- 信息：炉壁有砂眼。\n- 心理：掌柜在等他出错。'
+  const body = `- 认知：陆昭不公开自己的来历。\n\n${first}\n\n${second}`
+  const result = beatScope({ body }, { title: '验炉', raw: second })
+  assert.equal(result.heading, '验炉')
+  assert.equal(result.cognition[0].text, '陆昭不公开自己的来历。')
+  assert.equal(result.interiors[0].text, '掌柜在等他出错。')
+  assert.equal(result.infos[0].text, '炉壁有砂眼。')
+  assert.ok(!result.text.includes('陌生人的来意'))
 })
 
 test('总预算含标题和指令，完整省略可选材料', () => {

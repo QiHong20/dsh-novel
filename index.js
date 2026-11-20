@@ -307,13 +307,14 @@ async function cloneStyle(root, options, extractRules) {
   const name = safeStyleName(String(options.name ?? '').trim() || (fileName ? path.basename(fileName, path.extname(fileName)) : '克隆文风'))
   const previous = await readStyle(root, name)
   const voice = detectVoice(raw)
-  const { rules, questions, warnings = [] } = await extractRules(excerpts, raw)
+  const { rules, narrative = [], questions, warnings = [] } = await extractRules(excerpts, raw)
   const draft = composeStyleCard({
     title: name,
     sourceLabel: `${label}（${countChars(raw)} 字样本，自动克隆）`,
     stats,
     excerpts,
     voice,
+    narrative,
   })
   const { content, added: ruleCount } = appendStyleRules(draft, rules)
   const card = withStyleCalibration(content, questions)
@@ -429,8 +430,8 @@ const STYLE_EXCERPTS = 5
 const STYLE_EXCERPT_CHARS = 480
 
 const STYLE_SCENE_CUES = [
-  { kind: '对白', pattern: /对话|对白|交谈|谈判|交涉|争辩|质问|反问|问道|追问|[「『“"]/gu },
-  { kind: '动作', pattern: /动作|打斗|战斗|交手|格斗|追逐|搏斗|冲向|扑向|挥刀|闪避|撞开/gu },
+  { kind: '对白', pattern: /对话|对白|交谈|谈判|交涉|争辩|争执|质问|对质|追责|反问|问道|追问|还价|压价|认账|赔偿|[「『“"]/gu },
+  { kind: '动作', pattern: /动作|打斗|战斗|交手|格斗|追逐|搏斗|冲向|扑向|挥刀|闪避|撞开|爆裂|炸炉|抢救|当众检验|当众验/gu },
   { kind: '心理', pattern: /心理|内心|独白|回忆|想起|心想|意识到|犹豫|暗想|盘算/gu },
   { kind: '过场', pattern: /过场|转场|次日|翌日|第二天|片刻后|数日后|不久后|几天后|数年后|转眼间/gu },
 ]
@@ -469,7 +470,7 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
         ? chunk.replace(/^  (?:对照)?原文第 \d+–\d+ 行：.*$/gmu, '').trim()
         : chunk
       const priority = /\[必选\]/u.test(ruleText) || /核心|视角|叙述权限|格式|面板|模板|专有/u.test(heading) ? 0
-        : /锚点|已确认的文风规则|作者校准规则/u.test(heading) ? 1
+        : /锚点|已确认的文风规则|作者校准规则|叙述主声/u.test(heading) ? 1
         : heading === 'AI 提炼的文风规则' ? 2
         : /禁忌/u.test(heading) ? 2
         : /统计观察|待校准/u.test(heading) ? 6
@@ -478,10 +479,14 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
       add(`${heading} · ${i + 1}`, i === 0 ? `## ${heading}\n${ruleText}` : ruleText, priority)
     })
   }
-  const relevant = sceneKinds.flatMap(kind => candidates.filter(item => item.kind === kind)).slice(0, 2)
+  const relevant = sceneKinds.length === 1
+    ? candidates.filter(item => item.kind === sceneKinds[0]).slice(0, 2)
+    : sceneKinds.map(kind => candidates.find(item => item.kind === kind)).filter(Boolean)
   const general = candidates.find(item => item.kind === '通用')
   const selected = new Set(general ? [general, ...relevant] : relevant)
-  candidates.sort((a, b) => a.priority - b.priority || Number(Boolean(a.kind)) - Number(Boolean(b.kind)) || Number(selected.has(b)) - Number(selected.has(a)))
+  const anchorOrder = new Map([...selected].map((item, index) => [item, index]))
+  candidates.sort((a, b) => a.priority - b.priority || Number(Boolean(a.kind)) - Number(Boolean(b.kind)) ||
+    (anchorOrder.get(a) ?? candidates.length) - (anchorOrder.get(b) ?? candidates.length))
   const included = []
   const omitted = []
   const parts = []
@@ -489,7 +494,7 @@ function assembleStylePrompt(text, maxChars, sceneKinds = []) {
   const budget = Math.max(0, Math.floor(Number(maxChars) || 0))
   for (const item of candidates) {
     const next = [...parts, item.text].join('\n\n')
-    const entry = { id: item.id, label: item.label, priority: item.priority, chars: length(item.text) }
+    const entry = { id: item.id, label: item.label, priority: item.priority, chars: length(item.text), ...(item.kind ? { kind: item.kind } : {}) }
     if (relevant.length && item.kind && !selected.has(item)) {
       omitted.push({ ...entry, reason: '优先使用通用锚点和匹配当前场景的锚点' })
     } else if (length(next) <= budget) {
@@ -522,6 +527,7 @@ async function generateStyleRules(llm, agent, excerpts, raw, parentSignal) {
     '从视角、叙述距离、节奏、对白和旁白归纳可迁移的偏好。每条都说明什么叙事任务适用、倾向怎么写、何时不适用。把当前场景的具体内容留在原作，不移用道具、人名、固定措辞、动作、配额或场景顺序。',
     '只输出 JSON 对象，结构为 {"rules":[{"scope":"对白","when":"适用场景","prefer":"表达偏好","unless":"不适用情形","evidence":[17,19],"contrast":[85]}],"questions":[{"scope":"对白","question":"明确的取舍","scenario":"固定人物、事实和叙事任务","evidence":[17,85],"options":[{"label":"偏好名称","effect":"影响和代价","when":"适用情形","prefer":"表达偏好","unless":"例外条件","example":"原创试写正文"}]}]}。',
     'rules 为 1–8 项。questions 为 0–3 项。只有不同片段支持不同方向，并且在同一叙事任务中仍需要作者确定长期偏好，才出题。能由场景目的、读者已知信息、人物处境或时间压力判断的选项，由写作时判断，questions 留空。禁问开场先景后人、解释用长用短、回忆要不要插入这类脱离具体取舍的问题。',
+    'JSON 另带 narrative 数组，最多三项，格式为 [{"facet":"旁白声调","pattern":"它如何写出这种读感","evidence":[17,85]}]。facet 用旁白声调、句段起伏、反应与信息揭示之一。每项由不同章段或区间的原文共同支持。说明叙述者如何组织、强调和评价信息，交代哪些地方铺开、哪些地方落短；选反映该项的叙述片段，不能仅凭几句台词归纳。缺证据时省略。',
     '每题给两个选项和各自约 40–100 字的原创试写。两版使用相同人物、事件结果、读者已知信息和叙述视角，只变化被比较的表达习惯。例文只写正文。界面提供「由场景决定」，不把它当模型选项。',
     'scope 只能是通用、对白、动作、心理或过场。when、prefer、unless 写简短单行短句。evidence 只填已展示的 1–3 个不同整数行号。通用偏好和校准题须引用不同章段或原文区间。',
     '提炼前找同类任务里的反例或不同做法，contrast 仅填未被本条支持证据使用的章段或区间里的行号，并在 unless 解释差异。如果没有合适的反例，contrast 可以为空，此时只提出证据支持的场景偏好。通用偏好必须带反例。若一个写法只出现在一组对话或某人身上，保留局部适用条件。',
@@ -530,6 +536,7 @@ async function generateStyleRules(llm, agent, excerpts, raw, parentSignal) {
   const sourceLines = raw.split(/\r\n?|\n/u)
   const acceptedRules = new Map()
   const acceptedQuestions = new Map()
+  const acceptedNarrative = new Map()
   let omittedContrasts = 0
   let feedback = ''
   const result = async warnings => {
@@ -544,7 +551,7 @@ async function generateStyleRules(llm, agent, excerpts, raw, parentSignal) {
       }
     }
     return {
-      rules, questions: questions.map((item, index) => ({ ...item, id: index + 1 })),
+      rules, narrative: [...acceptedNarrative.values()], questions: questions.map((item, index) => ({ ...item, id: index + 1 })),
       warnings: [...warnings, ...(omittedContrasts ? [`${omittedContrasts} 条场景偏好的反例未通过核对，已保留有效的场景证据。`] : [])],
     }
   }
@@ -564,7 +571,7 @@ async function generateStyleRules(llm, agent, excerpts, raw, parentSignal) {
     const rejected = []
     try {
       const fenced = output.trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/iu)
-      const { rules, questions } = JSON.parse(fenced?.[1] ?? output)
+      const { rules, narrative, questions } = JSON.parse(fenced?.[1] ?? output)
       if (!Array.isArray(rules) || !rules.length || rules.length > 8) throw new Error('规则须为 1–8 项的 JSON 数组')
       for (const [index, item] of rules.entries()) {
         if (acceptedRules.size >= 8) break
@@ -594,6 +601,18 @@ async function generateStyleRules(llm, agent, excerpts, raw, parentSignal) {
       }
       const calibration = validateStyleQuestions(questions, resolveEvidence)
       for (const item of calibration) acceptedQuestions.set(item.question, item)
+      if (Array.isArray(narrative)) {
+        for (const item of narrative.slice(0, 3)) {
+          try {
+            if (!['旁白声调', '句段起伏', '反应与信息揭示'].includes(item?.facet)) continue
+            const evidence = resolveEvidence(item.evidence, true)
+            if (new Set(evidence.map(proof => proof.quote)).size < 2) continue
+            acceptedNarrative.set(item.facet, { facet: item.facet, pattern: calibrationText(item.pattern, 150), evidence })
+          } catch {
+            // 主声缺证据时省略，保留已经通过的场景偏好。
+          }
+        }
+      }
     } catch (error) {
       rejected.push(error instanceof Error ? error.message : String(error))
     }
@@ -738,7 +757,7 @@ async function generateStyleTrial(root, llm, agent, payload, signal) {
   return { scene: scene.title, variants: Math.random() < 0.5 ? variants.reverse() : variants }
 }
 
-function composeStyleCard({ title, sourceLabel, stats, excerpts, voice }) {
+function composeStyleCard({ title, sourceLabel, stats, excerpts, voice, narrative = [] }) {
   const lines = []
   lines.push(`# 文风卡：${title}`)
   lines.push(`- 来源：${sourceLabel}`)
@@ -749,6 +768,13 @@ function composeStyleCard({ title, sourceLabel, stats, excerpts, voice }) {
   lines.push(`- 每千字标点：逗号 ${stats.per1000.comma} · 句号 ${stats.per1000.period} · 省略号 ${stats.per1000.ellipsis} · 破折号 ${stats.per1000.dash}`)
   if (voice) lines.push(`- 代词线索：${voice}`)
   if (stats.words.length) lines.push(`- 高频双字组合：${stats.words.slice(0, 12).map(item => item.word).join('、')}`)
+  if (narrative.length) {
+    lines.push('', '## 叙述主声')
+    for (const { facet, pattern, evidence } of narrative) {
+      lines.push(`- ${facet}：${pattern}`)
+      for (const { startLine, quote } of evidence) lines.push(`  原文第 ${startLine} 行：「${quote}」`)
+    }
+  }
   lines.push('')
   lines.push('## 待校准')
   lines.push('> 对照多段锚点提炼叙述视角、叙述距离、旁白分寸、用词句法、对白声口、描写和转场。每条候选规则附原文证据，依据不足时保留待确认。')
@@ -1232,20 +1258,21 @@ function assembleNovelContext(value, budget) {
   const size = text => Array.from(text).length
   const rewrite = value.mode === 'rewrite'
   const scope = value.rewriteScope
+  const scene = value.scene
   const voiceRule = '人物的临场反应与对话应贴合各自人物卡的性格、认知与说话习惯，避免千人一面。外貌锚点按现场需要自然呈现，不要求初登场一次用齐。'
   const instructions = rewrite
     ? scope.partial
       ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
       : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风与各角色声口。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。${voiceRule}`
     : `按章纲和文风写作；省略的资料不代表没有约束，必要时调用对应工具读取。${voiceRule} 场景和关键动作链应完整呈现；参考字数不限制正文长度，不因接近或超过目标而缩写、省略过程或提前收尾。是否分章按情节自然节点决定；确需顺延尚未开始的后续场景时，结构化章纲使用 novel_move_scene 整场移动，旧版逐行章纲可用 novel_write({ ..., carryOver: true })；不能把当前动作的前提与结果拆散。`
-  const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}\n参考篇幅 ${value.chapter.target} 字（允许超出，不因超出删减）。上下文预算 ${budget} Unicode 字符（仅限制本次装配包，含标题、空白和指令，不是 token，也不是正文字数上限）。\n${instructions}`
+  const head = `【${rewrite ? '改写' : '续写'}装配包】${value.chapter.id} ${value.chapter.title}${scene ? ` · ${scene.title}` : ''}\n参考篇幅 ${value.chapter.target} 字（整章参考，允许超出）。上下文预算 ${budget} Unicode 字符（仅限制本次装配包，含标题和指令）。\n${instructions}${scene ? '\n本次只处理选定场景，其他场景的出场、认知和事件不从本包推定。' : ''}`
   const blocks = []
   const add = (id, label, body, required = false) => {
     if (body) blocks.push({ id, label, text: `## ${label}\n${body}`, required })
   }
   if (value.materialPreflight) add('materialPreflight', '生成前资料预检（先核对再写）', renderMaterialPreflight(value.materialPreflight, true), true)
   if (rewrite) add('chapterText', scope.partial ? `本章片段 [${scope.start}, ${scope.end})，全章 ${scope.total} 字符` : '完整本章原文', value.chapterText, true)
-  if ((value.chapter.id === '0001' || !value.prevTail.text) && !(rewrite && scope.partial)) {
+  if ((!scene || scene.opening) && (value.chapter.id === '0001' || !value.prevTail.text) && !(rewrite && scope.partial)) {
     add(
       'openingRules',
       '第一章开篇纪律（黄金三百字）',
@@ -1272,9 +1299,12 @@ function assembleNovelContext(value, budget) {
   add('presentation', '本场人物表现：写前推演', value.presentation || '', true)
   add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
   if (value.style.text) {
-    add('style', `文风：${value.style.name}`, '按标签、适用条件和例外使用文风偏好。同一场景下作者的校准偏好优先于 AI 提炼偏好。根据当前叙事任务、角色意图和时间压力决定怎样写，避免每场重复同一套路。锚点用于参考表达。剧情、人物和设定以当前作品为准，勿移用样本的专有名词、事件和独特原句。统计观察供对照，待校准内容仅供提炼。\n\n' + value.style.text, true)
+    const sceneGuide = value.style.sceneGuide?.length ? '\n\n## 本章各场的文风锚点\n' + value.style.sceneGuide.join('\n') : ''
+    add('style', `文风：${value.style.name}`,
+      '按标签、适用条件和例外使用文风偏好。每场先从同类锚点找出旁白如何铺陈与收束、人物判断如何进入叙述、揭示前后如何组织反应，再把这些写法用到本作的人物和事实。对白的长短只是一项线索。保留样本有作用的长复句、叙述起伏和反应，按现场压力决定取舍。相同场景下作者校准偏好优先。遵守本作的章纲与叙述权限，勿移用参考作品的人名、事件和独特原句。\n\n' +
+      value.style.text + sceneGuide, true)
   }
-  if (value.rhythm && value.rhythm.present) add('rhythm', '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
+  if (value.rhythm && value.rhythm.present) add('rhythm', scene ? '本场节奏' : '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
   value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content, Boolean(value.presentation)))
   add('presentationExcerpts', '人物与情绪承接原文候选', value.presentationExcerpts || '')
   value.settings.forEach((item, i) => add(`setting-${i}`, `设定：${item.name}`, item.content))
@@ -1318,6 +1348,37 @@ function rewriteSelection(text, start, limit) {
   if (!Number.isInteger(length) || length < 1) throw new Error('rewriteLimit 必须是正整数')
   const end = partial ? Math.min(chars.length, from + length) : chars.length
   return { text: chars.slice(from, end).join(''), scope: { partial, start: from, end, total: chars.length, nextStart: end < chars.length ? end : null, baseHash: createHash('sha256').update(text).digest('hex') } }
+}
+
+function contextRequestArgs(params) {
+  const chapter = (params.get('chapter') ?? '').trim()
+  if (!chapter) throw new Error('请选择章节')
+  const args = { chapter, mode: params.get('mode') === 'rewrite' ? 'rewrite' : 'continue' }
+  const scene = params.get('scene')?.trim()
+  if (scene) args.scene = scene
+  if (params.get('pass') === 'deai') args.pass = 'deai'
+  for (const [key, minimum] of [['budget', 1], ['rewriteStart', 0], ['rewriteLimit', 1]]) {
+    const raw = params.get(key)
+    if (raw === null) continue
+    const number = Number(raw)
+    if (!raw.trim() || !Number.isSafeInteger(number) || number < minimum) throw new Error(`${key} 须为不小于 ${minimum} 的整数`)
+    args[key] = number
+  }
+  return args
+}
+
+function contextBeatScope(section, scene) {
+  const chapter = section?.body ?? ''
+  const shared = scene ? chapter.split(/^### 场景[ \t]+/mu, 1)[0].trim() : ''
+  const text = scene ? [shared, scene.raw].filter(Boolean).join('\n\n') : chapter
+  return {
+    present: Boolean(text.trim()),
+    heading: scene?.title ?? section?.heading ?? '',
+    text,
+    infos: scene ? parseBeatInfos(text) : section?.infos ?? [],
+    interiors: scene ? parseBeatInteriors(text) : section?.interiors ?? [],
+    cognition: scene ? parseBeatCognition(text) : section?.cognition ?? [],
+  }
 }
 
 function applyChapterEdit(previous, args) {
@@ -3119,6 +3180,7 @@ export function apply(ctx, config) {
     execute: async args => {
       if (args.mode !== 'rewrite' && (args.rewriteStart !== undefined || args.rewriteLimit !== undefined)) throw new Error('分段参数仅用于 rewrite 模式')
       if (args.rewriteLimit !== undefined && args.rewriteStart === undefined) throw new Error('rewriteLimit 需要同时提供 rewriteStart')
+      if (args.scene && args.mode === 'rewrite' && args.rewriteStart === undefined) throw new Error('按场景改写须指定正文范围，整章改写请使用整章装配')
       const { meta } = await loadBook(rootNow())
       const chapters = []
       for (const chapter of meta.chapters) chapters.push(await chapterStats(rootNow(), chapter, meta.targetChars))
@@ -3149,11 +3211,13 @@ export function apply(ctx, config) {
       // 章纲优先：有这一章的 beats 就按清单配额给它，大纲退成背景参考。
       const beats = await readBeats(rootNow(), current)
       const stage = await stageContext(rootNow(), meta.chapters, current.id, args.scene)
-      const beatsText = args.scene ? stage.scenes[0].raw : (beats.section?.body || '')
+      const selectedScene = args.scene ? stage.scenes[0] : null
+      const contextBeats = contextBeatScope(beats.section, selectedScene)
+      const beatsText = contextBeats.text
       const sceneText = `${beatsText}\n${outlinePart}`
 
       // 节奏：把本章章纲上的爽点/钩子标记算出来，顺便看前面断了几章。
-      const marks = beats.section ? beats.section.marks : { payoff: [], hook: 0, turn: 0 }
+      const marks = selectedScene ? parseBeatMarks(selectedScene.raw) : beats.section?.marks ?? { payoff: [], hook: 0, turn: 0 }
       let gapBefore = 0
       const chapterIndex = meta.chapters.findIndex(item => item.id === current.id)
       for (let i = chapterIndex - 1; i >= 0; i -= 1) {
@@ -3163,7 +3227,7 @@ export function apply(ctx, config) {
         gapBefore += 1
       }
       const rhythm = {
-        present: Boolean(beats.section && beats.section.chars > 0),
+        present: contextBeats.present,
         payoff: marks.payoff.map(item => item.label || '爽点'),
         hook: marks.hook > 0,
         turn: marks.turn,
@@ -3177,12 +3241,12 @@ export function apply(ctx, config) {
       for (const eventLine of eventBoard.lines) {
         for (const event of eventLine.events) spineLookup.push({ ...event, lineId: eventLine.id, lineName: eventLine.name })
       }
-      const anchorIds = beats.section && Array.isArray(beats.section.events) ? beats.section.events : []
+      const anchorIds = selectedScene?.events ?? beats.section?.events ?? []
       const spine = []
       for (const event of spineLookup) {
         const inRange = event.from !== '' && current.id >= event.from && current.id <= event.to
         const anchored = anchorIds.includes(event.id)
-        if (!inRange && !anchored) continue
+        if (!anchored && (selectedScene || !inRange)) continue
         spine.push({
           id: event.id,
           line: event.lineName || event.lineId,
@@ -3270,9 +3334,20 @@ export function apply(ctx, config) {
       const styleBudget = rewrite
         ? Math.max(800, Math.min(16000, Math.round(budget * 0.25)))
         : Math.max(1100, Math.min(12000, Math.round(budget * 0.2)))
-      const sceneKinds = stage.scenes.length === 1 ? styleSceneScores(stage.scenes[0].raw).map(item => item.kind) : []
+      const sceneStyles = stage.scenes.map(scene => ({
+        title: scene.title,
+        kinds: styleSceneScores(scene.raw.split(/^####[ \t]+/mu)[0]).slice(0, 2).map(item => item.kind),
+      }))
+      const sceneKinds = [...new Set(sceneStyles.flatMap(item => item.kinds))]
       const styleAssembly = assembleStylePrompt(styleRaw, styleBudget, sceneKinds)
       const styleText = styleAssembly.text
+      const anchors = styleAssembly.included.filter(item => item.label.startsWith('锚点原文'))
+      const sceneGuide = sceneStyles.flatMap(item => {
+        const related = anchors.filter(anchor => item.kinds.includes(anchor.kind))
+        const fallback = anchors.find(anchor => anchor.kind === '通用' || !anchor.kind)
+        const picked = related.length ? related : fallback ? [fallback] : []
+        return picked.length ? [`- ${item.title}：对照${picked.map(anchor => anchor.label).join('、')}，仅迁移与本场任务相符的叙述方式。`] : []
+      })
 
       // 改写模式要带回这一章现有的正文：没有它，「按文风重写」就变成「重新写一遍」。
       let chapterText = ''
@@ -3281,6 +3356,7 @@ export function apply(ctx, config) {
         rawChapter = (await readText(path.join(rootNow(), current.file))) ?? ''
         if (rewrite) chapterText = rawChapter
       }
+      if (rewrite && !rawChapter.trim()) throw new Error('该章尚无正文，请选择续写装配')
       // 「去 AI 味」：带上改写纪律 + 本章能指认的 AI 腔清单（检测在宿主算，省得模型自己数）。
       const deai = args.pass === 'deai'
       const tone = deai && rawChapter ? detectAiTone(rawChapter) : { signals: [], total: 0 }
@@ -3296,7 +3372,8 @@ export function apply(ctx, config) {
       const preflight = await materialPreflight(rootNow(), current, { beatsText, styleName, styleText: styleRaw ?? '' })
       return assembleNovelContext({
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
-        beats: { present: Boolean(beats.section), heading: beats.section ? beats.section.heading : '', text: beatsText, infos: beats.section?.infos ?? [], interiors: beats.section?.interiors ?? [], cognition: beats.section?.cognition ?? [] },
+        beats: contextBeats,
+        scene: selectedScene ? { id: selectedScene.id, title: selectedScene.title, opening: beats.section?.scenes[0]?.id === selectedScene.id } : null,
         rhythm,
         presentation: presentationContext(stage, characters, rewrite && selected.scope.partial),
         presentationSources,
@@ -3309,7 +3386,7 @@ export function apply(ctx, config) {
         settings,
         ledger: ledgerRows,
         threads: threadRows,
-        style: { name: styleName, present: Boolean(styleText), ...styleAssembly },
+        style: { name: styleName, present: Boolean(styleText), ...styleAssembly, sceneGuide },
         mode: rewrite ? 'rewrite' : 'continue',
         chapterText,
         settingsCount: settingItems.length,
@@ -4082,7 +4159,7 @@ export function apply(ctx, config) {
         for (const item of value.settingReferences ?? []) lines.push(`- ${item.name}：${item.summary}`)
         if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
         lines.push('', '## 各维度 supported 所需来源（须在对应 checks 中引用）')
-        for (const item of value.sourceRequirements ?? []) lines.push(`- ${item.aspect}：${item.source}:${item.name}`)
+        for (const item of value.sourceRequirements ?? []) lines.push(`- ${item.aspect}：${item.source}:${item.name}${item.anchor ? '，请引用同类场景的锚点原文' : ''}`)
         if (value.style.text) lines.push('', `## 文风样本与约束：${value.style.name}`, value.style.text)
         lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review。')
         for (const item of value.items) {
@@ -5162,34 +5239,27 @@ export function apply(ctx, config) {
               return
             }
             if (route === '/context') {
-              const chapter = (url.searchParams.get('chapter') || '').trim()
-              if (!chapter) { sendJson(res, 400, { error: '需要 chapter（哪一章）' }); return }
               const definition = toolDefs.get('novel_context')
               if (!definition) { sendJson(res, 500, { error: '装配包工具未注册' }); return }
-              const mode = url.searchParams.get('mode') === 'rewrite' ? 'rewrite' : 'continue'
-              // 默认预算跟工具走，不要在路由里写死：工具改了默认值，预览必须跟着改，
-              // 否则会出现「预览说预算不足、AI 却能正常装配」的错位。
-              const declared = definition && definition.parameters && definition.parameters.properties
-                && definition.parameters.properties.budget && definition.parameters.properties.budget.default
-              const budget = Number(url.searchParams.get('budget')) || Number(declared) || (mode === 'rewrite' ? 80000 : 60000)
               try {
-                const args = { chapter, mode, ...(budget ? { budget } : {}) }
+                const args = contextRequestArgs(url.searchParams)
                 const value = await definition.execute(args, {})
-                const rendered = (definition.output && typeof definition.output.render === 'function' ? definition.output.render(args, value) : [])
-                  .map(part => (part && part.type === 'text' ? part.text : ''))
-                  .filter(Boolean)
-                  .join('\n')
                 if (url.searchParams.get('format') === 'text') {
                   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
-                  res.end(rendered)
+                  res.end(value.prompt)
                   return
                 }
                 sendJson(res, 200, {
-                  chapter: value.chapter || { id: chapter },
-                  mode: value.mode || mode,
-                  chars: Array.from(rendered).length,
-                  budgetUsed: value.budgetUsed || 0,
-                  text: rendered,
+                  chapter: value.chapter,
+                  scene: value.scene,
+                  mode: value.mode,
+                  ready: value.ready,
+                  chars: value.budgetUsed,
+                  budget: value.budget,
+                  budgetUsed: value.budgetUsed,
+                  minimumBudget: value.minimumBudget,
+                  style: value.style.name,
+                  text: value.prompt,
                 })
               } catch (error) {
                 sendJson(res, 400, { error: error && error.message ? error.message : String(error) })
@@ -5720,8 +5790,8 @@ const DEAI_REVIEW_ASPECTS = {
   continuity: '结合 scenes 动作链核对人物与设备位置、转场路线、工具来源、状态变化前因、技术因果和安全禁令，确认读者能连续还原现场，不能用脑补步骤消解矛盾。',
   timing: '核对倒计时与动作、观察、解释、交涉是否相容，指出具体段落依据；无倒计时也检查场景时间。',
   voice: '对照场景、人物认知、关系与说话目的，检查对白是否当场听得懂、是否为了狠话而生硬压缩，检查角色是否雷同；逐段提交 dialogue 判断，未匹配人物卡时先补读。',
-  narration: '按场景核对文风卡的视角权限、叙述距离和旁白分寸，检查是否混入参考作品专名、事件或独特原句。检查讲解、细节堆叠、标签重复与总结是否替代现场，数量对应和感官亮灯是否有设定依据。指出具体段落和适用规则，依据不足时如实登记。',
-  rhythm: '对照同类场景的锚点检查固定句段模板、工整对称、逐项报幕、冲突与对白是否生硬。用段落引文说明结论，句长和标点差异仅供复核，无文风卡时明确说明。',
+  narration: '引用同类场景的锚点原文和本章段落，比较叙述距离、旁白声调、人物判断与反应怎样参与信息揭示。符合章纲限知视角只是叙述权限核对，还需说明是否迁移了样本的表达方式。检查参考专名、事件和独特原句混入，守住所需的解释和设定依据，证据不足时如实登记。',
+  rhythm: '引用同类场景的锚点原文和本章段落，比较旁白句段怎样铺开和收短、对白在哪些时点加速、揭示前后怎样停顿。只有短问短答或没有套话不足以判为贴合。句长和标点偏差用于定位，结合现场压力判断。',
   facts: '核对事实、意图、因果、数字和信息点；尤其检查空间过渡、工具来源、动作前提和后果是否被缩写省略。区分已确认事实与原稿矛盾，修法不明先澄清，不编造补丁。',
 }
 
@@ -5983,14 +6053,23 @@ async function reviewSourceCoverage(root, meta, raw, checks) {
     if ([card.name, ...parseCardAliases(content)].some(name => mentions(raw, name))) add('voice', 'character', card.name)
   }
   const styleName = activeStyleName(meta)
-  if (styleName) { add('rhythm', 'style', styleName); add('narration', 'style', styleName) }
+  const anchors = styleName ? styleAnchorText(await readStyle(root, styleName)) : ''
+  if (styleName) {
+    for (const aspect of ['rhythm', 'narration']) {
+      requirements.push({ aspect, source: 'style', name: styleName, ...(anchors.trim().length >= 8 ? { anchor: true } : {}) })
+    }
+  }
   for (const setting of await listSettings(root)) {
     if (mentions(raw, setting.name)) add('facts', 'setting', setting.name)
   }
   for (const requirement of requirements) {
     const check = checks?.[requirement.aspect]
-    if (!check || check.verdict !== 'supported' || check.evidence.some(reference => reference.source === requirement.source && reference.name === requirement.name)) continue
-    findings.push({ aspect: requirement.aspect, verdict: 'uncertain', detail: `本项宣告 supported，但缺少 ${requirement.source}:${requirement.name} 的逐字依据。请补读并引用，或如实登记依据不足。`, evidence: check.evidence, counterargument: '其他维度的引用不能代替本维度的来源；引用存在也不能证明结论成立。' })
+    if (!check || check.verdict !== 'supported') continue
+    const evidence = check.evidence.some(reference => reference.source === requirement.source && reference.name === requirement.name &&
+      (!requirement.anchor || (typeof reference.quote === 'string' && reference.quote.trim().length >= 8 && anchors.includes(reference.quote.trim()))))
+    if (evidence) continue
+    const needed = requirement.anchor ? '锚点原文引文' : '逐字依据'
+    findings.push({ aspect: requirement.aspect, verdict: 'uncertain', detail: `本项宣告 supported，但缺少 ${requirement.source}:${requirement.name} 的${needed}。请补读并对照本章正文，或如实登记依据不足。`, evidence: check.evidence, counterargument: '核对是否是同类场景、是否比较了具体写法；引用存在也不能证明结论成立。' })
   }
   return { requirements, findings }
 }
