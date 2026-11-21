@@ -841,7 +841,7 @@ window.__ModuleLoader__.load({
         if (data.settings && data.settings.length) text += ` · 设定 ${data.settings.length}`
         if (data.style) text += ` · 文风 ${data.style}`
         const rhythm = data.rhythm
-        if (rhythm && rhythm.withBeats && rhythm.currentGap >= (rhythm.gapLimit || 2)) text += ` · ⚠ 断爽 ${rhythm.currentGap} 章`
+        if (rhythm && rhythm.withBeats && rhythm.currentBreached) text += ` · ⚠ 断爽 ${rhythm.currentGap} 章`
       }
 
       return h(
@@ -1860,7 +1860,6 @@ window.__ModuleLoader__.load({
           h('div', null, '跟助手说「新建人物卡：名字 + 设定」，会写到 ', h('code', null, 'characters/名字.md'), '。'),
         )
       } else if (mode === 'graph') {
-        const ids = (data && data.chapterIds) || []
         const marked = edgesWithMarks(data && data.graph)
         const deadCount = ((data && data.graph && data.graph.nodes) || []).filter(node => node.dead).length
         body = h(
@@ -1869,13 +1868,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'nvl-graph-bar' },
-            h('span', { className: 'nvl-hint' }, '关系截至'),
-            h(
-              'select',
-              { className: 'nvl-select', value: upto, onChange: event => setUpto(event.target.value) },
-              h('option', { value: '' }, '全部'),
-              ids.map(id => h('option', { key: id, value: id }, `第 ${Number(id)} 章`)),
-            ),
+            h('span', { className: 'nvl-hint' }, `关系截至 ${upto || '全部'}`),
             marked ? h('span', { className: 'nvl-hint' }, `（${marked} 条带时间标记）`) : null,
             deadCount ? h('span', { className: 'nvl-hint' }, `· ${deadCount} 人已殁`) : null,
           ),
@@ -1889,12 +1882,14 @@ window.__ModuleLoader__.load({
             h(
               'button',
               { key: card.name, type: 'button', className: 'nvl-card', onClick: () => setOpenName(card.name) },
-              h('span', { className: 'nvl-card-name' }, card.name, stateAt(card, upto) && stateAt(card, upto).dead ? h('span', { className: 'nvl-card-dead' }, '殁') : null, appearance[card.name] && appearance[card.name].due ? h('span', { className: 'nvl-card-due', title: appearance[card.name].last ? `上次出场第 ${Number(appearance[card.name].last)} 章，已经 ${appearance[card.name].gap} 章没露面（卡上写每 ${appearance[card.name].cadence} 章一次）` : `正文里还没出现过（卡上写每 ${appearance[card.name].cadence} 章一次）` }, '欠场') : null),
+              h('span', { className: 'nvl-card-name' }, card.name, stateAt(card, upto) && stateAt(card, upto).dead ? h('span', { className: 'nvl-card-dead' }, '殁') : null, appearance[card.name]?.due ? h('span', { className: 'nvl-card-due', title: appearance[card.name].last ? `上次可核实出场 ${appearance[card.name].last}，之后经过 ${appearance[card.name].gap} 个已写章（每 ${appearance[card.name].cadence} 章一次）` : `截至 ${appearance[card.name].cutoff} 无核实出场依据（每 ${appearance[card.name].cadence} 章一次）` }, '欠场') : null),
               h('span', { className: 'nvl-card-sum' }, card.summary || '（没有摘要）'),
               h(
                 'span',
                 { className: 'nvl-card-meta' },
-                `${card.chars} 字${card.relations && card.relations.length ? ` · 关系 ${card.relations.length}` : ''}`,
+                `${card.chars} 字${card.relations && card.relations.length ? ` · 关系 ${card.relations.length}` : ''}` +
+                  (appearance[card.name]?.candidateLast ? ` · ${appearance[card.name].candidateLast} 有字面候选` : '') +
+                  (appearance[card.name]?.last ? ` · 核实 ${appearance[card.name].last}` : ''),
               ),
             ),
           ),
@@ -1905,6 +1900,12 @@ window.__ModuleLoader__.load({
         'div',
         { className: 'nvl-pane' },
         header,
+        h('div', { className: 'nvl-graph-bar' },
+          h('span', { className: 'nvl-hint' }, `戏份截至 ${data?.appearanceCutoff || '暂无已写章'}`),
+          h('select', { className: 'nvl-select', value: upto, onChange: event => setUpto(event.target.value), 'aria-label': '关系与人物戏份统计范围' },
+            h('option', { value: '' }, '全部关系 / 最新已写章戏份'),
+            (data?.chapterIds || []).map(id => h('option', { key: id, value: id }, `截至 ${id}`)))),
+        h('div', { className: 'nvl-hint' }, '核实出场只认当前正文仍有效的已确认「登场」记录；画像、转述外貌与章纲出场只是线索或计划，认知转述和姓名命中都不清零欠场。'),
         body,
         cards.length
           ? h(AskBar, {
@@ -2300,6 +2301,10 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'nvl-pane' },
         h('div', { className: 'nvl-pane', style: { display: route ? 'none' : 'flex' } },
           h('div', { className: 'nvl-head' }, h('span', { className: 'nvl-title' }, '小说章纲'), h('span', { className: 'nvl-meta' }, `已规划 ${board?.coverage?.covered?.length || 0}/${board?.coverage?.total || 0} 章`)),
+          board?.rhythm ? h('div', { className: 'nvl-rhythm', 'data-tone': board.rhythm.currentBreached ? 'err' : '', role: 'status' },
+            `爽点 ${board.rhythm.payoff}${board.rhythm.budget ? ` / 计划 ${board.rhythm.budget}` : ''} · 有爽点的章 ${board.rhythm.withPayoff}/${board.rhythm.withBeats} · 钩子 ${board.rhythm.hooks} 章 · 最长断档 ${board.rhythm.longestGap} 章 · 阈值 ${board.rhythm.gapLimit}`,
+            board.rhythm.currentBreached ? ` · ⚠ 截至 ${board.rhythm.currentChapter} 连续 ${board.rhythm.currentGap} 章无标记` : '',
+            board.rhythm.complete === false ? ' · 统计不完整，请核对歧义章纲' : '') : null,
           h('div', { className: 'nvl-outline', ref: scroll },
             error ? h('p', null, error) : null,
             ...(board?.warnings || []).map((text, index) => h('p', { key: `warning-${index}`, role: 'alert', className: 'nvl-err' }, text)),
@@ -2311,10 +2316,13 @@ window.__ModuleLoader__.load({
                 h('p', { role: 'alert', className: 'nvl-err' }, match.warning),
                 h('p', { className: 'nvl-hint' }, '章纲目标存在歧义，未选择任何小节；请先核对 beats.md 中的章 ID。'))
               const section = sections[chapter.id]
+              const rhythm = board?.rhythm?.perChapter?.find(item => item.id === chapter.id)
               const overview = section?.overview
               const needsNormalization = match?.needsNormalization === true
               return h('section', { key: chapter.id, className: 'nvl-beat-sec' },
-                h('h3', null, `${chapter.id} ${chapter.title}`),
+                h('h3', { className: 'nvl-beat-head' }, `${chapter.id} ${chapter.title}`,
+                  rhythm?.hasBeats ? h('span', { className: 'nvl-mark', title: `连续断档 ${rhythm.gap} 章，阈值 ${board.rhythm.gapLimit}` }, `爽×${rhythm.payoff}${rhythm.hook ? ' 钩' : ''}`) : null),
+                rhythm?.breached ? h('p', { role: 'status', className: 'nvl-err' }, `⚠ 连续 ${rhythm.gap} 章无爽点标记，达到阈值 ${board.rhythm.gapLimit}`) : null,
                 needsNormalization ? h('p', { role: 'alert', className: 'nvl-err' }, match.warning) : null,
                 overview?.fields?.本章目标 ? h('p', null, `本章目标：${overview.fields.本章目标}`) : null,
                 ...(overview?.scenes || []).map(scene => h('div', { key: scene.id, className: 'nvl-outline-sec' },

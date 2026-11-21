@@ -29,7 +29,7 @@ import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
 import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
 import { parseCadence } from './lib/people.js'
-import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, resolveBeatSection, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
+import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, resolveBeatSection, beatsCoverageFromSections, beatCoverage, calculateBeatRhythm, beatReactionCandidates, payoffBudget } from './lib/beats.js'
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
 import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_STRUCTURE_INVALID } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
@@ -44,7 +44,7 @@ export const name = 'novel'
 export const inject = ['tools', 'webServer', 'agents', 'llm']
 
 const API_PREFIX = '/novel-api'
-const PLUGIN_REVISION = 'scene-ledger-style-v6'
+const PLUGIN_REVISION = 'rhythm-appearance-v7'
 
 const REVIEW_SOURCE_ROLES = {
   chapter: { role: 'written-content', label: '当前正文', policy: '核对叙述、对白和推断各自声称了什么；人物说法不自动成为作者事实。' },
@@ -171,6 +171,21 @@ function resolveRoot(config) {
 function chapterProgress(item) {
   if (!item.target) return 0
   return Math.min(1, item.chars / item.target)
+}
+
+/** 所有节奏入口投影同一快照；阈值与断档不在工具或客户端重新计算。 */
+function rhythmView(chapters, board, outlineText) {
+  const rhythm = calculateBeatRhythm(chapters, board.sections, parseSceneCadence(outlineText) || 2)
+  return { ...rhythm, budget: payoffBudget(outlineText)?.total ?? 0, baseHash: board.baseHash }
+}
+
+function appearanceDetail(name, item) {
+  const where = item.last
+    ? `上次可核实的出场证据在 ${item.last}，之后经过 ${item.gap} 个已写章`
+    : `截至 ${item.cutoff} 尚无核实出场依据，已经过 ${item.gap} 个已写章`
+  const planned = item.plannedLast ? `；${item.plannedLast} 的章纲安排了出场，但计划不等于正文已发生` : ''
+  const candidate = item.candidateLast ? `；${item.candidateLast} 有姓名或别名字面候选，不能据此判为已出场` : ''
+  return `「${name}」${where}；人物卡约定每 ${item.cadence} 章至少出场一次${planned}${candidate}。核实依据只认当前正文仍有效的已确认「登场」记录；画像、转述外貌、认知记录和章纲计划都不证明本人登场，也不构成自动语义认证。`
 }
 
 // ---- 人物卡 --------------------------------------------------------------
@@ -1416,7 +1431,7 @@ function assembleNovelContext(value, budget) {
     }
   }
   add('rewriteRules', '写作与审稿纪律', value.rewriteRules, true)
-  if (value.rhythm && value.rhythm.present) add('rhythm', scene ? '本场节奏' : '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}`)
+  if (value.rhythm && value.rhythm.present) add('rhythm', scene ? '本场节奏' : '章纲节奏', `爽点：${value.rhythm.payoff.join('、') || '无'}；钩子：${value.rhythm.hook ? '有' : '无'}；转折：${value.rhythm.turn}；整章连续无爽点：${value.rhythm.gap} 章 / 阈值 ${value.rhythm.gapLimit}${value.rhythm.breached ? '（已达到）' : ''}`)
   value.characters.forEach((item, i) => add(`character-${i}`, `人物：${item.name}`, item.content, Boolean(value.presentation)))
   add('presentationExcerpts', '人物与情绪承接原文候选', value.presentationExcerpts || '')
   value.settings.forEach((item, i) => add(`setting-${i}`, `设定：${item.name}`, item.content))
@@ -2051,14 +2066,12 @@ async function auditBook(root) {
     add('warn', 'thread-due', '「' + item.thread + '」计划在 ' + item.payoff + ' 收，现在已经写到 ' + latest + ' 还没收', item.payoff)
   }
   const cadenced = cards.filter(card => card.cadence > 0)
+  let appearance = {}
   if (cadenced.length) {
-    const seen = await appearanceIndex(root, rows, cards, target)
-    const report = appearanceReport(seen.last, cadenced, latest || seen.latestId)
-    for (const name of Object.keys(report)) {
-      const item = report[name]
-      if (!item.due) continue
-      const where = item.last ? ' 上一次出场是第 ' + item.last + ' 章，已经 ' + item.gap + ' 章没露面' : ' 一次都没在正文里出现'
-      add('warn', 'absent-role', name + where + '；人物卡上写的是每 ' + item.cadence + ' 章至少一次', item.last || latest)
+    const seen = await appearanceIndex(root, rows, cards)
+    appearance = appearanceReport(seen, cadenced, seen.latestId)
+    for (const [name, item] of Object.entries(appearance)) {
+      if (item.due) add('warn', 'absent-role', appearanceDetail(name, item), item.cutoff)
     }
   }
   const eventBoard = await readEvents(root)
@@ -2066,15 +2079,19 @@ async function auditBook(root) {
     const timeline = eventTimeline(eventBoard, rows, sections)
     for (const warning of timeline.warnings) add('warn', 'spine', warning)
   }
-  const rhythm = await beatRhythm(root, rows)
-  const gapLimit = rhythm.gapLimit || 2
-  if (latest && rhythm.currentGap >= gapLimit) {
-    add('warn', 'no-payoff', '已经连续 ' + rhythm.currentGap + ' 章没有爽点（大纲要求每 ' + gapLimit + ' 章至少一次）', latest)
+  const outlineText = (await readText(path.join(root, OUTLINE_FILE))) ?? ''
+  const rhythm = rhythmView(rows, beatBoard, outlineText)
+  const gapLimit = rhythm.gapLimit
+  for (const warning of rhythm.warnings) add('warn', 'beats-ambiguous', warning)
+  for (const breach of rhythm.breaches) {
+    add('warn', 'no-payoff', `截至 ${breach.id} 已连续 ${breach.gap} 个有章纲的章节没有爽点（配置阈值为 ${gapLimit}）`, breach.id)
   }
   const rank = { error: 0, warn: 1 }
   issues.sort((a, b) => (rank[a.level] - rank[b.level]) || String(a.chapter || '').localeCompare(String(b.chapter || '')))
   return {
     issues,
+    rhythm,
+    appearance,
     summary: {
       chapters: rows.length,
       written: written.length,
@@ -2167,12 +2184,11 @@ export function apply(ctx, config) {
     const characters = await listCharacters(rootNow())
     const threads = await loadThreads(rootNow())
     const ledger = await loadLedger(rootNow())
-    const beats = await beatsCoverage(rootNow(), chapters)
-    const rhythm = await beatRhythm(rootNow(), chapters)
+    const beatBoard = await readBeats(rootNow(), null, chapters)
+    const beats = beatsCoverageFromSections(chapters, beatBoard.sections)
+    const rhythm = rhythmView(chapters, beatBoard, outline)
     const eventBoard = await readEvents(rootNow())
-    const beatBoard = await readBeats(rootNow(), null)
     const spine = eventTimeline(eventBoard, chapters, beatBoard.sections)
-    const budget = payoffBudget(outline)
     const settings = await listSettings(rootNow())
     const styles = await listStyles(rootNow())
     const activeStyle = activeStyleName(meta)
@@ -2202,25 +2218,7 @@ export function apply(ctx, config) {
         warnings: spine.warnings.length,
         byChapter: spine.chapters.map(item => ({ id: item.id, hits: item.hits.map(hit => hit.eventId) })),
       },
-      rhythm: {
-        total: rhythm.total,
-        withBeats: rhythm.withBeats,
-        payoff: rhythm.payoff,
-        withPayoff: rhythm.withPayoff,
-        hooks: rhythm.hooks,
-        turns: rhythm.turns,
-        longestGap: rhythm.longestGap,
-        currentGap: rhythm.currentGap,
-        gapLimit: rhythm.gapLimit,
-        budget: budget ? budget.total : 0,
-        perChapter: rhythm.perChapter.map(item => ({          id: item.id,
-          title: item.title,
-          hasBeats: item.hasBeats,
-          payoff: item.payoff,
-          hook: item.hook,
-          turn: item.turn,
-        })),
-      },
+      rhythm,
       characters: characters.map(item => ({ name: item.name, summary: item.summary, chars: item.chars })),
       settings: settings.map(item => ({ name: item.name, summary: item.summary, category: item.category, chars: item.chars })),
       styles: styles.map(item => ({ name: item.name, summary: item.summary, chars: item.chars })),
@@ -2302,9 +2300,10 @@ export function apply(ctx, config) {
           (value.rhythm && value.rhythm.withBeats
             ? `\n节奏：爽点 ${value.rhythm.payoff}${value.rhythm.budget ? ` / 计划 ${value.rhythm.budget}` : ''}` +
               ` · 有爽点的章 ${value.rhythm.withPayoff}/${value.rhythm.withBeats} · 钩子 ${value.rhythm.hooks} 章 · 最长断档 ${value.rhythm.longestGap} 章` +
-              (value.rhythm.currentGap >= (value.rhythm.gapLimit || 2)
-                ? `\n⚠ 已经连续 ${value.rhythm.currentGap} 章没有爽点：读者会走神，下一章该给一次情绪回报（打脸 / 翻盘 / 揭秘 / 情感兑现都算）。`
-                : '')
+              (value.rhythm.currentBreached
+                ? `\n⚠ 截至 ${value.rhythm.currentChapter} 已连续 ${value.rhythm.currentGap} 章没有爽点，达到配置阈值 ${value.rhythm.gapLimit}。这是章纲标记统计，需结合剧情核对。`
+                : '') +
+              (value.rhythm.complete === false ? `\n节奏统计不完整：${value.rhythm.warnings.join('；')}` : '')
             : '')
         const list = value.chapters.length
           ? '\n' +
@@ -3294,7 +3293,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_character_history',
-    description: '人物认知与有向关系历史。inspect 查看；propose 提交正文提取候选（character/scene 为稳定 ID，evidenceIndex 必须取自当前 novel_deai_pack 的正文段号，evidence 为该段逐字引文；kind 为已知/未知/误信/怀疑/关系/状态/呈现，content 为内容、source 为信息来源；关系必填 target，可给 event、supersedes）。工具使用同版本全文分场核对引文的实际场景；无法可靠归属时只保存待核对 candidate。confirm 需 character+id，仅在 binding=bound 且作者确认或已授权核对流程后调用；revoke 撤销。计划不能直接确认为事实，正文、分场或章纲变化后需重新提取。',
+    description: '人物认知与有向关系历史。inspect 查看；propose 提交正文提取候选（character/scene 为稳定 ID，evidenceIndex 必须取自当前 novel_deai_pack 的正文段号，evidence 为该段逐字引文；kind 为已知/未知/误信/怀疑/关系/状态/登场/呈现，content 为内容、source 为信息来源；关系必填 target，可给 event、supersedes）。kind=登场 只记录人物本人在场景中实际出场，必须提交 onStage: true；只写到画像、转述外貌、旧物或其他间接信息时用 kind=呈现。工具使用同版本全文分场核对引文的实际场景；无法可靠归属时只保存待核对 candidate。confirm 需 character+id，仅在 binding=bound 且作者确认或已授权核对流程后调用；revoke 撤销。计划不能直接确认为事实，正文、分场或章纲变化后需重新提取。',
     parameters: historyParameters,
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
     execute: async args => updateHistory(rootNow(), (await loadBook(rootNow())).meta.chapters, args),
@@ -3418,22 +3417,20 @@ export function apply(ctx, config) {
       const beatsText = contextBeats.text
       const sceneText = `${beatsText}\n${outlinePart}`
 
-      // 节奏：把本章章纲上的爽点/钩子标记算出来，顺便看前面断了几章。
+      // 场景标记仍按选中场装配；断档只取共享章节时间线，不能按场重算。
       const marks = selectedScene ? parseBeatMarks(selectedScene.raw) : beats.section?.marks ?? { payoff: [], hook: 0, turn: 0 }
-      let gapBefore = 0
-      const chapterIndex = meta.chapters.findIndex(item => item.id === current.id)
-      for (let i = chapterIndex - 1; i >= 0; i -= 1) {
-        const section = matchBeatSection(beats.sections, meta.chapters[i], meta.chapters)
-        if (!section || section.chars === 0) continue
-        if ((section.marks?.payoff.length ?? 0) > 0) break
-        gapBefore += 1
-      }
+      const rhythmChapters = meta.chapters.some(item => item.id === current.id) ? meta.chapters : [...meta.chapters, current]
+      const bookRhythm = rhythmView(rhythmChapters, beats, outlineText)
+      const chapterRhythm = bookRhythm.perChapter.find(item => item.id === current.id)
       const rhythm = {
+        ...chapterRhythm,
+        gapLimit: bookRhythm.gapLimit,
+        complete: bookRhythm.complete,
+        warnings: bookRhythm.warnings,
         present: contextBeats.present,
         payoff: marks.payoff.map(item => item.label || '爽点'),
         hook: marks.hook > 0,
         turn: marks.turn,
-        gapBefore,
       }
 
       // 事件线：这一章该推进哪几条（区间给默认，章纲锚点做修正）。
@@ -3958,7 +3955,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_check',
     description:
-      '写完后做机械自检（不联网、不改文件）：旧称、未登记说话人、重复句、标点、长度、文风与默认开启的 AI 腔线索。按章读取时同时检查当前正文的模型审稿记录，不认证动作可行性或语义自然度。近似统计仅作非阻塞提示。作者只要求检查时，不得为清除提示自行调用写入工具改正文。',
+      '写完后做机械自检（不联网、不改文件）：旧称、未登记说话人、重复句、标点、长度、文风与默认开启的 AI 腔线索。按章读取时同时返回共享爽点断档、结构化人物出场依据与当前正文的模型审稿记录；姓名/别名命中只是候选。打脸场缺显式反应标签是限定在本场的非阻塞线索，逐场语义判断有当前有效证据时只附注依据。工具不认证动作可行性或语义自然度。作者只要求检查时，不得为清除提示自行调用写入工具改正文。',
     parameters: {
       type: 'object',
       properties: {
@@ -3981,6 +3978,8 @@ export function apply(ctx, config) {
           historyCoverage: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '非阻塞的人物入场历史覆盖状态，不是正文问题' },
           presentationReview: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '人物表现审阅依据，不是已发现错误或必须清零的任务' },
           heuristicNotes: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '非阻塞统计线索；不能据此自动补动作、改台词或合并句子' },
+          rhythm: { type: 'object', additionalProperties: true, description: '本章爽点标记、包含本章的连续断档及共享配置阈值' },
+          appearance: { type: 'object', additionalProperties: true, description: '截至目标章的已确认出场依据、章纲计划与字面候选；计划或候选不消除欠场' },
           chars: { type: 'integer' },
           target: { type: 'integer' },
           issues: {
@@ -4009,6 +4008,7 @@ export function apply(ctx, config) {
           ...(value.deaiReview ? [value.deaiReview.detail] : []),
           ...(value.aiToneReview ? [`已纳入当前版本语义复核的机械线索（${value.aiToneReview.total} 处）：`, ...value.aiToneReview.signals.map(item => `${item.label}：${item.samples.join(' / ')}`)] : []),
           ...(value.heuristicNotes ?? []).map(item => `非阻塞线索 [${item.kind}] ${item.detail}`),
+          ...Object.entries(value.appearance ?? {}).filter(([, item]) => item.candidateLast).map(([character, item]) => `出场候选 [${character}] ${item.candidateLast} 仅有姓名或别名字面命中；核实出场取当前正文仍有效的已确认「登场」记录，章纲计划与字面候选都不清零欠场。`),
           ...(review ? [
             ...review.warnings.map(item => `格式提醒：${item}`),
             ...(review.limitedCount ? [`少用词命中 ${review.limitedCount} 处（仅提醒，不判违规）：`, ...review.limited] : []),
@@ -4045,7 +4045,8 @@ export function apply(ctx, config) {
         if (typeof args.text !== 'string') text = (await readText(path.join(rootNow(), chapter.file))) ?? ''
       }
       const cards = []
-      for (const card of await listCharacters(rootNow())) {
+      const characterCards = await listCharacters(rootNow())
+      for (const card of characterCards) {
         cards.push({ name: card.name, content: (await readCharacter(rootNow(), card.name)) ?? '' })
       }
       const target = chapter ? chapter.target || meta.targetChars : meta.targetChars
@@ -4123,32 +4124,26 @@ export function apply(ctx, config) {
             '如果大纲里说了篇幅，用 novel_book({ targetChars }) 定下来）'
         }
       }
-      // 有章纲就再对一遍：这一步以前没做，结果模型写了三条 beat 就收笔，章纲第 4、5 场没人发现。
+      // 同场景的显式反应标签只提供字面线索，不替代正文语义判断。
       const beat = await readBeats(rootNow(), chapter ?? null, meta.chapters)
-    const beatBody = beat && beat.section ? String(beat.section.body ?? '') : ''
-    if (beatBody) {
-      const beatLines = beatBody.split(/\r?\n/u)
-      const reactions = beat && beat.section && Array.isArray(beat.section.reactions) ? beat.section.reactions : []
-      for (let index = 0; index < beatLines.length; index += 1) {
-        const line = beatLines[index]
-        if (!/爽点\s*[（(]\s*打脸/u.test(line)) continue
-        let has = false
-        for (let cursor = index + 1; cursor < beatLines.length; cursor += 1) {
-          if (/^\s*[-*+]?\s*场景\s*[：:]/u.test(beatLines[cursor])) break
-          if (/^\s*[-*+]?\s*(?:反应|对方反应)\s*[：:]/u.test(beatLines[cursor])) { has = true; break }
-        }
-        if (!has) {
-          report.issues.push({
-            kind: 'no-reaction-on-payoff',
-            detail: '这一场的爽点标的是「打脸」，但章纲里没写对手当场怎么反应：补一行「- 反应：他把烟塞回兜里，笑了一下，说「行，你有种」」——可用表情、动作或对白呈现；是否直接写内心遵守本场叙述视角，不强制增加心理段落。',
-          })
-          break
-        }
+      if (beat.matchIssue) report.heuristicNotes.push({ kind: 'beats-ambiguous', detail: beat.matchIssue.message })
+      const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
+      const sharedRhythm = rhythmView(meta.chapters, beat, outlineText)
+      const sharedChapterRhythm = sharedRhythm.perChapter.find(item => item.id === chapter?.id)
+      if (sharedChapterRhythm) report.rhythm = { ...sharedChapterRhythm, gapLimit: sharedRhythm.gapLimit, complete: sharedRhythm.complete, warnings: sharedRhythm.warnings }
+      for (const candidate of beatReactionCandidates(beat.section)) {
+        const reaction = recorded ? reviewState.sceneReactions?.find(scene => scene.sceneId === candidate.sceneId && scene.beatHash === candidate.beatHash)?.reaction : null
+        const supported = reaction?.verdict === 'supported'
+        const label = candidate.sceneId ? `场景 ${candidate.sceneId}「${candidate.title}」` : `旧章纲第 ${candidate.line} 行`
+        report.heuristicNotes.push({
+          kind: 'no-reaction-on-payoff',
+          classification: 'literal-candidate',
+          ...candidate,
+          semanticStatus: supported ? 'supported' : 'pending',
+          ...(supported ? { semanticReview: reaction } : {}),
+          detail: `${label} 标记了打脸，但本场章纲块内未见标记后的显式反应标签。这只是复核线索，不表示正文缺少自然反应，可通过对白、动作或其他自然方式体现；不要为清除线索补身体动作。${supported ? `已登记本场自然反应判断：${reaction.detail}；依据：${reaction.evidence.filter(reference => reference.source === 'chapter').map(reference => `第 ${reference.index} 段「${reference.quote}」`).join('、')}。登记不自动认证语义正确。` : '须结合本场正文语义复核。'}`,
+        })
       }
-      if (reactions.length === 0 && /爽点\s*[（(]\s*打脸/u.test(beatBody)) {
-        // already covered above; keep single issue
-      }
-    }
       if (beat.section && beat.section.chars > 0) {
         const gap = beatCoverage(text, beat.section.body)
         if (gap.missing.length) {
@@ -4159,22 +4154,11 @@ export function apply(ctx, config) {
               gap.missing.map(item => `第 ${item.index} 场「${item.snippet}…」`).join('、') + '。未匹配不代表漏写，不要求照抄章纲或补写；确认实际缺失后再登记语义问题。',
           })
         }
-        // 节奏：爽点与钩子写在章纲的场记末尾，这里只做提醒，不逼着改。
         const marks = beat.section.marks ?? { payoff: [], hook: 0, turn: 0 }
-        if (!marks.payoff.length) {
-          let gapBefore = 0
-          const index = meta.chapters.findIndex(item => item.id === chapter.id)
-          for (let i = index - 1; i >= 0; i -= 1) {
-            const section = matchBeatSection(beat.sections, meta.chapters[i], meta.chapters)
-            if (!section || section.chars === 0) continue
-            if ((section.marks?.payoff.length ?? 0) > 0) break
-            gapBefore += 1
-          }
+        if (sharedChapterRhythm?.breached) {
           report.issues.push({
             kind: 'no-payoff',
-            detail:
-              `章纲里一场「→ 爽点」都没有${gapBefore ? `，而且已经连续 ${gapBefore} 章没有了` : ''}：` +
-              '读者追下去靠情绪回报，全是信息过场容易被跳读。类型可以是打脸 / 翻盘 / 揭秘 / 情感兑现 / 强强对话——在那一场末尾补一句「→ 爽点（类型）」再写。',
+            detail: `截至 ${chapter.id} 已连续 ${sharedChapterRhythm.gap} 个有章纲的章节没有爽点标记，达到配置阈值 ${sharedRhythm.gapLimit}。这是章纲计划统计，不自动判定正文缺少情绪回报；请结合情节复核。`,
           })
         }
         if (!marks.hook) {
@@ -4287,36 +4271,14 @@ export function apply(ctx, config) {
           report.issues.push({ kind: 'spine-conflict', detail: warning })
         }
       }
-      // 戏份承诺：人物卡上写「每 N 章至少出场一次」，就要真的查。
-      // 判据只看「已写章」——还没写的章不算漏。
-      const cadenceCards = cards.filter(card => parseCadence(card.content))
-      if (cadenceCards.length) {
-        const bookNow = await loadBook(rootNow())
-        const bookChapters = bookNow.meta.chapters ?? []
-        const uptoId = chapter
-          ? chapter.id
-          : [...bookChapters]
-              .reverse()
-              .map(item => item.id)
-              .find(() => true) || ''
-        if (uptoId) {
-          const ready = cadenceCards.map(card => ({
-            name: card.name,
-            file: `${CHARACTERS_DIR}/${card.name}${CHARACTER_EXT}`,
-            cadence: parseCadence(card.content),
-            states: parseStates(card.content),
-          }))
-          const seen = await appearanceIndex(rootNow(), bookChapters, ready, bookNow.meta.targetChars)
-          const report2 = appearanceReport(seen.last, ready, uptoId)
-          for (const item of ready) {
-            const info = report2[item.name]
-            if (!info || !info.due) continue
-            report.issues.push({
-              kind: 'absent-role',
-              detail: info.last
-                ? `${item.name} 上一次出场是第 ${Number(info.last)} 章，到现在已经 ${info.gap} 章没露面；人物卡上写的是每 ${item.cadence} 章至少一次。要么给他一场戏，要么把卡上的戏份改掉。`
-                : `${item.name} 一直没在正文里出现过；人物卡上写的是每 ${item.cadence} 章至少一次。`,
-            })
+      // 按目标章截断已写章出场时间线；直接文本检查没有可靠的书目或场景归属。
+      if (chapter && typeof args.text !== 'string') {
+        const ready = characterCards
+        if (ready.some(card => card.cadence)) {
+          const seen = await appearanceIndex(rootNow(), meta.chapters, ready)
+          report.appearance = appearanceReport(seen, ready, chapter.id)
+          for (const [character, info] of Object.entries(report.appearance)) {
+            if (info.due) report.issues.push({ kind: 'absent-role', detail: appearanceDetail(character, info) })
           }
         }
       }
@@ -4351,6 +4313,7 @@ export function apply(ctx, config) {
         properties: {
           chapter: { type: 'object', additionalProperties: true },
           baseHash: { type: 'string' },
+          beatsHash: { type: 'string', description: '取包时的完整章纲指纹；提交逐场反应判断时必须原样带回' },
           totalItems: { type: 'integer' },
           voices: { type: 'array', items: { type: 'object', additionalProperties: true } },
           items: { type: 'array', items: { type: 'object', additionalProperties: true } },
@@ -4376,7 +4339,7 @@ export function apply(ctx, config) {
           }
         }
         lines.push('仅以代称出场或尚未匹配的角色，请用 novel_card 补读人物卡；不要由缺少卡片推断人物没有声口约束。')
-        lines.push('', '## 本章场景与认知约束（按空间动作与对白钩子逐段核对）', value.dialogueContext?.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
+        lines.push('', `## 本章场景与认知约束（beatsHash: ${value.beatsHash}）`, value.dialogueContext?.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
         lines.push('', '## 设定索引（涉及机制、能量路径或身体反应时，用 novel_setting 读取相关完整条目）')
         for (const item of value.settingReferences ?? []) lines.push(`- ${item.name}：${item.summary}`)
         if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
@@ -4412,6 +4375,7 @@ export function apply(ctx, config) {
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
+        beatsHash: beats.baseHash,
         rules: `${DEAI_RULES}\n\n${SCENE_REVIEW_RULES}\n\n${REVIEW_EVIDENCE_RULES}\n\n${DEAI_WORKFLOW}`,
         style: { name: style.name, text: readStyleCalibration(style.text).content, hash: style.hash },
         dialogueContext: { beats: beats.section?.body ?? '' },
@@ -4425,13 +4389,14 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_deai_review',
-    description: '登记有证据的审稿结果。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。scenes 按正文顺序连续覆盖全文；本章有结构化章纲时每场必须用 sceneId 声明该段对应的稳定场景 ID，不能按下标假定顺序，人物历史据此绑定场景。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。干净的 recorded 只开放显式定稿资格，不自动把 draft 提升为 final；正文、引用资料或启用文风变化后资格失效。启用文风时须把取包返回的 styleHash 一并提交，取包后换卡或切换文风会拒绝登记。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
+    description: '登记有证据的审稿结果。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。scenes 按正文顺序连续覆盖全文；本章有结构化章纲时每场必须用 sceneId 声明该段对应的稳定场景 ID，不能按下标假定顺序，人物历史据此绑定场景。打脸场正文已自然体现反应时可在对应场景提交 reaction 及本场逐字证据，并带回 novel_deai_pack 的 beatsHash；整章汇总不能代替逐场确认。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。干净的 recorded 只开放显式定稿资格，不自动把 draft 提升为 final；正文、引用资料或启用文风变化后资格失效。启用文风时须把取包返回的 styleHash 一并提交，取包后换卡或切换文风会拒绝登记。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         chapter: { type: 'string' },
         baseHash: { type: 'string', description: '当前 novel_deai_pack 返回的整章哈希，发现矛盾也可登记' },
         styleHash: { type: 'string', description: '当前 novel_deai_pack 返回的 style.hash（启用名称＋卡片正文的指纹）；启用文风时必填，防止取包后换卡或切换到同内容另一张卡仍按旧审稿登记' },
+        beatsHash: { type: 'string', description: '提交 scenes[].reaction 时必填：当前 novel_deai_pack 的 beatsHash；章纲取包后变化会拒绝登记' },
         payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段；顶层也可带 baseHash，直接参数缺省时采用文件里的值（chapter 仍要直接传）。' },
         checks: {
           type: 'object', additionalProperties: false,
@@ -4519,6 +4484,16 @@ export function apply(ctx, config) {
               layout: { type: 'string', minLength: 1, description: '人物、设备、通道与危险区的相对位置及已知状态；转场说明如何从上场到达' },
               mechanism: { type: 'string', minLength: 1, description: '主要因果链：异常来源→采取措施→能量或物质去向→结果；说明各辅助动作的必要性与设定依据，无此类机制时说明原因' },
               timeline: { type: 'string', minLength: 1, description: '把移动、拿取工具、对白与操作放进同一时间线，核对串并行和倒计时；不默认一息等于一秒，不编造精确耗时；无明确时间窗口时说明依据' },
+              reaction: {
+                type: 'object', additionalProperties: false, description: '可选：只用于本 sceneId 的打脸后自然反应判断。章纲无显式反应标签时，正文仍可通过对白、动作或其他方式自然呈现；必须引用本场范围内正文，不能借下一场。',
+                properties: {
+                  verdict: { type: 'string', enum: ['supported', 'conflict', 'uncertain'] },
+                  detail: { type: 'string', minLength: 1 },
+                  evidence: { type: 'array', minItems: 1, items: REVIEW_EVIDENCE_SCHEMA },
+                  counterargument: { type: 'string', minLength: 1 },
+                },
+                required: ['verdict', 'detail', 'evidence', 'counterargument'],
+              },
               actions: {
                 type: 'array', description: '按发生顺序记录全部关键物理动作；同段多个动作逐条列出',
                 items: {
@@ -4592,20 +4567,31 @@ export function apply(ctx, config) {
       if (!raw.trim()) throw new Error(`第 ${chapter.id} 章正文为空，先写正文再登记复核；未登记`)
       const submittedHash = args.baseHash || payload.baseHash
       const submittedStyleHash = args.styleHash || payload.styleHash
+      const submittedBeatsHash = args.beatsHash || payload.beatsHash
       if (!submittedHash) throw new Error('缺少 baseHash：请传 novel_deai_pack 返回的 baseHash（写在 payloadFile 顶层也可以）。重新取包不会改变哈希，只有正文变化才会；未登记')
       if (submittedHash !== packed.baseHash) throw new Error(`版本已变化：提交 ${String(submittedHash).slice(0, 12)}，当前正文 ${packed.baseHash.slice(0, 12)}；请重新调用 novel_deai_pack 取包后再登记；未登记`)
       const style = await activeStyleSnapshot(root, meta)
       if (submittedStyleHash !== undefined && submittedStyleHash !== style.hash) throw new Error('启用文风在取包后已变化：请重新调用 novel_deai_pack 取包并核对文风后再登记；未登记')
       if (submittedStyleHash === undefined && style.name) throw new Error(`取包时未提交启用文风「${style.name}」的版本指纹。请重新调用 novel_deai_pack 取包，并把返回的 style.hash 作为 styleHash 提交，避免把旧文风的审稿登记到新卡；未登记`)
+      const beatBoard = await readBeats(root, chapter, meta.chapters)
+      const sceneIds = beatBoard.section?.scenes.map(item => item.id) ?? []
+      const sceneProblem = sceneReviewProblem(scenes, packed.totalItems, sceneIds)
+      if (sceneProblem) throw new Error(`场景复核未通过：${sceneProblem}；未登记`)
+      const reactions = sceneReactionReviews(scenes, beatBoard.section)
+      if (reactions.length && (!submittedBeatsHash || submittedBeatsHash !== beatBoard.baseHash)) throw new Error('章纲在取包后已变化或未提交 beatsHash；请重新调用 novel_deai_pack 取包后登记反应判断；未登记')
       const observations = reviewObservations(observationsInput, checks)
+      for (const scene of reactions) {
+        const verdict = scene.reaction.verdict
+        if (verdict === 'conflict' && checks.rhythm.verdict !== 'conflict') throw new Error(`场景 ${scene.sceneId} 的反应判为 conflict，rhythm 汇总也必须如实登记 conflict；未登记`)
+        if (verdict === 'uncertain' && !['conflict', 'uncertain'].includes(checks.rhythm.verdict)) throw new Error(`场景 ${scene.sceneId} 的反应依据不足，rhythm 汇总不能登记为通过；未登记`)
+        if (verdict === 'supported' && checks.rhythm.verdict === 'not-applicable') throw new Error(`场景 ${scene.sceneId} 已提交反应判断，rhythm 不能登记为 not-applicable；未登记`)
+      }
       let timing = calculateReviewTimeBudgets(timeBudgets, packed, checks)
-      const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence])
+      const reactionEvidence = reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference })))
+      const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence, ...reactionEvidence])
       timing = calculateReviewTimeBudgets(timeBudgets, packed, checks, evidence.contexts)
       const coverage = await reviewSourceCoverage(root, meta, raw, checks, style)
       const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
-      const sceneIds = (await readBeats(root, chapter, meta.chapters)).section?.scenes.map(item => item.id) ?? []
-      const sceneProblem = sceneReviewProblem(scenes, packed.totalItems, sceneIds)
-      if (sceneProblem) throw new Error(`场景复核未通过：${sceneProblem}；未登记`)
       if (!hasCompleteParagraphReviews(paragraphs, packed.totalItems)) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
       const byIndex = new Map(paragraphs.map(item => [item.index, item]))
       for (const item of packed.items) {
@@ -4625,6 +4611,7 @@ export function apply(ctx, config) {
       chapter.deaiReview = {
         version: DEAI_REVIEW_VERSION,
         baseHash: packed.baseHash,
+        ...(reactions.length ? { beatsHash: beatBoard.baseHash, reactionBindings: reactions.map(scene => ({ sceneId: scene.sceneId, beatHash: scene.beatHash, startIndex: scene.startIndex, endIndex: scene.endIndex })) } : {}),
         styleName: style.name,
         ...(style.name ? { styleHash: style.hash } : {}),
         reviewedAt: new Date().toISOString(),
@@ -4681,7 +4668,7 @@ export function apply(ctx, config) {
         const rhythmTail = value.rhythm
           ? `\n节奏：爽点 ${value.rhythm.payoff}${value.rhythm.budget ? ` / 计划 ${value.rhythm.budget}` : ''}` +
             ` · 有爽点的章 ${value.rhythm.withPayoff}/${value.rhythm.withBeats} · 钩子 ${value.rhythm.hooks} 章 · 最长断档 ${value.rhythm.longestGap} 章` +
-            (value.rhythm.currentGap >= (value.rhythm.gapLimit || 2) ? `\n⚠ 已经连续 ${value.rhythm.currentGap} 章没有爽点（每 ${value.rhythm.gapLimit || 2} 章至少一次）` : '')
+            (value.rhythm.currentBreached ? `\n⚠ 截至 ${value.rhythm.currentChapter} 连续 ${value.rhythm.currentGap} 章无爽点，达到阈值 ${value.rhythm.gapLimit}` : '')
           : ''
         const warningText = value.warnings?.length
           ? `\n\n⚠ 章纲核对提醒：\n${value.warnings.map(item => `- ${item}`).join('\n')}`
@@ -4721,33 +4708,19 @@ export function apply(ctx, config) {
       const { meta } = await loadBook(rootNow())
       const chapters = []
       for (const chapter of meta.chapters) chapters.push(await chapterStats(rootNow(), chapter, meta.targetChars))
-      const coverage = await beatsCoverage(rootNow(), chapters)
-
       const hasContent = typeof args.content === 'string'
       if (hasContent && !args.chapter) throw new Error('写章纲要给 chapter（哪一章）')
       const chapter = args.chapter ? findChapter(meta.chapters, args.chapter) : null
       if (args.chapter && !chapter) throw new Error(`没有这一章「${args.chapter}」；先 novel_status 看章节 id`)
 
-      const rhythm = await beatRhythm(rootNow(), chapters)
-      const budget = payoffBudget((await readText(path.join(rootNow(), OUTLINE_FILE))) ?? '')
-      const rhythmSummary = {
-        payoff: rhythm.payoff,
-        withPayoff: rhythm.withPayoff,
-        withBeats: rhythm.withBeats,
-        hooks: rhythm.hooks,
-        turns: rhythm.turns,
-        longestGap: rhythm.longestGap,
-        currentGap: rhythm.currentGap,
-        gapLimit: rhythm.gapLimit,
-        budget: budget ? budget.total : 0,
-        perChapter: rhythm.perChapter.map(item => ({ id: item.id, payoff: item.payoff, hook: item.hook, turn: item.turn })),
-      }
-
+      const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
       if (hasContent) {
         let written
         try { written = await writeBeats(rootNow(), chapter, args.content, meta.chapters) }
         catch (error) { return { ...beatFailure(error), chapter: { id: chapter.id, title: chapter.title } } }
-        const writtenCoverage = await beatsCoverage(rootNow(), chapters)
+        const savedBoard = await readBeats(rootNow(), chapter, meta.chapters)
+        const writtenCoverage = beatsCoverageFromSections(chapters, savedBoard.sections)
+        const rhythmSummary = rhythmView(chapters, savedBoard, outlineText)
         return {
           ok: true,
           written: true,
@@ -4769,6 +4742,8 @@ export function apply(ctx, config) {
       }
 
       const board = await readBeats(rootNow(), chapter, meta.chapters)
+      const coverage = beatsCoverageFromSections(chapters, board.sections)
+      const rhythmSummary = rhythmView(chapters, board, outlineText)
       // 不带参数时 schema 里的 chapter / beats 就不出现（写成 null 会被判 "must be an object"）。
       return {
         written: false,
@@ -4927,6 +4902,8 @@ export function apply(ctx, config) {
         additionalProperties: true,
         properties: {
           issues: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          rhythm: { type: 'object', additionalProperties: true },
+          appearance: { type: 'object', additionalProperties: true },
           summary: { type: 'object', additionalProperties: true },
         },
       },
@@ -4952,7 +4929,7 @@ export function apply(ctx, config) {
       const level = args && args.level === 'error' ? 'error' : args && args.level === 'warn' ? 'warn' : ''
       const limit = Math.max(1, Math.min(200, Number(args && args.limit) || 20))
       const issues = level ? report.issues.filter(item => item.level === level) : report.issues
-      return { issues: issues.slice(0, limit), summary: report.summary }
+      return { issues: issues.slice(0, limit), rhythm: report.rhythm, appearance: report.appearance, summary: report.summary }
     },
     presentCall: () => ({ card: 'generic', title: '全书巡检', kind: 'read' }),
   })
@@ -5521,6 +5498,7 @@ export function apply(ctx, config) {
                   missingRequired: value.missingRequired,
                   ledgerScope: value.ledgerScope,
                   ledgerMissing: value.ledgerMissing,
+                  rhythm: value.rhythm,
                   style: value.style.name,
                   text: value.prompt,
                 })
@@ -5547,19 +5525,21 @@ export function apply(ctx, config) {
             }
             if (route === '/characters') {
               const cards = await listCharacters(rootNow())
-              const upto = (url.searchParams.get('chapter') ?? '').trim()
+              const wanted = (url.searchParams.get('chapter') ?? '').trim()
               const book = await loadBook(rootNow())
-              const ids = (book.meta.chapters ?? []).map(item => item.id)
               const rawChapters = book.meta.chapters ?? []
-              const seen = cards.some(card => card.cadence)
-                ? await appearanceIndex(rootNow(), rawChapters, cards, book.meta.targetChars)
-                : { last: new Map(), latestId: '' }
+              const cutoff = wanted ? findChapter(rawChapters, wanted) : null
+              if (wanted && !cutoff) { sendJson(res, 404, { error: `没有这一章「${wanted}」` }); return }
+              const upto = cutoff?.id ?? ''
+              const seen = await appearanceIndex(rootNow(), rawChapters, cards)
+              const appearanceCutoff = upto || seen.latestId
               sendJson(res, 200, {
                 characters: cards,
                 graph: characterGraph(cards, upto),
                 upto,
-                chapterIds: ids,
-                appearance: appearanceReport(seen.last, cards, upto || seen.latestId),
+                appearanceCutoff,
+                chapterIds: rawChapters.map(item => item.id),
+                appearance: appearanceReport(seen, cards, appearanceCutoff),
               })
               return
             }
@@ -5617,8 +5597,9 @@ export function apply(ctx, config) {
                 sendJson(res, 409, { error: board.matchIssue.message })
                 return
               }
-              const coverage = await beatsCoverage(rootNow(), meta.chapters)
-              const rhythm = await beatRhythm(rootNow(), meta.chapters)
+              const coverage = beatsCoverageFromSections(meta.chapters, board.sections)
+              const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
+              const rhythm = rhythmView(meta.chapters, board, outlineText)
               const castCards = await listCharacters(rootNow())
               const sectionView = (section, id = section.id) => {
                 const scenes = parseScenes(section.body, id)
@@ -5663,18 +5644,7 @@ export function apply(ctx, config) {
                 coverage,
                 issues: board.issues,
                 warnings: [...new Set([...(coverage.warnings ?? []), ...board.issues.filter(item => item.severity === 'warning').map(item => item.message)])],
-                rhythm: {
-                  payoff: rhythm.payoff,
-                  withPayoff: rhythm.withPayoff,
-                  withBeats: rhythm.withBeats,
-                  hooks: rhythm.hooks,
-                  turns: rhythm.turns,
-                  longestGap: rhythm.longestGap,
-                  currentGap: rhythm.currentGap,
-                  gapLimit: rhythm.gapLimit,
-                  budget: payoffBudget((await readText(path.join(rootNow(), OUTLINE_FILE))) ?? '')?.total ?? 0,
-                  perChapter: rhythm.perChapter.map(item => ({ id: item.id, payoff: item.payoff, hook: item.hook, turn: item.turn })),
-                },
+                rhythm,
               })
               return
             }
@@ -6052,6 +6022,7 @@ const REVIEW_EVIDENCE_RULES = [
 const SCENE_REVIEW_RULES = [
   '场景连续性钩子：先按全文顺序分场，再逐步还原人物与设备的位置、姿态、持物和状态。不得用未写出的拿取、移动、入水或防护步骤替原文圆场。',
   '每场用 scenes 记录连续的 startIndex/endIndex、layout（布局）、mechanism（异常—措施—去向—结果）、timeline（含移动、取物和对白的完整时间线）与 actions。关键动作逐条填写 index 及 actor/from/to/action/tools/prerequisites/result/timing/safety；同段多动作分别记录，转场承接上一场状态。纯静态段落允许空 actions，但布局与时间线需说明依据。',
+  '打脸后反应按同一个稳定 sceneId 复核。章纲无显式反应标签不等于正文缺反应；已用对白、动作或其他自然方式体现时，可在该 scenes 条目提交 reaction 的 verdict/detail/evidence/counterargument，并带回取包的 beatsHash。正文引文只能来自本场范围；conflict/uncertain 需在 rhythm 汇总及 observations 如实登记。字面线索仍保留并附本场判断，不由整章 recorded 推定确认，不为清除线索强添身体动作。',
   '追踪工具从哪里来、由谁拿取或交接、是否够得着；追踪湿衣、伤口、姿态变化的前因；核对先前危险禁令与后续接触行为，不能无依据忽然安全。',
   '核对救险或技术操作的主要因果链，说明每个辅助操作的必要作用、能量或物质的去向与既有设定依据。不要用术语、动作堆叠或巧合代替机制；不得为简化而改变已确认的设定。',
   '把所有移动、对白、拿取和操作放进同一时间窗口，区分谁在同时做什么，不把一息擅自换算成一秒。原稿有矛盾时先指出并修订；设定不足以确定修法时向作者澄清，不能编造前提后登记完成。',
@@ -6062,7 +6033,7 @@ const SCENE_REVIEW_RULES = [
 
 /** 写作约束与审稿钩子共用，避免只在改写后补救。 */
 
-const DEAI_WORKFLOW = '生成或改写前先核对 novel_context 内的 materialPreflight，或单独调用 novel_preflight({chapter})。区分剧情计划、表达约束和可能过时的备忘，计划原句不默认照抄；有分歧先核实意图，不擅自覆盖资料。审稿先调用 novel_deai_pack({chapter}) 阅读全文、资料及各维度 sourceRequirements。先查空间因果和物件状态，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,styleHash,checks,observations,timeBudgets,scenes,paragraphs}) 如实登记：checks 提交 verdict/detail/evidence/counterargument：六个维度每一项都要至少一条正文引文（段号 index ＋ 逐字 quote），并按 sourceRequirements 补引人物卡／文风卡／设定；observations 逐条区分 conflict、missing-basis、preference，无发现填 []。conflict 须比较同一对象、同一属性和可比较时间，填写 comparison 并引用至少两条证据；仅历史备忘与正文不一致先记缺失依据，偏好不阻塞。timeBudgets 提交明示时间窗口和串并行任务，区分明示、估算、未知，无窗口填 []；scenes 和 paragraphs 覆盖全文。工具核算记账、检查来源覆盖并回显完整引文和来源角色。已登记的矛盾与具体依据不足、明示超时或无效记账依据可阻塞定稿，不单凭估算或未知耗时阻塞，即使 checks 写 supported。需要修改时在已获授权范围内修订并重新取包。旧阻塞项转为通过填写 resolutions。最后运行 novel_check；正文、引用资料、来源覆盖要求或启用文风变化后旧记录失效。登记、计算和引用校验不认证动作可行或文章自然。'
+const DEAI_WORKFLOW = '生成或改写前先核对 novel_context 内的 materialPreflight，或单独调用 novel_preflight({chapter})。区分剧情计划、表达约束和可能过时的备忘，计划原句不默认照抄；有分歧先核实意图，不擅自覆盖资料。审稿先调用 novel_deai_pack({chapter}) 阅读全文、资料及各维度 sourceRequirements。先查空间因果和物件状态，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,styleHash,checks,observations,timeBudgets,scenes,paragraphs}) 如实登记：checks 提交 verdict/detail/evidence/counterargument：六个维度每一项都要至少一条正文引文（段号 index ＋ 逐字 quote），并按 sourceRequirements 补引人物卡／文风卡／设定；observations 逐条区分 conflict、missing-basis、preference，无发现填 []。conflict 须比较同一对象、同一属性和可比较时间，填写 comparison 并引用至少两条证据；仅历史备忘与正文不一致先记缺失依据，偏好不阻塞。timeBudgets 提交明示时间窗口和串并行任务，区分明示、估算、未知，无窗口填 []；scenes 和 paragraphs 覆盖全文；打脸场景可用 scenes[].reaction 单独登记自然反应判断，必须提交取包的 beatsHash，并引用同 sceneId 范围内正文。工具核算记账、检查来源覆盖并回显完整引文和来源角色。已登记的矛盾与具体依据不足、明示超时或无效记账依据可阻塞定稿，不单凭估算或未知耗时阻塞，即使 checks 写 supported。需要修改时在已获授权范围内修订并重新取包。旧阻塞项转为通过填写 resolutions。最后运行 novel_check；正文、引用资料、来源覆盖要求或启用文风变化后旧记录失效。登记、计算和引用校验不认证动作可行或文章自然。'
 
 const DEAI_REVIEW_ASPECTS = {
   continuity: '结合 scenes 动作链核对人物与设备位置、转场路线、工具来源、状态变化前因、技术因果和安全禁令，确认读者能连续还原现场，不能用脑补步骤消解矛盾。',
@@ -6071,6 +6042,18 @@ const DEAI_REVIEW_ASPECTS = {
   narration: '引用同类场景的锚点原文和本章段落，比较叙述距离、旁白声调、人物判断与反应怎样参与信息揭示。符合章纲限知视角只是叙述权限核对，还需说明是否迁移了样本的表达方式。检查参考专名、事件和独特原句混入，守住所需的解释和设定依据，证据不足时如实登记。',
   rhythm: '引用同类场景的锚点原文和本章段落，比较旁白句段怎样铺开和收短、对白在哪些时点加速、揭示前后怎样停顿。只有短问短答或没有套话不足以判为贴合。句长和标点偏差用于定位，结合现场压力判断。',
   facts: '核对事实、意图、因果、数字和信息点；尤其检查空间过渡、工具来源、动作前提和后果是否被缩写省略。区分已确认事实与原稿矛盾，修法不明先澄清，不编造补丁。',
+}
+
+function sceneReactionReviews(scenes, beatSection) {
+  const beatsById = new Map((beatSection?.scenes ?? []).map(scene => [scene.id, scene]))
+  const reviews = []
+  for (const scene of scenes ?? []) {
+    if (scene?.reaction === undefined) continue
+    const beatScene = beatsById.get(scene.sceneId)
+    if (!beatScene || !/爽点\s*[（(]\s*打脸/u.test(beatScene.raw)) throw new Error(`场景 ${scene.sceneId || '（缺少 ID）'} 没有可绑定的打脸爽点，不能登记逐场反应判断；未登记`)
+    reviews.push({ ...scene, beatHash: createHash('sha256').update(beatScene.raw).digest('hex') })
+  }
+  return reviews
 }
 
 /** 登记和失效检查共用当前全文段落覆盖，不能拿记录自己的长度证明完整。 */
@@ -6430,10 +6413,11 @@ async function deaiReviewState(root, chapter, text, meta) {
     || review.styleName !== activeStyleName(meta) || !hasCompleteReviewChecks(review.checks)
     || !Array.isArray(review.observations) || !Array.isArray(review.sources) || !review.sources.length) return pending
   const packed = extractDeaiPack(text, [])
-  const sceneIds = (await readBeats(root, chapter, meta.chapters)).section?.scenes.map(item => item.id) ?? []
+  const beatBoard = await readBeats(root, chapter, meta.chapters)
+  const sceneIds = beatBoard.section?.scenes.map(item => item.id) ?? []
   if (!hasCompleteParagraphReviews(review.paragraphs, packed.totalItems)
     || !hasCompleteSceneReviews(review.scenes, packed.totalItems, sceneIds)) return pending
-  let validationFindings, timingReports, preferenceNotes
+  let validationFindings, timingReports, preferenceNotes, sceneReactions = []
   try {
     if (review.styleName) {
       const stored = review.styleHash ?? review.sources.find(reference => reference.source === 'style' && reference.name === review.styleName)?.hash
@@ -6449,14 +6433,24 @@ async function deaiReviewState(root, chapter, text, meta) {
     if (JSON.stringify(coverage.requirements) !== JSON.stringify(review.sourceCoverage)) return pending
     const timing = calculateReviewTimeBudgets(review.timeBudgets, packed, review.checks, review.evidenceContexts ?? [])
     const observations = reviewObservations(review.observations, review.checks)
+    const reactions = sceneReactionReviews(review.scenes, beatBoard.section)
+    if (reactions.length) {
+      if (!Array.isArray(review.reactionBindings)) return pending
+      for (const scene of reactions) {
+        const binding = review.reactionBindings.find(item => item.sceneId === scene.sceneId)
+        if (!binding || binding.beatHash !== scene.beatHash || binding.startIndex !== scene.startIndex || binding.endIndex !== scene.endIndex) return pending
+      }
+      await validateReviewEvidence(root, chapter, packed, review.checks, reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference }))))
+    }
     validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
+    sceneReactions = reactions
     preferenceNotes = observations.notes
     timingReports = timing.reports
   } catch {
     return pending
   }
   const findings = sortReviewFindings([...reviewFindings(review.checks, review.observations), ...validationFindings])
-  return { status: findings.length ? 'blocked' : 'recorded', findings, checkVerdicts: Object.fromEntries(Object.entries(review.checks).map(([aspect, check]) => [aspect, check.verdict])), preferenceNotes, evidenceContexts: review.evidenceContexts, timingReports }
+  return { status: findings.length ? 'blocked' : 'recorded', findings, checkVerdicts: Object.fromEntries(Object.entries(review.checks).map(([aspect, check]) => [aspect, check.verdict])), preferenceNotes, evidenceContexts: review.evidenceContexts, timingReports, sceneReactions }
 }
 
 async function currentChapterStatus(root, chapter, text, meta) {

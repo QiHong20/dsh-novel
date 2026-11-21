@@ -34,6 +34,9 @@ const stageEditError = (message, code = BEAT_REQUEST_INVALID) => Object.assign(n
 
 export const PRESENTATION_RULES = '小说心理与登场原则：按关键决定、误解或认知转变安排心理材料，不设数量和密度配额，不在每句对白后解释。主配角均可有心理，但直接呈现必须遵守本场叙述视角；仅作者参考不写成可直接读取的内心。允许联想、短回忆、间接叙述，只有「保留心声原句」要求保留原句。重要人物首次正式登场应考虑体态、面容、衣着、声音等可辨认特征，融入观察和动作；暗处、伪装等可说明不描写原因。后续出场以唤起特征或变化为主，不用外貌篇幅代替人物重要性。计划不是已经向读者呈现的事实。'
 
+/** 读者已见的人物信息：`登场` 是本人出场，`呈现` 可能只是画像、转述外貌或旧物，不证明本人到场。 */
+export const PRESENTATION_KINDS = ['登场', '呈现']
+
 export function presentationChecks(scene, cards = []) {
   const items = []
   for (const role of scene.roles) {
@@ -221,10 +224,10 @@ export async function stageBook(root, chapters) {
 export function sceneState(book, scene) {
   return scene.cast.map(id => {
     const card = book.cards.find(c => c.id === id)
-    const eligible = book.records.filter(r => r.kind !== '呈现' && r.character === id && r.valid && scene.time !== null && r.time < scene.time)
+    const eligible = book.records.filter(r => !PRESENTATION_KINDS.includes(r.kind) && r.character === id && r.valid && scene.time !== null && r.time < scene.time)
     const replaced = new Set(eligible.map(r => r.supersedes).filter(Boolean))
     const history = eligible.filter(r => !replaced.has(r.id)).sort((a, b) => a.time - b.time)
-    const presented = book.records.filter(r => r.kind === '呈现' && r.character === id && r.valid &&
+    const presented = book.records.filter(r => PRESENTATION_KINDS.includes(r.kind) && r.character === id && r.valid &&
       book.scenes.findIndex(s => s.id === r.scene) < book.scenes.indexOf(scene))
     return { id, name: card?.name || id, role: card?.role || '', importance: card?.importance || '',
       history, presented, ...scene.roles.find(r => r.id === id),
@@ -242,7 +245,7 @@ export async function stageContext(root, chapters, chapter, sceneId) {
   const scopedDiagnostics = book.diagnostics.filter(d => d.global ||
     (d.chapter === chapter && (!sceneId || d.scene === sceneId)) ||
     (d.record && scenes.some(s => s.id === d.scene || (s.cast.includes(d.character) &&
-      (d.kind === '呈现'
+      (PRESENTATION_KINDS.includes(d.kind)
         ? chapters.findIndex(c => c.id === d.chapter) <= chapters.findIndex(c => c.id === s.chapter)
         : s.time !== null && (d.time == null || d.time < s.time))))))
   const warnings = scopedDiagnostics.map(d => d.detail)
@@ -350,13 +353,16 @@ async function updateUnlocked(root, chapters, args) {
     const paragraph = extractIndexedParagraphs(text).find(item => item.index === args.evidenceIndex)
     if (!args.evidence?.trim() || !paragraph?.text.includes(args.evidence)) throw historyError(`依据必须是该章正文第 ${args.evidenceIndex} 段的逐字引文`)
     if (!args.content?.trim() || !args.source?.trim()) throw historyError('必须提供认知内容及信息来源')
-    if (!['已知', '未知', '误信', '怀疑', '关系', '状态', '呈现'].includes(args.kind)) throw historyError('认知类型无效')
+    if (!['已知', '未知', '误信', '怀疑', '关系', '状态', ...PRESENTATION_KINDS].includes(args.kind)) throw historyError('认知类型无效')
+    // 本人登场会让欠场统计清零；必须确认是本人出场，不能拿画像、转述外貌或旧物冒充。
+    if (args.kind === '登场' && args.onStage !== true) throw historyError('kind=登场 只记录本人实际出场，必须提交 onStage: true；只写到人物外貌或转述时请用 kind=呈现')
     if (args.target && !book.cards.some(c => c.id === args.target)) throw historyError('关系目标人物不存在')
     if (args.kind === '关系' && !args.target) throw historyError('关系变化必须指定目标人物 target')
     if (args.event && !book.events.has(args.event)) throw historyError('事件节点不存在')
     if (args.supersedes && !book.records.some(r => r.id === args.supersedes && r.character === character && r.valid && r.time < scene.time)) throw historyError('被修正记录必须是本人物此前的有效记录')
     record = { recordVersion: 2, id: randomUUID(), character, scene: scene.id, chapter: scene.chapter, time: scene.time,
       content: args.content, kind: args.kind, source: args.source, evidence: args.evidence, evidenceIndex: args.evidenceIndex,
+      ...(args.kind === '登场' ? { onStage: true } : {}),
       target: args.target || '', event: args.event || '', supersedes: args.supersedes || '',
       status: 'candidate', sourceHash: hash(text), sceneHash: hash(scene.raw) }
     const binding = resolveHistorySceneBinding(book.chapters, book.scenes, book.sources, record)
@@ -408,6 +414,7 @@ export const historyParameters = {
     ...Object.fromEntries(['action', 'character', 'scene', 'id', 'kind', 'content', 'source', 'evidence', 'target', 'event', 'supersedes'].map(key => [key,
       key === 'action' ? { type: 'string', enum: ['inspect', 'propose', 'confirm', 'revoke'] } : { type: 'string' }])),
     evidenceIndex: { type: 'integer', minimum: 1, description: 'propose 必填；novel_deai_pack 返回的正文段号' },
+    onStage: { type: 'boolean', description: 'kind=登场 时必填 true：确认是人物本人在当前场景实际出场，而不是画像、转述外貌或旧物' },
   },
 }
 

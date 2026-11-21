@@ -68,7 +68,7 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 | `novel_character_history` | 人物历史：`propose` 使用 `novel_deai_pack` 的 `evidenceIndex` 与逐字引文绑定实际场景；无法可靠归属时保持待核对，`confirm` 后才会从来源场景结束后继承。 |
 | `novel_ledger` | 当前状态快照：查询或覆盖资产、境界、道具、伤势、位置和时间。更新同名项目会覆盖旧值，不保存历史版本；回改旧章须查前文或已有证据。 |
 | `novel_card` | 人物卡：无参列清单 / 给 `name` 读 / 再加 `content` 写 |
-| `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 参考篇幅统计与偏短提示（超出不报错） / **章纲场次字面匹配候选（`beats-gap`，非阻塞）** / **这一章没有爽点（`no-payoff`，会带「已连续 N 章没有」）/ 章末没有钩子（`no-hook`）** |
+| `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 参考篇幅统计与偏短提示（超出不报错） / **章纲场次字面匹配候选（`beats-gap`，非阻塞）** / **本章爽点状态与共享断档阈值（达到阈值才报 `no-payoff`）/ 章末没有钩子（`no-hook`）**；打脸场未写显式反应标签只作同场景非阻塞线索，可用逐场语义证据标注正文已自然体现。 |
 | `novel_beats` | 章纲：无参看全书覆盖 / 给 `chapter` 读这一章的拍摄清单 / 给 `content` 覆盖写（只动这一节） |
 | `novel_events` | 事件线：无参看全书事件线与推进情况 / 给 `line` 读那条线（含覆盖章、已写数）/ 给 `line` + `content` 整段替换这一条线（别的线不动） |
 | `novel_threads` | 伏笔：无参看清单（未回收 / 已回收 / 到期未收）/ 给 `thread` + `planted`/`payoff`/`status` 登记或改状态 |
@@ -160,7 +160,7 @@ curl.exe -s "http://127.0.0.1:18080/novel-api/state"
 
 | 看哪里 | 显示什么 |
 |---|---|
-| 章纲页顶部 | `爽点 12 / 计划 15 · 有爽点的章 8/12 · 钩子 11 章 · 最长断档 3 章`，断档 ≥2 章时变红 |
+| 章纲页顶部 | `爽点 12 / 计划 15 · 有爽点的章 8/12 · 钩子 11 章 · 最长断档 3 章 · 阈值 3`；当前断档达到配置阈值才显示告警，各章另显示同口径的断档提示 |
 | 章纲页每章 | `爽×2 钩` 徽标 |
 | 输入框上方状态条 | `· ⚠ 断爽 3 章` |
 | `novel_status` | 全书节奏一行 + 断档提醒 |
@@ -241,13 +241,13 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 
 审稿有效记录的状态使用 `recorded`，不再使用容易误读为通过的 `reviewed`；`certifiesSemantics` 固定为 false。旧记录在读取时按当前规则重算状态，不需手工改 book.json。时间报告标记 `scope: "arithmetic-only"` 和 `feasibility: "not-automatically-verified"`：即使在正文中补齐三、四、两息，使 3+4+2=9，也只说明记账一致，不能自动认证动作可行。
 
-`style-drift`、`no-interior`、`payoff-no-reaction` 在 `novel_check` 中归入 `heuristicNotes`，只作非阻塞提示，不导致检查失败。反应检测使用当前段及后两段全文，只有展示样例被截短；0% 代表词表未命中，不代表人物缺少自然反应。不要为了清除提示添加发抖、喉咙发紧等动作，或把句号机械改成逗号。作者只要求检查时保持正文不变。
+`style-drift`、`no-interior`、`payoff-no-reaction` 在 `novel_check` 中归入 `heuristicNotes`，只作非阻塞提示，不导致检查失败。正文 `payoff-no-reaction` 词表检测使用当前段及后两段全文，只有展示样例被截短；0% 代表词表未命中，不代表人物缺少自然反应。章纲的 `no-reaction-on-payoff` 另按当前结构化场景块检查，旧逐行格式只在下一条 `- 场景：` 之前查；下一场的反应标签不抵扣本场。它同样是非阻塞字面线索，不要求补标签或身体动作。若本场已通过对白、动作或其他自然方式体现，可在审稿 `scenes[]` 的同一 `sceneId` 中提交可选 `reaction: { verdict, detail, evidence, counterargument }`，并提交当前包的 `beatsHash`；正文引文必须位于本场范围，错场、旧章纲或非逐字证据会拒绝。`supported` 的当前有效判断会附在原线索中，仍不自动认证语义；`conflict/uncertain` 须在 rhythm 与 observations 如实登记，旧阻塞消失仍需 resolutions。正文、章纲、分场或引用变化后确认标注失效，旧记录未填 reaction 不会被推定已确认。不要为了清除提示添加发抖、喉咙发紧等动作，或把句号机械改成逗号。作者只要求检查时保持正文不变。
 
 ## 节奏与戏份：规格写在数据里，不是写死在代码里
 
-- **爽点断档阈值**取 `outline.md` 里的「三章一爽点」/「每 3 章至少一次爽点」，中文数字也认；读不到才退回默认 2。状态条的「断爽 N 章」、章纲页红字、`novel_check` 的 `no-payoff` 都按这个数。
-- **戏份承诺**写在人物卡：`- 戏份：每 8 章至少出场一次`。插件按正文统计出场（含卡里的「旧称」），超期报 `absent-role`，人物页挂「欠场」徽标，`/novel-api/characters` 的 `appearance` 字段带 `{last, gap, cadence, due}`。
-- 出场统计按「书的内容指纹」缓存，轮询不会把几十章反复读一遍；只看「有正文的章」，占位梗概不算出场。
+- **爽点断档阈值**取 `outline.md` 里的「三章一爽点」/「每 3 章至少一次爽点」，中文数字也认；读不到才退回默认 2。状态条、章纲页、全书审计和 `novel_check` 共用同一算法，按书目顺序只计有章纲的章，当前章计入断档。每三章一爽点时，第一、二章保留 `hasPayoff: false` 与 gap 1、2，不报 `no-payoff`；第三章 gap 3 才提示。共享结果含逐章 `gap/breached` 与历史阈值命中 `breaches`；后续爽点不会抹掉审计中的既有断档位置。章纲匹配歧义视为未知边界，不并入前后断档计数，并明确标注统计不完整。
+- **戏份承诺**写在人物卡：`- 戏份：每 8 章至少出场一次`。已写章结构化场景的 `- 出场：稳定人物ID` 只作**计划**，不能单独清零欠场；核实出场只认当前正文仍有效的已确认 **`登场`** 人物历史（绑定正文哈希、章纲场景哈希与稳定 `sceneId`）。`kind: "登场"` 必须同时提交 `onStage: true`，表示人物本人在场；`kind: "呈现"` 只记录读者看到的外貌或其他特征，画像、他人口述外貌、旧物、认知转述和章纲安排都不证明本人登场。`- 提及`、正文姓名或当前别名字面命中只作候选。统计先按目标章截断，再按实际已写章数计算 gap，未来章节不会抵扣旧章当时的欠场；空章和占位章不计，起算章仍取人物卡第一条状态。人物页可选截至章，与 `novel_check` 和审计使用同一报告。
+- `appearance` 保留 `{last, gap, cadence, due}`，新增 `id/cutoff/since/basis/plannedLast/plannedBasis/candidateLast/candidateBasis/identityStatus` 区分核实出场、章纲计划与字面候选。无核实依据只称“截至目标章未核实”，不声称正文从未提到。缓存指纹覆盖完整正文、审稿分场引用、章纲、人物卡和书目顺序，等长改稿、增删别名或确认记录失效都会重算；轮询仍读取内容校验指纹，只缓存解析与匹配结果，不另存出场台账。
 ## 右栏只有一个 tab
 
 平台 tab 条每个 chip 最小 80px、不换行、手机上还滑不动，十页放不下（试过合并、试过「更多」页、试过改 CSS 让条子能横滑，都被裁）。现在是**一格「小说」+ 页内九个分区**，分区按钮在页内自动换行，小屏也点得到。
@@ -343,7 +343,7 @@ novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<�
 
 局部编辑可在界面完成，或调用 `novel_stage_edit({chapter,scene,character,baseHash,fields})`。`baseHash` 来自 `novel_context` 的 `stage.baseHash`；不提供 scene 时编辑章节目标/收尾，提供 scene 而不提供 character 时编辑场景。字段值为单行文本，空字符串删除该字段；保留未知字段与其他人物。版本冲突不覆盖，草稿保留在当前浏览器会话，重新核对后保存。
 
-实际外貌呈现可通过 `novel_character_history` 的 `kind: "呈现"` 提交逐字正文依据并确认。它按章节阅读顺序供后文参考，不进入人物认知；来源变更后仍需复核。
+实际外貌呈现可通过 `novel_character_history` 的 `kind: "呈现"` 提交逐字正文依据并确认。它按章节阅读顺序供后文参考，不进入人物认知，也不证明人物本人登场（画像、转述外貌同样可以是呈现）；来源变更后仍需复核。人物本人在场时另用 `kind: "登场"` 并提交 `onStage: true`，欠场统计只认后者。
 
 验证：`node --test tests/*.test.mjs`。可选浏览器验收脚本 `tests/stage-v2-browser.mjs` 使用外部目录安装的 React、esbuild、Playwright，不增加插件运行时依赖；用法见脚本注释。
 
