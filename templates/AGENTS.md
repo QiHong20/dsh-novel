@@ -9,7 +9,7 @@ book.json          章节清单（真相来源：章节 id、标题、文件、�
 outline.md         整本大纲（一句话 / 主线 / 约束）
 beats.md           章纲（每章一节，写正文前先看它）
 threads.md         伏笔表（人工维护的 Markdown 表格）
-ledger.md          动态状态台账（钱/境界/道具/伤势/时间）
+ledger.md          当前状态快照（钱/境界/道具/伤势/时间；不保存历史版本）
 characters/        人物卡，一人一个 `名字.md`
 settings/          设定，一个条目一个 `条目名.md`
 chapters/0001.md   正文，一章一个文件
@@ -30,7 +30,7 @@ chapters/0001.md   正文，一章一个文件
 | 「加个人物」「这个人改成…」 | `novel_card`（一张一个文件，含 `## 关系` / `## 状态`） |
 | 「记一条设定」 | `novel_setting`（一条一个文件，首行 `- 分类：…`） |
 | 「埋个伏笔」「这个伏笔收了」 | `novel_threads`（不要手改 `threads.md`） |
-| 「查一下现在有多少钱/什么境界/东西放哪了」「更新一下状态」 | `novel_ledger`（不要手改 `ledger.md`） |
+| 「查一下现在有多少钱/什么境界/东西放哪了」「更新一下状态」 | `novel_ledger`（不要手改 `ledger.md`；它只保留当前值，旧章状态查前文或已有证据） |
 | 「列个章纲」「这章要有哪几场」「改一下章纲」 | 新增或整章重写用 `novel_beats`（必须写 `### 场景 英文ID：标题` + `- 时序：` + `- 出场：` + `#### 人物 ID`）；只改已有章纲的单个字段用 `novel_stage_edit` |
 | 「大纲看看」/「改大纲」 | `novel_outline` |
 | 「这版不如上一版」/「回到刚才那稿」 | `novel_history` 看时间线 → `novel_restore` |
@@ -189,15 +189,17 @@ chapters/0001.md   正文，一章一个文件
 - 书名/题材/目标字数用 `novel_book`，那不算设定。
 
 1. `novel_status` —— 现在写到哪、目标多少字、缺什么（设定 0 条时会当场提醒）
-2. `novel_context({ chapter })` —— 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 未回收伏笔 + 相关设定」的装配包
+2. `novel_context({ chapter })` —— 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 台账适用范围 + 未回收伏笔 + 相关设定」的装配包。`ready: true` 才表示全部 `[必选]` 文风已进入提示；旧章出现 `ledgerMissing` 时按提示查前文，不拿当前台账倒填。
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
 4. `novel_write({ chapter, content })` —— 落盘。目标字数仅供参考，超出不删减、不缩写、不提前收尾；先把当前场景的动作前提、空间过渡和因果后果写清。是否分章由情节自然节点决定，确需顺延尚未开始的后续场景时可传 `carryOver: true`，不能拆散当前动作链。
 5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。
-6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。按场景提交 `scenes`，用连续的 `startIndex/endIndex` 覆盖全部段落，每场记录 `layout`、`mechanism`、`timeline`、`actions`。每个关键动作记录段号 `index` 与 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对人物位置、通路、工具来源、状态变化前因、技术因果、耗时及危险禁令；同段多个关键动作分条列出。静态场景可用空动作数组，但须说明依据；不得脑补缺失步骤后登记完成。再填写 `checks` 的 `continuity`（连续性）、`timing`（时间压力）、`voice`（角色声口）、`narration`（设定投放、细节与解释）、`rhythm`（句段与冲突）、`facts`（事实与信息完整性），用 `novel_deai_review({ chapter, baseHash, checks, observations, timeBudgets, scenes, paragraphs })` 登记（启用文风时同时提交取包返回的 `styleHash`，不得沿用换卡前的取包结果）。每项 checks 提交 `{ verdict, detail, evidence, counterargument }`：verdict 取 supported/conflict/uncertain/not-applicable，至少一条 `{ source: "chapter", index, quote }` 正文逐字引文，确认矛盾至少两条不同引文；引用人物卡、设定、文风时注明 source 与 name，并先读取对应资料。说明最可能推翻结论的证据或缺失依据，不编造距离、耗时、器件结构或后文影响。发现矛盾和依据不足也应如实登记，工具保存为 blocked；记录完整不等于通过。旧阻塞项转为通过时另填对应 resolutions，说明修复依据或更正原因。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文、引用资料或启用文风变化后旧复核失效，未复核或仍有阻塞项不能标记 `final`。`recorded` 只开放定稿资格，不自动把草稿晋级；作者明确要定稿且 `novel_check` 仍显示当前记录有效时，把当前完整正文原样作为 `content`，用 `novel_write({ chapter, content, status: "final" })` 显式定稿。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
+6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。按场景提交 `scenes`，用连续的 `startIndex/endIndex` 覆盖全部段落；本章有结构化章纲场景时，每场必须用 `sceneId` 声明该段对应的稳定场景 ID，不能按数组下标假定正文顺序等于章纲顺序，每个场景只能认领一个正文范围。每场记录 `layout`、`mechanism`、`timeline`、`actions`。每个关键动作记录段号 `index` 与 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对人物位置、通路、工具来源、状态变化前因、技术因果、耗时及危险禁令；同段多个关键动作分条列出。静态场景可用空动作数组，但须说明依据；不得脑补缺失步骤后登记完成。再填写 `checks` 的 `continuity`（连续性）、`timing`（时间压力）、`voice`（角色声口）、`narration`（设定投放、细节与解释）、`rhythm`（句段与冲突）、`facts`（事实与信息完整性），用 `novel_deai_review({ chapter, baseHash, checks, observations, timeBudgets, scenes, paragraphs })` 登记（启用文风时同时提交取包返回的 `styleHash`，不得沿用换卡前的取包结果）。每项 checks 提交 `{ verdict, detail, evidence, counterargument }`：verdict 取 supported/conflict/uncertain/not-applicable，至少一条 `{ source: "chapter", index, quote }` 正文逐字引文，确认矛盾至少两条不同引文；引用人物卡、设定、文风时注明 source 与 name，并先读取对应资料。说明最可能推翻结论的证据或缺失依据，不编造距离、耗时、器件结构或后文影响。发现矛盾和依据不足也应如实登记，工具保存为 blocked；记录完整不等于通过。旧阻塞项转为通过时另填对应 resolutions，说明修复依据或更正原因。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文、引用资料或启用文风变化后旧复核失效，未复核或仍有阻塞项不能标记 `final`。`recorded` 只开放定稿资格，不自动把草稿晋级；作者明确要定稿且 `novel_check` 仍显示当前记录有效时，把当前完整正文原样作为 `content`，用 `novel_write({ chapter, content, status: "final" })` 显式定稿。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。
    - `novel_write` 写完也会自动跑一次节奏比对，返回里有警告就别装没看见。
    - 右栏章节列表里挂了「漂」红标的章，就是节奏已经偏离文风卡的章。
 7. 有新人物就 `novel_card`，有新设定就 `novel_setting`，有新伏笔就 `novel_threads`，资产/境界/道具去向/伤势/时间变动就用 `novel_ledger` 更新 `ledger.md`
+
+`ledger.md` 只保存人工维护的当前快照，更新同名项目会覆盖旧值。回改旧章时当前值不会装配，`ledgerMissing` 明确列出历史缺项但不阻断其他材料；须查目标章及其前文、人物历史或已有逐字证据，仍无依据时标为未知。不得为了回改旧章把旧值覆盖回当前台账。正常向前续写可读取当前状态；改写最新章时当前台账只作终态参考，不当作本章开场状态。
 
 生成或改写前核对 `novel_context` 内的 `materialPreflight`，也可调用只读的 `novel_preflight({ chapter })`。章纲与文风的字面命中只是候选，逐项核对语义约束。正文是当前表述，设定是声明规则，人物卡是人物资料，文风是表达约束，章纲/大纲/事件线是计划，threads 是计划与可能过时的历史备忘。来源不同不自动证明谁错，不擅自覆盖资料；章纲内心原句默认不照抄，保留意图与情绪按文风表达。上下文预算不够时增加装配预算或继续读取资料，不缩写正文。
 
@@ -242,7 +244,7 @@ chapters/0001.md   正文，一章一个文件
 - 起卡：`novel_style({ clone: true, source })` 由当前会话模型提炼有证据的规则，生成待校准卡，保存参考原文并默认启用。只分析用 `novel_style({ source })` 或 `novel_style({ text })`。样本留档在 `styles/<名字>.sample.md`，右栏可查看开头。
 - 校准：先用 `novel_style({ name })` 读全卡。对照多段锚点提炼视角权限、叙述距离、句法用词、对白声口、旁白分寸、描写和转场。每条候选写法附逐字引文与位置，证据不足时标待确认。原文很长时分段读取并核对跨段一致性。
 - 试写：选同一新场景写约 500–800 字，可与基准版本并列。剧情、人物和设定以当前作品为准，勿移用样本的人名、事件或独特原句。只在对话中展示试写，经作者确认后才把长期偏好写回文风卡，局部意见留在本次。
-- 写卡：结构见 `templates/style-card.md`。`novel_style({ name, content })` 保存，`novel_style({ name, active: true })` 启用。锚点保留连续原文，标题可加【通用】【对白】【动作】【心理】【过场】标签。统计观察用于对照，不设句长或对白配额。
+- 写卡：结构见 `templates/style-card.md`。`novel_style({ name, content })` 保存，`novel_style({ name, active: true })` 启用。锚点保留连续原文，标题可加【通用】【对白】【动作】【心理】【过场】标签。统计观察用于对照，不设句长或对白配额。列表项开头的 `[必选]` 属于最低装配预算；预算不足会返回 `missingRequired` 和 `minimumBudget`，不得忽略后继续写。
 - 复核：`## 禁忌` 一行一项，用「禁用词：」或「整句：」声明字面约束。`## 少用词` 仅提示，`## 语义禁忌` 由会话助手读正文和锚点核对。句长、标点提示需结合场景核实，再给出有原文依据的局部修订建议。
 
 ## 节奏与戏份：两个「承诺」的写法
@@ -314,8 +316,8 @@ chapters/0001.md   正文，一章一个文件
 2. 章纲每章仍为 `## 0001 标题`；每场为 `### 场景 scene-id：标题`，必填 `- 时序：10`、`- 出场：hero、heroine`；记录故事时间、地点、视角、冲突、具体事件 ID。时序是故事先后顺序的整数，不是章号；倒叙用较小值，建议预留间隔。
 3. 每位出场者用 `#### 人物 hero` 块，写已知/未知/误信/怀疑及来源、目标、关系与情绪、表达意图、触发、计划变化。仅被提及者写入 `- 提及：ID`，不算知情或出场。
 4. 写前调用 `novel_context({chapter:"0001",scene:"scene-id"})`；认知只继承更早时序、已确认且来源有效的历史。本场变化在触发后才能用于对白。未记录不代表明确未知。
-5. 写后读正文，逐场提取实际变化，调用 `novel_character_history({action:"propose",character:"hero",scene:"scene-id",kind:"已知",content:"认知内容",source:"亲历/转述等信息来源",evidence:"正文逐字引文"})`。关系变化 kind 为 `关系`，另给 `target` 人物 ID；可给具体事件 `event`，纠正旧认知用 `supersedes` 记录 ID。
-6. 候选核对实际含义后，经作者确认或已授权的核对流程调用 `confirm`（character+id）；不接受的候选用 `revoke`。历史落盘 `character-history/人物ID.md`。正文或场景变化使旧记录待复核，必须重新提取；不把章纲计划自动确认。
+5. 写后先用 `novel_deai_pack` 取得非空正文段号，并在 `novel_deai_review.scenes` 中按正文顺序连续分场；本章有结构化章纲时每场用 `sceneId` 声明对应的稳定场景 ID。逐场提取实际变化时调用 `novel_character_history({action:"propose",character:"hero",scene:"scene-id",kind:"已知",content:"认知内容",source:"亲历/转述等信息来源",evidenceIndex:7,evidence:"第 7 段中的正文逐字引文"})`。关系变化 kind 为 `关系`，另给 `target` 人物 ID；可给具体事件 `event`，纠正旧认知用 `supersedes` 记录 ID。
+6. 候选只有在正文哈希、逐字段号、显式 sceneId、实际分场范围和章纲场景都一致时才返回 `binding.status: "bound"`；无法可靠归属时保持待核对。核对实际含义后，经作者确认或已授权流程调用 `confirm`（character+id）；不接受的候选用 `revoke`。历史落盘 `character-history/人物ID.md`。正文、分场或章纲场景变化会使旧记录待复核，必须重新提取；不把章纲计划自动确认。
 7. 整场顺延用 `novel_move_scene({scene:"scene-id",chapter:"0002"})`，整块保留人物约束；不用旧的逐行 carryOver 拆分结构化场景。
 8. 同场需要明确先后获得信息时，在人物块写清触发点；若需要在中途保存可继承状态，把该场拆成两个稳定场景 ID。当前确认记录的生效点为场景结束。
 
@@ -328,4 +330,4 @@ chapters/0001.md   正文，一章一个文件
 
 局部修改使用 `novel_stage_edit({chapter,scene,character,baseHash,fields})`，baseHash 取本次 novel_context 的 stage.baseHash；fields 为要修改的字段与单行值，空值删除字段。仅改章目标/收尾时省略 scene 和 character；仅改场景时省略 character。版本冲突后重新读取，不能盲目重试覆盖。
 
-外貌或其他呈现写入正文后，可用人物历史 `kind: "呈现"` 提交逐字引文，再按已授权的核对流程确认。读者已见的特征按章节阅读顺序继承，不等同于人物获知信息。表现安排的语义核对清单不是机器证明未落实，不为清空清单而堆心理或外貌描写。
+外貌或其他呈现写入正文后，可用人物历史 `kind: "呈现"` 连同 `evidenceIndex` 提交对应段的逐字引文，再按已授权的核对流程确认。读者已见的特征按章节阅读顺序继承，不等同于人物获知信息。表现安排的语义核对清单不是机器证明未落实，不为清空清单而堆心理或外貌描写。

@@ -64,7 +64,9 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 | `novel_read` | 读某一章正文 |
 | `novel_write` | 写正文（`mode: append` 默认 / `replace`，可带 `status`；省略 `chapter` 自动建下一章并登记进 `book.json`） |
 | `novel_outline` | 读 / 写 `outline.md` |
-| `novel_context` | **续写前的标准动作**：一次拿到本章大纲 + 上一章末 + 出场人物卡 + 该惦记的伏笔（续写上下文默认最多 5000 Unicode 字符，不限制正文长度） |
+| `novel_context` | **续写前的标准动作**：一次拿到本章章纲、上章末、出场人物、台账适用范围、伏笔与文风。续写默认预算 60000、改写 80000 Unicode 字符，最多 200000；不限制正文长度。`ready: true` 保证全部 `[必选]` 文风规则已装配；旧章不会装入当前台账值。 |
+| `novel_character_history` | 人物历史：`propose` 使用 `novel_deai_pack` 的 `evidenceIndex` 与逐字引文绑定实际场景；无法可靠归属时保持待核对，`confirm` 后才会从来源场景结束后继承。 |
+| `novel_ledger` | 当前状态快照：查询或覆盖资产、境界、道具、伤势、位置和时间。更新同名项目会覆盖旧值，不保存历史版本；回改旧章须查前文或已有证据。 |
 | `novel_card` | 人物卡：无参列清单 / 给 `name` 读 / 再加 `content` 写 |
 | `novel_check` | 写完自检（只报告不改）：旧称残留 / 未登记说话人 / 重复句 / 半角标点 / 参考篇幅统计与偏短提示（超出不报错） / **章纲场次字面匹配候选（`beats-gap`，非阻塞）** / **这一章没有爽点（`no-payoff`，会带「已连续 N 章没有」）/ 章末没有钩子（`no-hook`）** |
 | `novel_beats` | 章纲：无参看全书覆盖 / 给 `chapter` 读这一章的拍摄清单 / 给 `content` 覆盖写（只动这一节） |
@@ -268,9 +270,9 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 
 ## 文风上下文装配（2026-11-16）
 
-- [x] 顶部视角与叙述权限优先注入；规则支持 `[必选]` 标记，不再只取每节前两条。
-- [x] 按完整条目选择规则、锚点与正反例；预算不足时不截断句子。
-- [x] `novel_context` 的 `style` 增加 `included`、`omitted`、`budget`、`used`；省略项带原因，并在文本结果中展示。文风额度按含空白及标题的 Unicode 字符计，总上下文预算改造仍见 `doc/优化规划.md` 第 3 项。
+- [x] 顶部视角与叙述权限优先注入；列表项开头的 `[必选]` 是硬约束，会进入总上下文最低预算，不受文风软份额静默裁剪。
+- [x] 按完整条目选择规则、锚点与正反例；预算不足时不截断。条目在重排或省略后重新附上所属标题，「反例」「少用词」「语义禁忌」不会失去分类。
+- [x] `novel_context` 返回 `requiredItems`、`missingRequired`、`minimumBudget` 与 `budgetUnit`；`ready: true` 时所有 `[必选]` 均在最终提示中。可选锚点仍整段纳入或整段省略。文风与总预算均按含空白及标题的 Unicode 字符计，不是 token。
 
 验证：`node --test tests/style-context.test.mjs`；`node --check index.js`。宿主联调及真实生成效果尚未验证。
 
@@ -310,8 +312,8 @@ novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<�
 2. 章纲每章仍为 `## 0001 标题`；每场为 `### 场景 scene-id：标题`，必填 `- 时序：10`、`- 出场：hero、heroine`；记录故事时间、地点、视角、冲突、具体事件 ID。时序是故事先后顺序的整数，不是章号；倒叙用较小值，建议预留间隔。
 3. 每位出场者用 `#### 人物 hero` 块，写已知/未知/误信/怀疑及来源、目标、关系与情绪、表达意图、触发、计划变化。仅被提及者写入 `- 提及：ID`，不算知情或出场。
 4. 写前调用 `novel_context({chapter:"0001",scene:"scene-id"})`；认知只继承更早时序、已确认且来源有效的历史。本场变化在触发后才能用于对白。未记录不代表明确未知。
-5. 写后读正文，逐场提取实际变化，调用 `novel_character_history({action:"propose",character:"hero",scene:"scene-id",kind:"已知",content:"认知内容",source:"亲历/转述等信息来源",evidence:"正文逐字引文"})`。关系变化 kind 为 `关系`，另给 `target` 人物 ID；可给具体事件 `event`，纠正旧认知用 `supersedes` 记录 ID。
-6. 候选核对实际含义后，经作者确认或已授权的核对流程调用 `confirm`（character+id）；不接受的候选用 `revoke`。历史落盘 `character-history/人物ID.md`。正文或场景变化使旧记录待复核，必须重新提取；不把章纲计划自动确认。
+5. 写后先用 `novel_deai_pack` 取得非空正文段号，并在 `novel_deai_review.scenes` 中按正文顺序连续分场；本章有结构化章纲时每场用 `sceneId` 声明对应的稳定场景 ID。逐场提取实际变化时调用 `novel_character_history({action:"propose",character:"hero",scene:"scene-id",kind:"已知",content:"认知内容",source:"亲历/转述等信息来源",evidenceIndex:7,evidence:"第 7 段中的正文逐字引文"})`。关系变化 kind 为 `关系`，另给 `target` 人物 ID；可给具体事件 `event`，纠正旧认知用 `supersedes` 记录 ID。
+6. 候选只有在正文哈希、逐字段号、显式 sceneId、实际分场范围和章纲场景都一致时才返回 `binding.status: "bound"`；无法可靠归属时保持待核对。核对实际含义后，经作者确认或已授权流程调用 `confirm`（character+id）；不接受的候选用 `revoke`。历史落盘 `character-history/人物ID.md`。正文、分场或章纲场景变化会使旧记录待复核，必须重新提取；不把章纲计划自动确认。
 7. 整场顺延用 `novel_move_scene({scene:"scene-id",chapter:"0002"})`，整块保留人物约束；不用旧的逐行 carryOver 拆分结构化场景。
 8. 同场需要明确先后获得信息时，在人物块写清触发点；若需要在中途保存可继承状态，把该场拆成两个稳定场景 ID。当前确认记录的生效点为场景结束。
 

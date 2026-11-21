@@ -2091,17 +2091,13 @@ window.__ModuleLoader__.load({
     }
 
     function BeatEvidence({ record }) {
-      const [text, setText] = useState('')
-      async function locate() {
-        try {
-          const value = await getJson(`${API}/chapter?id=${encodeURIComponent(record.chapter)}`)
-          const at = (value.content || '').indexOf(record.evidence)
-          setText(at < 0 ? '原文已变化，找不到引文。' : value.content.slice(Math.max(0, at - 120), at) + '【' + record.evidence + '】' + value.content.slice(at + record.evidence.length, at + record.evidence.length + 120))
-        } catch (e) { setText(e.message) }
-      }
-      return h('div', null, h('blockquote', null, record.evidence),
-        h('button', { className: 'nvl-ask-btn', onClick: locate }, `查看依据 ${record.chapter}/${record.scene}`),
-        text ? h('p', { style: { whiteSpace: 'pre-wrap' } }, text) : null)
+      const binding = record.binding || { status: 'pending', reason: '缺少正文场景定位' }
+      return h('div', null,
+        h('blockquote', null, record.evidence),
+        h('p', { className: binding.status === 'bound' ? 'nvl-hint' : 'nvl-err' }, binding.status === 'bound'
+          ? `依据已绑定 ${record.chapter}/${binding.scene || record.scene} 第 ${binding.evidenceIndex} 段（场景范围 ${binding.startIndex}–${binding.endIndex}）`
+          : `依据待核对：${binding.reason || '无法可靠定位实际场景'}`),
+        record.evidenceContext ? h('p', { style: { whiteSpace: 'pre-wrap' } }, record.evidenceContext) : null)
     }
 
     function BeatDetail({ route, section, sectionHash, fields, onNavigate, onBack, onReload }) {
@@ -2126,9 +2122,9 @@ window.__ModuleLoader__.load({
         catch (e) { setNotice(e.message) } finally { setBusy(false) }
       }
       const recordView = record => h('div', { key: record.id, className: 'nvl-beat-sec' },
-        h('strong', null, `${names[record.character] || record.character} · ${record.kind} · ${record.status === 'confirmed' && !record.valid ? '待复核' : record.status}`),
+        h('strong', null, `${names[record.character] || record.character} · ${record.kind} · ${record.status === 'confirmed' && !record.valid ? '待复核' : record.status === 'candidate' && record.binding?.status !== 'bound' ? '待绑定' : record.status}`),
         h('p', null, record.content), h('p', null, `信息来源：${record.source}`), h(BeatEvidence, { record }),
-        record.status === 'candidate' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'confirm') }, '已核对正文，确认') : null,
+        record.status === 'candidate' && record.binding?.status === 'bound' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'confirm') }, '已核对正文与场景，确认') : null,
         record.status !== 'revoked' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'revoke') }, '撤销') : null)
       let body
       if (route.tab === 'raw') body = sectionHash
@@ -2220,6 +2216,7 @@ window.__ModuleLoader__.load({
       const current = state?.key === key ? state : null
       const value = current?.value
       const ready = Boolean(value?.ready && value.text)
+      const retryBudget = Math.min(200000, Math.max(300, Number(value?.minimumBudget) || 0))
       const report = (text, ok = true) => setNotice({ key, text, ok })
       const copy = async () => {
         if (!ready || session !== currentSessionId) return
@@ -2270,9 +2267,11 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'nvl-primary', onClick: () => void send() }, '放入主对话'),
               h('button', { type: 'button', className: 'nvl-ghost', onClick: () => void copy() }, '复制装配包'),
               h('span', { className: 'nvl-meta' }, `${value.chars}/${value.budget} 字符${value.style ? ` · 文风：${value.style}` : ''}`),
-            ) : value.minimumBudget <= 200000 && budget < 200000
-                ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(200000) }, '提高预算后重试')
+            ) : value.minimumBudget <= 200000 && retryBudget > 0 && budget !== retryBudget
+                ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(retryBudget) }, `按最低预算 ${retryBudget} 重试`)
                 : null,
+            value.missingRequired?.length ? h('p', { role: 'alert', className: 'nvl-err' }, `缺少必选文风：${value.missingRequired.map(item => item.label).join('、')}`) : null,
+            value.ledgerScope?.mode === 'historical' ? h('p', { className: 'nvl-hint' }, `旧章台账历史值缺失 ${value.ledgerMissing?.length || 0} 项；当前值未装配。`) : null,
             notice?.key === key ? h('p', { role: 'status', className: 'nvl-hint', 'data-tone': notice.ok ? 'ok' : 'err' }, notice.text) : null,
             h('pre', { className: 'nvl-context-preview' }, value.text),
           ) : null,
@@ -3367,7 +3366,7 @@ window.__ModuleLoader__.load({
       const create = async () => {
         const name = draftName.trim()
         if (!name) return
-        const template = `# 文风卡：${name}\n\n- 来源：\n- 一句话：\n- 视角与时态：\n\n## 句法\n\n- \n\n## 用词\n\n- \n\n## 对话\n\n- \n\n## 意象\n\n- \n\n## 禁忌（不要出现）\n\n- \n\n## 锚点原文\n\n### 锚点 1\n\n\n### 锚点 2\n\n\n### 锚点 3\n`
+        const template = `# 文风卡：${name}\n\n- 来源：\n- 一句话：\n- 视角与时态：\n\n## 核心规则\n\n- [必选] \n\n## 句法与用词\n\n- \n\n## 对话\n\n- \n\n## 反例\n\n- \n\n## 禁忌（不要出现）\n\n- 禁用词：\n\n## 少用词（仅提醒，不判违规）\n\n- \n\n## 语义禁忌（交给会话 AI 复核）\n\n- \n\n## 锚点原文\n\n### 锚点 1【通用】\n\n\n### 锚点 2【对白】\n\n\n### 锚点 3【动作】\n`
         setNotice(null)
         try {
           const value = await postJson(`${API}/style`, { name, content: template })

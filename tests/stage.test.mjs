@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { stageBook, stageContext, updateHistory, moveScene, parseScenes } from '../stage.js'
+import { stageBook, stageContext, updateHistory, moveScene, parseScenes, hash } from '../stage.js'
 import { apply } from '../index.js'
 import { Readable } from 'node:stream'
 
@@ -11,15 +11,17 @@ async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'novel-stage-'))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
   for (const dir of ['characters', 'chapters']) await fs.mkdir(path.join(root, dir))
+  const chapterOne = '甲看见信物。乙只听说有人失踪。'
   const chapters = ['0001', '0002', '0003'].map(id => ({ id, title: id, file: `chapters/${id}.md` }))
+  chapters[0].deaiReview = { baseHash: hash(chapterOne), scenes: [{ startIndex: 1, endIndex: 1, sceneId: 'first' }] }
   await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '测试', chapters }))
-  for (const c of chapters) await fs.writeFile(path.join(root, c.file), c.id === '0001' ? '甲看见信物。乙只听说有人失踪。' : '')
+  for (const c of chapters) await fs.writeFile(path.join(root, c.file), c.id === '0001' ? chapterOne : '')
   for (const [id, name] of [['a', '甲'], ['b', '乙']]) await fs.writeFile(path.join(root, 'characters', `${name}.md`), `# ${name}\n- ID：${id}\n- 定位：重要配角\n- 重要程度：重要\n## 作者侧秘密\n真实身份不可当成角色已知。`)
   const scene = (id, time, cast = 'a、b') => `### 场景 ${id}：对质\n- 时序：${time}\n- 出场：${cast}\n- 提及：不在场的人\n- 冲突：追问信物\n#### 人物 a\n- 未知：幕后主使\n- 目标：查清真相\n- 触发：看到信物\n- 计划变化：怀疑旧约\n`
   await fs.writeFile(path.join(root, 'beats.md'), `## 0001 开场\n${scene('first', 10)}\n## 0002 后续\n${scene('later', 20)}\n## 0003 倒叙\n${scene('flashback', 5)}`)
   return { root, chapters }
 }
-const proposal = { action: 'propose', character: 'a', scene: 'first', kind: '已知', content: '看到信物', source: '亲眼看见', evidence: '甲看见信物。' }
+const proposal = { action: 'propose', character: 'a', scene: 'first', kind: '已知', content: '看到信物', source: '亲眼看见', evidence: '甲看见信物。', evidenceIndex: 1 }
 
 test('已登记章出现重复 ID 时保留歧义诊断，不把两份小节场景都载入', async t => {
   const { root, chapters } = await fixture(t)
@@ -130,10 +132,10 @@ test('逐字证据、关系方向、引用与路径受到校验', async t => {
 test('整场移动保持约束和 ID，原确认失效', async t => {
   const { root, chapters } = await fixture(t)
   const file = path.join(root, 'beats.md')
-  const original = (await fs.readFile(file, 'utf8')).replaceAll('- 计划变化：怀疑旧约\n', '- 计划变化：怀疑旧约\n#### 人物 b\n- 目标：隐瞒真相\n')
-  await fs.writeFile(file, original.replace('## 0002 后续', '### 场景 remaining：留守\n- 时序：15\n- 出场：a\n#### 人物 a\n- 目标：留守\n\n## 0002 后续'))
   const { record } = await updateHistory(root, chapters, proposal)
   await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: record.id })
+  const original = (await fs.readFile(file, 'utf8')).replaceAll('- 计划变化：怀疑旧约\n', '- 计划变化：怀疑旧约\n#### 人物 b\n- 目标：隐瞒真相\n')
+  await fs.writeFile(file, original.replace('## 0002 后续', '### 场景 remaining：留守\n- 时序：15\n- 出场：a\n#### 人物 a\n- 目标：留守\n\n## 0002 后续'))
   await moveScene(root, chapters, 'first', '0002')
   const context = await stageContext(root, chapters, '0002', 'first')
   assert.equal(context.scenes[0].id, 'first')
@@ -173,10 +175,14 @@ test('同章前场确认可供后场继承，修正历史不抹去过去，撤�
   const { root, chapters } = await fixture(t)
   const file = path.join(root, 'beats.md')
   await fs.writeFile(file, (await fs.readFile(file, 'utf8')).replace('## 0002 后续', '### 场景 second：后场\n- 时序：15\n- 出场：a\n#### 人物 a\n- 目标：核对误解\n\n## 0002 后续'))
+  const body = '甲看见信物。\n甲随后发现信物是假的。'
+  await fs.writeFile(path.join(root, 'chapters/0001.md'), body)
+  chapters[0].deaiReview = { baseHash: hash(body), scenes: [{ startIndex: 1, endIndex: 1, sceneId: 'first' }, { startIndex: 2, endIndex: 2, sceneId: 'second' }] }
+  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '测试', chapters }))
   const { record } = await updateHistory(root, chapters, { ...proposal, kind: '误信', content: '乙拿走了信物' })
   await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: record.id })
   assert.equal((await stageContext(root, chapters, '0001', 'second')).scenes[0].characters[0].history[0].kind, '误信')
-  const corrected = await updateHistory(root, chapters, { ...proposal, scene: 'second', supersedes: record.id })
+  const corrected = await updateHistory(root, chapters, { ...proposal, scene: 'second', content: '信物其实是假的', evidence: '甲随后发现信物是假的。', evidenceIndex: 2, supersedes: record.id })
   await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: corrected.record.id })
   const current = (await stageContext(root, chapters, '0002')).scenes[0].characters[0].history
   assert.equal(current.length, 1)

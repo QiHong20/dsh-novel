@@ -74,9 +74,55 @@ test('后置必选规则优先，省略条目有原因，锚点不截断', () =>
   if (result.text.includes('锚点 1')) assert.ok(result.text.includes('推开门。'))
 })
 
-test('极小预算不截断要求，旧卡及空卡可用', () => {
+test('顶部多行必选项整条进入硬预算，续行不被拆成可选说明', () => {
+  const content = '- [必选] 不得越过主角的限知视角\n  （例外：群像全景可短暂切到旁观者）\n- 普通说明。'
+  const result = assemble(content, 1)
+  assert.equal(result.requiredItems.length, 1)
+  assert.match(result.text, /例外：群像全景可短暂切到旁观者/u)
+  assert.equal(result.missingRequired.length, 0)
+})
+
+test('空行后的缩进续段仍属于上一条必选规则', () => {
+  const content = '- [必选] 不得越过主角的限知视角\n\n  （例外：群像全景可短暂切到旁观者）\n'
+  const result = assemble(content, 1)
+  assert.equal(result.requiredItems.length, 1)
+  assert.match(result.text, /例外：群像全景可短暂切到旁观者/u)
+  // 空行后的非缩进文字仍是独立说明，不被吸进上一条规则。
+  const separated = assemble('- [必选] 主语只能是主角\n\n普通卡片说明。', 200)
+  assert.equal(separated.requiredItems.length, 1)
+  assert.ok(separated.requiredItems[0].chars < Array.from(separated.text).length)
+  assert.match(separated.text, /- \[必选\] 主语只能是主角/u)
+  assert.match(separated.text, /普通卡片说明。/u)
+})
+
+test('必选规则突破文风软份额且重排后仍携带分类标题', () => {
+  const content = '## 语义禁忌\n- 普通规则。\n- [必选] 不得越过主角限知视角。'
+  const result = assemble(content, 20)
+  assert.ok(result.used > result.budget)
+  assert.equal(result.requiredItems.length, 1)
+  assert.match(result.text, /^## 语义禁忌\n- \[必选\] 不得越过主角限知视角。/u)
+  assert.equal(result.missingRequired.length, 0)
+})
+
+test('首条过长被省略时后续条目仍保留反例、少用词和语义禁忌标题', () => {
+  for (const heading of ['反例', '少用词', '语义禁忌']) {
+    const result = assemble(`## ${heading}\n- ${'很长'.repeat(100)}\n- 短条目`, 30)
+    assert.equal(result.text, `## ${heading}\n- 短条目`)
+  }
+})
+
+test('只认列表项开头的必选标记，卡片顶部规则同样进入硬预算', () => {
+  const result = assemble('## 普通规则\n- 这是一条示例。\n  引文中写了 [必选]，但不是规则标记。', 200)
+  assert.equal(result.requiredItems.length, 0)
+  const top = assemble('- [必选] 不得改变叙述人称。', 1)
+  assert.equal(top.requiredItems.length, 1)
+  assert.match(top.text, /不得改变叙述人称/u)
+})
+
+test('文风软份额不能裁剪叙述权限，旧卡及空卡可用', () => {
   const tiny = assemble(card, 1)
-  assert.equal(tiny.text, '')
+  assert.equal(tiny.text, tiny.requiredText)
+  assert.ok(tiny.minimumBudget > tiny.budget)
   assert.ok(tiny.omitted.length > 0)
   assert.equal(assemble('', 100).included.length, 0)
   assert.ok(assemble('只使用第一人称。', 100).text.includes('只使用第一人称'))

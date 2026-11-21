@@ -3,7 +3,8 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { BEAT_SECTION_CHANGED, mutateBeatsFile, parseBeatSections } from './lib/beats.js'
 import { beatHeading, normalizeBeatId, resolveBeatSection, scanBeatHeadings } from './lib/beat-match.js'
-import { findChapter, loadBook } from './lib/book.js'
+import { BOOK_FILE, BEATS_FILE, findChapter, loadBook, writeFileAtomic } from './lib/book.js'
+import { withFileLock } from './lib/file-lock.js'
 import {
   APPEARANCE_FIELDS,
   CHAPTER_FIELDS,
@@ -15,11 +16,16 @@ import {
   parseStageFields,
   scanSceneHeadings,
 } from './lib/beat-structure.js'
+import { extractIndexedParagraphs } from './lib/text.js'
+import { sceneCoverageProblem } from './lib/scene-review.js'
 
 export { APPEARANCE_FIELDS, CHAPTER_FIELDS, PSYCHOLOGY_FIELDS, ROLE_FIELDS, SCENE_FIELDS, hash, parseScenes }
 export const BEAT_REQUEST_INVALID = 'BEAT_REQUEST_INVALID'
+export const HISTORY_REQUEST_INVALID = 'HISTORY_REQUEST_INVALID'
+export const HISTORY_SOURCE_CHANGED = 'HISTORY_SOURCE_CHANGED'
+const historyError = (message, code = HISTORY_REQUEST_INVALID) => Object.assign(new Error(message), { code })
 const safeId = value => {
-  if (!/^[a-zA-Z0-9_-]+$/.test(value || '')) throw new Error('ID 必须为字母、数字、下划线或连字符')
+  if (!/^[a-zA-Z0-9_-]+$/.test(value || '')) throw historyError('ID 必须为字母、数字、下划线或连字符')
   return value
 }
 const read = async file => { try { return await fs.readFile(file, 'utf8') } catch (e) { if (e.code === 'ENOENT') return ''; throw e } }
@@ -55,6 +61,68 @@ export function chapterOverview(text, chapter = '') {
 export function cardIdentity(text) {
   const f = fields(text.split(/^## /m)[0])
   return { id: f.ID || '', role: f.定位 || '', importance: f.重要程度 || '未设置' }
+}
+
+const pendingHistoryBinding = (record, reason, extra = {}) => ({
+  status: 'pending',
+  ...(Number.isInteger(record.evidenceIndex) ? { evidenceIndex: record.evidenceIndex } : {}),
+  reason,
+  ...extra,
+})
+
+/** 用当前正文审稿分场把逐字段号绑定到稳定章纲场景；无法证明时保持待核对。 */
+function resolveHistorySceneBinding(chapters, scenes, sources, record, { requireStored = false } = {}) {
+  if (!Number.isInteger(record.evidenceIndex) || record.evidenceIndex < 1) {
+    return pendingHistoryBinding(record, '记录缺少有效 evidenceIndex，请从当前审稿包重新提取')
+  }
+  const chapter = chapters.find(item => item.id === record.chapter)
+  const source = sources.get(record.chapter) || ''
+  const paragraphs = extractIndexedParagraphs(source)
+  const paragraph = paragraphs.find(item => item.index === record.evidenceIndex)
+  if (!paragraph) return pendingHistoryBinding(record, `正文不存在第 ${record.evidenceIndex} 段`)
+  if (!record.evidence || !paragraph.text.includes(record.evidence)) {
+    return pendingHistoryBinding(record, `逐字引文不在正文第 ${record.evidenceIndex} 段`)
+  }
+  const review = chapter?.deaiReview
+  if (!review || review.baseHash !== hash(source)) {
+    return pendingHistoryBinding(record, '当前正文没有同版本的完整分场复核')
+  }
+  const chapterScenes = scenes.filter(item => item.chapter === record.chapter)
+  if (!Array.isArray(review.scenes) || !chapterScenes.length) {
+    return pendingHistoryBinding(record, '当前正文没有覆盖本章结构化场景的分场复核')
+  }
+  if (chapterScenes.some(item => scenes.filter(candidate => candidate.id === item.id).length !== 1)) {
+    return pendingHistoryBinding(record, '场景 ID 缺失或重复，不能可靠归属')
+  }
+  // 与审稿状态共用同一份覆盖检查：章纲新增/删除场景、重复或外来 ID 都会让旧分场不可用。
+  const coverage = sceneCoverageProblem(review.scenes, paragraphs.length, chapterScenes.map(item => item.id))
+  if (coverage) return pendingHistoryBinding(record, `分场复核已不适用于当前章纲：${coverage}`)
+  const range = review.scenes.find(item => record.evidenceIndex >= item.startIndex && record.evidenceIndex <= item.endIndex)
+  if (!range) return pendingHistoryBinding(record, `正文第 ${record.evidenceIndex} 段不属于任何已复核场景`)
+  // 只认复核显式声明的稳定场景 ID，不按数组下标把正文顺序当成章纲顺序。
+  if (typeof range.sceneId !== 'string' || !range.sceneId.trim()) {
+    return pendingHistoryBinding(record, '复核分场缺少稳定 sceneId，请重新登记复核')
+  }
+  const actualScene = chapterScenes.find(item => item.id === range.sceneId)
+  if (!actualScene) {
+    return pendingHistoryBinding(record, `复核声明的场景 ${range.sceneId} 不属于本章结构化章纲`)
+  }
+  if (actualScene.id !== record.scene) {
+    return pendingHistoryBinding(record, `引文属于场景 ${actualScene.id}，不是声明的 ${record.scene}`, { actualScene: actualScene.id })
+  }
+  if (requireStored && (record.sourceSceneId !== range.sceneId ||
+    record.sourceSceneStart !== range.startIndex || record.sourceSceneEnd !== range.endIndex)) {
+    return pendingHistoryBinding(record, '正文分场范围或场景归属已变化，请从当前审稿包重新提取')
+  }
+  return {
+    status: 'bound',
+    evidenceIndex: record.evidenceIndex,
+    scene: actualScene.id,
+    sceneId: actualScene.id,
+    startIndex: range.startIndex,
+    endIndex: range.endIndex,
+    evidenceContext: paragraph.text,
+  }
 }
 
 export async function stageBook(root, chapters) {
@@ -117,18 +185,29 @@ export async function stageBook(root, chapters) {
     for (const id of scene.cast) if (!scene.roles.some(r => r.id === id)) warn(`${scene.id}：${id} 缺少本场目标与认知约束`, { chapter: scene.chapter, scene: scene.id })
   }
   for (const record of records) {
-    const scene = scenes.find(s => s.id === record.scene)
-    record.valid = record.status === 'confirmed' && !!scene && scenes.filter(s => s.id === record.scene).length === 1 &&
-      cards.filter(c => c.id === record.character).length === 1 && scene.cast.includes(record.character) && scene.chapter === record.chapter &&
-      scene.time === record.time && hash(scene.raw) === record.sceneHash &&
-      hash(sources.get(record.chapter) || '') === record.sourceHash &&
-      !!record.evidence && (sources.get(record.chapter) || '').includes(record.evidence)
+    const matches = scenes.filter(scene => scene.id === record.scene)
+    const scene = matches[0]
+    const reasons = []
+    if (matches.length !== 1) reasons.push('场景不存在或 ID 重复')
+    if (cards.filter(card => card.id === record.character).length !== 1) reasons.push('人物不存在或 ID 重复')
+    if (scene && (!scene.cast.includes(record.character) || scene.chapter !== record.chapter || scene.time !== record.time)) reasons.push('人物出场、章节或时序已变化')
+    if (scene && hash(scene.raw) !== record.sceneHash) reasons.push('章纲场景已变化')
+    if (hash(sources.get(record.chapter) || '') !== record.sourceHash) reasons.push('正文已变化')
+    const binding = resolveHistorySceneBinding(chapters, scenes, sources, record, { requireStored: true })
+    record.binding = binding
+    record.evidenceContext = binding.evidenceContext || ''
+    if (binding.status !== 'bound') reasons.push(binding.reason)
+    record.invalidReasons = [...new Set(reasons)]
+    record.valid = record.status === 'confirmed' && record.invalidReasons.length === 0
   }
   // A correction is unusable if its source record was invalidated.
   for (let n = 0; n < records.length; n++) for (const r of records) {
-    if (r.valid && r.supersedes && !records.some(p => p.id === r.supersedes && p.valid)) r.valid = false
+    if (r.valid && r.supersedes && !records.some(p => p.id === r.supersedes && p.valid)) {
+      r.valid = false
+      r.invalidReasons.push('被修正的前置记录已失效')
+    }
   }
-  for (const r of records) if (r.status === 'confirmed' && !r.valid) warn(`认知 ${r.id} 来源或场景已变化，待复核；后续不得继承`, { chapter: r.chapter, scene: r.scene, character: r.character, record: r.id, time: r.time, kind: r.kind })
+  for (const r of records) if (r.status === 'confirmed' && !r.valid) warn(`认知 ${r.id} 来源或场景已变化，待复核；后续不得继承：${r.invalidReasons.join('；')}`, { chapter: r.chapter, scene: r.scene, character: r.character, record: r.id, time: r.time, kind: r.kind })
   const impacts = records.filter(r => r.status === 'confirmed' && !r.valid).map(r => ({
     record: r.id, character: r.character, content: r.content,
     scenes: scenes.filter(s => s.cast.includes(r.character) && s.time !== null && s.time > r.time).map(s => ({ id: s.id, chapter: s.chapter, title: s.title })),
@@ -136,7 +215,7 @@ export async function stageBook(root, chapters) {
   const eventStarts = [...eventText.matchAll(/^### (\S+)([^\n]*)\n/gm)]
   const eventNodes = eventStarts.map((m, i) => ({ id: m[1], title: m[2].trim(),
     plan: eventText.slice(m.index + m[0].length, eventStarts[i + 1]?.index ?? eventText.length).split(/^## /m)[0].trim() }))
-  return { scenes, cards, records, sources, warnings, diagnostics, events, impacts, eventNodes, baseHash: hash(beats) }
+  return { chapters, scenes, cards, records, sources, warnings, diagnostics, events, impacts, eventNodes, baseHash: hash(beats) }
 }
 
 export function sceneState(book, scene) {
@@ -246,61 +325,90 @@ export async function editStageFields(root, args) {
   return { ok: true, baseHash: saved.baseHash, issues: saved.issues, warnings: saved.warnings }
 }
 
-const locks = new Map()
-export async function updateHistory(root, chapters, args) {
-  const previous = locks.get(root) || Promise.resolve()
-  const next = previous.catch(() => {}).then(() => updateUnlocked(root, chapters, args))
-  locks.set(root, next)
-  try { return await next } finally { if (locks.get(root) === next) locks.delete(root) }
+export async function updateHistory(root, _chapters, args) {
+  const resolved = path.resolve(root)
+  // 与正文和章纲写入使用同一文件锁，固定 book → beats → history 顺序，避免确认旧快照。
+  return withFileLock(path.join(resolved, BOOK_FILE), () =>
+    withFileLock(path.join(resolved, BEATS_FILE), () =>
+      withFileLock(path.join(resolved, 'character-history', '.history'), async () => {
+        const current = (await loadBook(resolved)).meta.chapters
+        return updateUnlocked(resolved, current, args)
+      })))
 }
 
 async function updateUnlocked(root, chapters, args) {
   const book = await stageBook(root, chapters)
   if (args.action === 'inspect' || !args.action) return { records: book.records, warnings: book.warnings, impacts: book.impacts }
   const character = safeId(args.character)
-  if (book.cards.filter(c => c.id === character).length !== 1) throw new Error('人物 ID 不存在或重复')
+  if (book.cards.filter(c => c.id === character).length !== 1) throw historyError('人物 ID 不存在或重复')
   let record
   if (args.action === 'propose') {
     const scene = book.scenes.find(s => s.id === args.scene)
-    if (!scene || book.scenes.filter(s => s.id === args.scene).length !== 1 || !scene.cast.includes(character) || scene.time === null) throw new Error('需要唯一场景、出场人物和明确时序')
+    if (!scene || book.scenes.filter(s => s.id === args.scene).length !== 1 || !scene.cast.includes(character) || scene.time === null) throw historyError('需要唯一场景、出场人物和明确时序')
     const text = book.sources.get(scene.chapter) || ''
-    if (!args.evidence?.trim() || !text.includes(args.evidence)) throw new Error('依据必须是该章正文的逐字引文')
-    if (!args.content?.trim() || !args.source?.trim()) throw new Error('必须提供认知内容及信息来源')
-    if (!['已知', '未知', '误信', '怀疑', '关系', '状态', '呈现'].includes(args.kind)) throw new Error('认知类型无效')
-    if (args.target && !book.cards.some(c => c.id === args.target)) throw new Error('关系目标人物不存在')
-    if (args.kind === '关系' && !args.target) throw new Error('关系变化必须指定目标人物 target')
-    if (args.event && !book.events.has(args.event)) throw new Error('事件节点不存在')
-    if (args.supersedes && !book.records.some(r => r.id === args.supersedes && r.character === character && r.valid && r.time < scene.time)) throw new Error('被修正记录必须是本人物此前的有效记录')
-    record = { id: randomUUID(), character, scene: scene.id, chapter: scene.chapter, time: scene.time,
-      content: args.content, kind: args.kind, source: args.source, evidence: args.evidence,
+    if (!Number.isInteger(args.evidenceIndex) || args.evidenceIndex < 1) throw historyError('propose 必须提供 novel_deai_pack 返回的正整数 evidenceIndex')
+    const paragraph = extractIndexedParagraphs(text).find(item => item.index === args.evidenceIndex)
+    if (!args.evidence?.trim() || !paragraph?.text.includes(args.evidence)) throw historyError(`依据必须是该章正文第 ${args.evidenceIndex} 段的逐字引文`)
+    if (!args.content?.trim() || !args.source?.trim()) throw historyError('必须提供认知内容及信息来源')
+    if (!['已知', '未知', '误信', '怀疑', '关系', '状态', '呈现'].includes(args.kind)) throw historyError('认知类型无效')
+    if (args.target && !book.cards.some(c => c.id === args.target)) throw historyError('关系目标人物不存在')
+    if (args.kind === '关系' && !args.target) throw historyError('关系变化必须指定目标人物 target')
+    if (args.event && !book.events.has(args.event)) throw historyError('事件节点不存在')
+    if (args.supersedes && !book.records.some(r => r.id === args.supersedes && r.character === character && r.valid && r.time < scene.time)) throw historyError('被修正记录必须是本人物此前的有效记录')
+    record = { recordVersion: 2, id: randomUUID(), character, scene: scene.id, chapter: scene.chapter, time: scene.time,
+      content: args.content, kind: args.kind, source: args.source, evidence: args.evidence, evidenceIndex: args.evidenceIndex,
       target: args.target || '', event: args.event || '', supersedes: args.supersedes || '',
       status: 'candidate', sourceHash: hash(text), sceneHash: hash(scene.raw) }
+    const binding = resolveHistorySceneBinding(book.chapters, book.scenes, book.sources, record)
+    record.binding = binding
+    record.evidenceContext = binding.evidenceContext || paragraph.text
+    if (binding.status === 'bound') {
+      record.sourceSceneId = binding.sceneId
+      record.sourceSceneStart = binding.startIndex
+      record.sourceSceneEnd = binding.endIndex
+    }
     book.records.push(record)
   } else {
     record = book.records.find(r => r.id === args.id && r.character === character)
-    if (!record) throw new Error('找不到认知记录')
-    if (!['confirm', 'revoke'].includes(args.action)) throw new Error('操作无效')
+    if (!record) throw historyError('找不到认知记录')
+    if (!['confirm', 'revoke'].includes(args.action)) throw historyError('操作无效')
     if (args.action === 'confirm') {
-      const scene = book.scenes.find(s => s.id === record.scene)
-      if (!scene || hash(scene.raw) !== record.sceneHash || hash(book.sources.get(record.chapter) || '') !== record.sourceHash) throw new Error('来源已变化，请重新提取候选，不得确认旧记录')
-      if (record.supersedes && !book.records.some(r => r.id === record.supersedes && r.valid)) throw new Error('前置记录已失效')
+      const scenes = book.scenes.filter(s => s.id === record.scene)
+      const scene = scenes[0]
+      if (scenes.length !== 1 || !scene.cast.includes(record.character) || scene.chapter !== record.chapter || scene.time !== record.time ||
+        hash(scene.raw) !== record.sceneHash || hash(book.sources.get(record.chapter) || '') !== record.sourceHash) {
+        throw historyError('来源已变化，请重新提取候选，不得确认旧记录', HISTORY_SOURCE_CHANGED)
+      }
+      const binding = resolveHistorySceneBinding(book.chapters, book.scenes, book.sources, record, { requireStored: true })
+      if (binding.status !== 'bound') throw historyError(`引文场景尚未可靠归属：${binding.reason}；不得确认`, HISTORY_SOURCE_CHANGED)
+      if (record.status !== 'candidate') throw historyError('只有待核对 candidate 可以确认；已撤销或已确认记录不能复用')
+      if (record.supersedes && !book.records.some(r => r.id === record.supersedes && r.valid)) throw historyError('前置记录已失效', HISTORY_SOURCE_CHANGED)
+      record.sourceSceneId = binding.sceneId
+      record.sourceSceneStart = binding.startIndex
+      record.sourceSceneEnd = binding.endIndex
+      record.binding = binding
+      record.evidenceContext = binding.evidenceContext || ''
     }
     record.status = args.action === 'confirm' ? 'confirmed' : 'revoked'
   }
-  const rows = book.records.filter(r => r.character === character).map(({ valid, ...r }) => r)
+  const outputRecord = { ...record }
+  const rows = book.records.filter(r => r.character === character).map(({ valid, binding, evidenceContext, invalidReasons, ...r }) => r)
   const dir = path.join(root, 'character-history')
   await fs.mkdir(dir, { recursive: true })
   const dest = path.join(dir, `${character}.md`)
-  const tmp = `${dest}.${randomUUID()}.tmp`
-  await fs.writeFile(tmp, `# 人物经历：${character}\n\n${rows.map(r => `## ${r.id} · ${r.status}\n\n\`\`\`json\n${JSON.stringify(r, null, 2)}\n\`\`\``).join('\n\n')}\n`, 'utf8')
-  await fs.rename(tmp, dest)
-  return { record: rows.find(r => r.id === record.id), warnings: book.warnings }
+  await writeFileAtomic(dest, `# 人物经历：${character}\n\n${rows.map(r => `## ${r.id} · ${r.status}\n\n\`\`\`json\n${JSON.stringify(r, null, 2)}\n\`\`\``).join('\n\n')}\n`)
+  const warnings = [...book.warnings]
+  if (outputRecord.binding?.status === 'pending') warnings.push(`候选已保存但尚不能确认：${outputRecord.binding.reason}`)
+  return { record: outputRecord, warnings }
 }
 
 export const historyParameters = {
   type: 'object', additionalProperties: false,
-  properties: Object.fromEntries(['action', 'character', 'scene', 'id', 'kind', 'content', 'source', 'evidence', 'target', 'event', 'supersedes'].map(key => [key,
-    key === 'action' ? { type: 'string', enum: ['inspect', 'propose', 'confirm', 'revoke'] } : { type: 'string' }])),
+  properties: {
+    ...Object.fromEntries(['action', 'character', 'scene', 'id', 'kind', 'content', 'source', 'evidence', 'target', 'event', 'supersedes'].map(key => [key,
+      key === 'action' ? { type: 'string', enum: ['inspect', 'propose', 'confirm', 'revoke'] } : { type: 'string' }])),
+    evidenceIndex: { type: 'integer', minimum: 1, description: 'propose 必填；novel_deai_pack 返回的正文段号' },
+  },
 }
 
 export async function moveScene(root, chapters, sceneId, targetChapter) {
