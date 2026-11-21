@@ -62,7 +62,8 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 | `novel_status` | 看整体：书名、章数、总字数/目标、人物卡张数、未回收伏笔、每章 `字数/目标 · 状态` |
 | `novel_book` | 书的元信息：书名 / 作者 / 类型 / 一句话简介 / **每章目标字数**；`targetChars` 是全书默认（每章可单独覆盖），写章自查按它判长短 |
 | `novel_read` | 读某一章正文 |
-| `novel_write` | 写正文（`mode: append` 默认 / `replace`，可带 `status`；省略 `chapter` 自动建下一章并登记进 `book.json`） |
+| `novel_write` | 写正文（`replace` 默认、`append` 续写、`patch` 改写）。AI 起稿或续写须传本章当前版本的 `preflightId`。 |
+| `novel_chapter_preflight` | AI 起稿前核对剧情。无阻塞直接通过，有阻塞汇总拷问，作者确认具体修订后应用并复检。 |
 | `novel_outline` | 读 / 写 `outline.md` |
 | `novel_context` | **续写前的标准动作**：一次拿到本章章纲、上章末、出场人物、台账适用范围、伏笔与文风。续写默认预算 60000、改写 80000 Unicode 字符，最多 200000；不限制正文长度。`ready: true` 保证全部 `[必选]` 文风规则已装配；旧章不会装入当前台账值。 |
 | `novel_character_history` | 人物历史：`propose` 使用 `novel_deai_pack` 的 `evidenceIndex` 与逐字引文绑定实际场景；无法可靠归属时保持待核对，`confirm` 后才会从来源场景结束后继承。 |
@@ -171,28 +172,21 @@ curl.exe -s "http://127.0.0.1:18080/novel-api/state"
 
 ## 导入旧稿：读文件的能力归插件，判断边界归 AI
 
-不另设「导入」工具 —— 它无非是现有工具的编排。插件只负责 AI 做不好的那件事：**编码和分页**。
+使用 `novel_import({ source, dryRun: true })` 先核对切章边界。需要查看旧稿原文时，用 `novel_read({ source, offset, limit })` 分页读取，它会自动识别 UTF-8、GBK 和 UTF-16。确认后用同一组切章参数正式导入。默认跳过已存在的章节，只有作者明确要求覆盖时使用 `replace: true`。导入完成后用 `novel_status` 查看章数和字数，按需补建总纲、人物卡、设定和文风卡。
 
-```js
-novel_read({ source: 'D:\\books\\旧稿.txt', limit: 4000 })            // 自动认 UTF-8 / GBK / UTF-16
-novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // 接着读
-```
+## 章前剧情预检
 
-返回里带 `encoding` / `chars` / `nextOffset` / `done`，所以不分页也不会读漏。剩下的交给会话里的 AI：
+AI 新写或续写前调用 `novel_chapter_preflight({ action: "check", chapter })`。插件用当前会话模型核对本章章纲、总纲（含范本）、已有正文、相关人物和设定。只有影响本章写法的明确冲突或关键依据缺失才阻塞。未发现阻塞时直接返回 `ready` 和带引文的事实清单，AI 重新调用 `novel_context` 后开写，保存时把本章 ID 和 `preflightId` 传给 `novel_write`。
 
-1. `novel_read({ source })` 扫几屏，看清章节标题长什么样（有没有「第N章」、有没有目录页）
-2. **它自己判断边界** —— 插件不猜，猜错一次要重导
-3. 逐章 `novel_write({ chapter, title, content })` 落盘（自动留历史版本）
-4. `novel_status` 核对章数与字数
-5. 需要的话再逆向提炼：`novel_outline` / `novel_card` / `novel_setting` / `novel_style({ clone: true, source })`
+存在阻塞时，本章生成一次 `novel_grill`，汇总有依据的问题、推荐方案和影响范围。作者可以批量回答独立问题，或暂缓。全部阻塞问题得到明确答复后，AI 用 `preview` 生成逐段修订清单，`apply` 通过宿主原生提问展示清单并等待作者确认。确认后工具按版本应用修订，回读复检。预检资料版本变化时旧结果失效；写入中途失败时用 `resume` 恢复已确认的清单，复检失败可用 `check` 重试。状态保存在书稿的 `.novel/chapter-preflight/`。
 
-长篇别让它一口气读完：每 8–10 章派一个 subagent 只读原文、只返回摘要，主上下文负责汇总。
+章前门槛适用于 AI 起稿和续写。直接保存作者正文、`novel_import` 导入和历史恢复照常使用。章后的正文审稿流程继续适用。
 
 ## 去 AI 味与全文语义复核
 
 生成或改写前，`novel_context` 现在自动带上 `materialPreflight`；也可用只读的 `novel_preflight({ chapter })` 单独查看。预检对照本章章纲与启用文风的字面规则，展示语义约束、章纲原文及本章备忘，候选命中不等于确认矛盾。启用文风缺失会明确提示。上下文预算不足时应增加装配预算或分次读取资料，不能压缩正文来迁就。
 
-资料按用途区分：正文是当前表述，设定是声明规则，人物卡是人物资料，文风是表达约束，章纲、大纲、事件线是计划，`threads.md` 可能含计划和旧备忘。备忘不自动高于正文，来源差异须先核实。章纲中的内心台词默认保留意图与情绪并按文风表达，移除了默认“逐字写进正文”的指令；作者明确要求逐字引用时遵从作者要求。预检不自动修改任何资料，也不认证材料没有冲突。
+资料按用途区分：正文是当前表述，设定是声明规则，人物卡是人物资料，文风是表达约束，章纲、大纲、事件线是计划，`threads.md` 可能含计划和旧备忘。备忘不自动高于正文，来源差异须先核实。章纲中的内心台词默认保留意图与情绪并按文风表达，移除了默认“逐字写进正文”的指令；作者明确要求逐字引用时遵从作者要求。只读资料预检提供核对线索；章前剧情预检的正式修订须经作者确认。
 
 审稿协议升级至版本 6，必须提交 `observations`（无发现填 `[]`）。每条填写 `aspect/classification/detail/evidence/counterargument`：`conflict` 为确定矛盾，另填 `comparison: { entity, property, timeScope }` 并提供至少两条不同证据；`missing-basis` 为依据不足；`preference` 为可选表达偏好，单列 `preferenceNotes`，不阻塞定稿。六项汇总中的 conflict/uncertain 必须有对应观察；仅凭正文与历史备忘不同不能自动判正文写错。引用新增支持 `threads`、`events`，逐字校验并绑定来源哈希。旧版记录需按新协议重新登记，字段完整仍不代表推论正确。
 
