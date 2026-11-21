@@ -3,7 +3,7 @@ import { Readable } from 'node:stream'
 import vm from 'node:vm'
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { styleAnchorText } from '../lib/text.js'
+import { readStyleCalibration, styleAnchorText } from '../lib/text.js'
 
 // 测试纯装配函数，无需启动 DSH 或改变生产模块导出。
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
@@ -31,7 +31,7 @@ const rulesEnd = source.indexOf('// 参考文本', rulesStart)
 const { verify, append, calibrationText, formatStylePreference, readCalibration, withCalibration, applyCalibration } = vm.runInNewContext(
   `${source.slice(rulesStart, rulesEnd)}; ({ verify: verifyStyleRules, append: appendStyleRules,
     calibrationText, formatStylePreference, readCalibration: readStyleCalibration,
-    withCalibration: withStyleCalibration, applyCalibration: applyStyleCalibration })`,
+    withCalibration: withStyleCalibration, applyCalibration: applyStyleCalibration })`, { readStyleCalibration },
 )
 const generateStart = source.indexOf('async function generateStyleRules')
 const generateEnd = source.indexOf('function composeStyleCard', generateStart)
@@ -365,7 +365,7 @@ test('本书试写两版共享章纲和模型，只有一版带待验证文风',
     }),
     listCharacters: async () => [], listSettings: async () => [], styleSceneScores: () => [],
     assembleStylePrompt: assemble,
-    readStyleModelText: async (_llm, options) => {
+    readModelText: async (_llm, options) => {
       requests.push(options)
       return options.messages[0].content[0].text
     },

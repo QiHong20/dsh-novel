@@ -17,14 +17,14 @@ import { createHash } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { countChars, extractIndexedParagraphs, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, DIALOGUE_REVIEW_RULES, DEAI_RULES, styleStats, styleFit, interiorStats, payoffMoments, detectAiTone, CJK_STOP, styleAnchorText, aiSnippet, aiSentences } from './lib/text.js'
+import { countChars, extractIndexedParagraphs, readStyleCalibration, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, DIALOGUE_REVIEW_RULES, DEAI_RULES, styleStats, styleFit, interiorStats, payoffMoments, detectAiTone, CJK_STOP, styleAnchorText, aiSnippet, aiSentences } from './lib/text.js'
 import { presentationContext, selectPresentationExcerpts, renderPresentationExcerpts } from './lib/presentation.js'
 import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { CHAPTER_PREFLIGHT_PARAMETERS, chapterPreflightStatus, hasDraftProse, preflightChapter, runChapterPreflight } from './lib/chapter-preflight.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS, BEAT_REQUEST_INVALID, HISTORY_REQUEST_INVALID, HISTORY_SOURCE_CHANGED } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, deriveChapterStatus, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
-import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
+import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, matchesCharacterMention, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
 import { CHARACTERS_DIR } from './lib/book.js'
 import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
@@ -34,7 +34,7 @@ import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognit
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
 import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_STRUCTURE_INVALID } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
-import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
+import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, matchesSettingMention, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
 import { stampOf, stampToIso, shortHash } from './lib/book.js'
 import { withFileLock } from './lib/file-lock.js'
 import { SCENE_ACTION_FIELDS, hasCompleteSceneReviews, sceneReviewProblem } from './lib/scene-review.js'
@@ -852,8 +852,13 @@ async function reviewChapterPlan(llm, exec, chapter, snapshot, previous) {
     ...selection, sessionId: exec.agent.session.id, signal, system, maxTokens: 10000,
     messages: [{ role: 'user', content: [{ type: 'text', text: data }] }],
   })
-  const fenced = output.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/iu)
-  return JSON.parse(fenced?.[1] ?? output)
+  const blocks = [...output.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map(match => match[1])
+  for (const candidate of [output, ...blocks]) {
+    let report
+    try { report = JSON.parse(candidate) } catch { continue }
+    if (Array.isArray(report?.facts) && Array.isArray(report?.issues)) return report
+  }
+  throw new Error('章前预检模型未返回有效的 JSON 核对结果，请重新执行 check')
 }
 
 async function loadStyleTrialChapter(root, wanted) {
@@ -1068,19 +1073,6 @@ function formatStylePreference({ when, prefer, unless }) {
     throw new Error('文风偏好须有具体适用条件和可调整的例外')
   }
   return `当${condition}时，倾向于${tendency}。${exception}时可以调整。`
-}
-
-function readStyleCalibration(content) {
-  const match = content.match(/^<!-- novel-style-calibration: (.+) -->[ \t]*\r?\n?/mu)
-  if (!match) return { content, questions: [] }
-  const visible = content.replace(match[0], '').trimEnd() + '\n'
-  try {
-    const questions = JSON.parse(match[1])
-    if (Array.isArray(questions)) return { content: visible, questions }
-  } catch {
-    // 卡片可在宿主外编辑，损坏的校准数据不阻断显式正文。
-  }
-  return { content: visible, questions: [] }
 }
 
 function withStyleCalibration(content, questions) {
@@ -1609,6 +1601,35 @@ function applyChapterEdit(previous, args) {
   }
   parts.push(chars.slice(cursor).join(''))
   return parts.join('')
+}
+
+function isChapterRevision(previous, body, args, mode) {
+  if (!hasDraftProse(previous) || (mode !== 'patch' && !(args.mode === 'replace' && args.baseHash))) return false
+
+  const paragraphs = text => text.split('\n').map(line => line.replace(/[\s\p{P}]/gu, '')).filter(Boolean)
+  const expands = (before, after) => {
+    const beforeParagraphs = paragraphs(before)
+    const afterParagraphs = paragraphs(after)
+    const size = countChars(beforeParagraphs.join(''))
+    const growth = countChars(afterParagraphs.join('')) - size
+    const tolerance = Math.max(24, Math.min(120, Math.ceil(size * 0.15)))
+    if (growth > tolerance) return true
+    if (growth <= 0 || afterParagraphs.length <= Math.max(1, beforeParagraphs.length)) return false
+
+    // 原段落仍按原顺序完整出现时，多出的段落属于增写。
+    let matched = 0
+    for (const paragraph of afterParagraphs) {
+      if (paragraph === beforeParagraphs[matched]) matched += 1
+    }
+    return matched === beforeParagraphs.length
+  }
+
+  if (expands(previous, body)) return false
+  if (mode === 'replace') return true
+
+  const original = Array.from(previous)
+  const patches = args.patches ?? [{ start: args.start, end: args.end, content: args.content }]
+  return !patches.some(patch => expands(original.slice(patch.start, patch.end).join(''), patch.content))
 }
 
 /** 禁忌分为字面禁止、少用提醒与待语义复核；不猜测语义规则是否违反。 */
@@ -2806,7 +2827,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_write',
     description:
-      'AI 新写和续写需提交当前版本的 preflightId。改写已有正文须使用带 baseHash 的 patch 或显式 replace；导入作者提供的旧稿走 novel_import。写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。目标字数只作参考，允许超出，不要求缩写或提前收尾。按情节自然节点决定分章；确需顺延后续场景时可传 carryOver: true。' +
+      'AI 新写和续写需提交当前版本的 preflightId；下一章可继承预检标题。改写已有正文须使用带 baseHash 的 patch 或显式 replace；新增段落或明显扩写时也需预检；导入作者提供的旧稿走 novel_import。写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。目标字数只作参考，允许超出，不要求缩写或提前收尾。按情节自然节点决定分章；确需顺延后续场景时可传 carryOver: true。' +
       '\n改写先用 novel_deai_pack 阅读全文与声口；多个修改用 mode:"patch", baseHash, patches:[{start,end,content}] 一次提交，所有坐标均以同一版原文为准。单片段 start/end/content 仍可用。修改后重新取包并提交 novel_deai_review，再 novel_check；未完成当前版本复核不可标记 final。',
     parameters: {
       type: 'object',
@@ -2882,6 +2903,9 @@ export function apply(ctx, config) {
       const nextId = nextChapterId(chapters)
       const writingNext = args.chapter === nextId && Boolean(args.preflightId)
 
+      if (exec?.agent && !existing && args.chapter === nextId && !args.preflightId && mode !== 'patch' && hasDraftProse(args.content)) {
+        throw new Error(`下一章 "${nextId}" 尚未登记，AI 起稿须先完成章前预检并提供 preflightId；正文未写入。`)
+      }
       if (args.chapter && !existing && !writingNext) {
         throw new Error(`找不到章节 "${args.chapter}"；要新建一章请省略 chapter`)
       }
@@ -2890,14 +2914,11 @@ export function apply(ctx, config) {
       let chapter = existing
       const created = !chapter
       if (!chapter) {
-        const id = nextId
-        chapter = {
-          id,
-          title: typeof args.title === 'string' && args.title.trim() ? args.title.trim() : `第 ${Number(id)} 章`,
-          file: `${CHAPTERS_DIR}/${id}.md`,
-          status: 'draft',
-          targetChars: 0,
-        }
+        const title = typeof args.title === 'string' ? args.title.trim() : ''
+        const target = args.preflightId
+          ? await preflightChapter(rootNow(), meta, nextId, title)
+          : { id: nextId, title: title || `第 ${Number(nextId)} 章`, file: `${CHAPTERS_DIR}/${nextId}.md` }
+        chapter = { ...target, status: 'draft', targetChars: 0 }
         chapters.push(chapter)
       } else {
         chapter = { ...chapter }
@@ -2912,11 +2933,8 @@ export function apply(ctx, config) {
       const target = path.join(rootNow(), chapter.file)
       const previous = (await readText(target)) ?? ''
       const body = applyChapterEdit(previous, { ...args, mode })
-      const addsToEnd = body.trimEnd().startsWith(previous.trimEnd())
-      const revision = hasDraftProse(previous) &&
-        mode !== 'append' && !addsToEnd && (mode === 'patch' || args.mode === 'replace' && args.baseHash)
       const review = await deaiReviewState(rootNow(), chapter, body, meta)
-      if (exec?.agent && body !== previous && hasDraftProse(body) && !revision) {
+      if (exec?.agent && body !== previous && hasDraftProse(body) && !isChapterRevision(previous, body, args, mode)) {
         const gate = await chapterPreflightStatus(rootNow(), meta, existing ?? chapter, false)
         if (gate.status !== 'ready' || !args.preflightId || args.preflightId !== gate.preflightId) {
           throw new Error(`章前剧情预检为 ${gate.status} 或编号失效；请先完成本章预检，再重新取写作上下文。正文未写入。`)
@@ -2940,8 +2958,7 @@ export function apply(ctx, config) {
         if (kept) backup = kept.file
       }
 
-      await fsp.mkdir(path.dirname(target), { recursive: true })
-      await fsp.writeFile(target, body, 'utf8')
+      await writeFileAtomic(target, body)
       await writeFileAtomic(lastSnapshotPath(rootNow(), chapter.id), body)
 
       const chars = countChars(body)
@@ -3480,7 +3497,7 @@ export function apply(ctx, config) {
 
       const current = index < chapters.length
         ? chapters[index]
-        : { id: nextChapterId(chapters), title: args.title?.trim() || `第 ${Number(nextChapterId(chapters))} 章`, file: `${CHAPTERS_DIR}/${nextChapterId(chapters)}.md`, chars: 0, target: meta.targetChars, status: 'planned' }
+        : { ...await preflightChapter(rootNow(), meta, nextChapterId(chapters), args.title), chars: 0, target: meta.targetChars, status: 'planned' }
 
       const rewrite = args.mode === 'rewrite'
       const preflightTarget = !rewrite && exec?.agent
@@ -3549,7 +3566,7 @@ export function apply(ctx, config) {
       const cards = await listCharacters(rootNow())
       const picked = []
       for (const card of cards) {
-        if (mentions(prevTailText, card.name) || mentions(sceneText, card.name)) picked.push(card)
+        if (matchesCharacterMention(prevTailText, card) || matchesCharacterMention(sceneText, card)) picked.push(card)
       }
       for (const card of cards) {
         if (picked.length >= 3) break
@@ -3607,13 +3624,8 @@ export function apply(ctx, config) {
       // 相关设定：只在被正文/章纲/大纲点名时才带，避免把整本世界观灌进上下文。
       const settingItems = await listSettings(rootNow())
       const settingHits = []
-      const matchesSetting = (haystack, name) => {
-        if (mentions(haystack, name)) return true
-        const parts = String(name ?? '').split(/[·・、/／与和及\-_\s]+/u).filter(part => part.length >= 2)
-        return parts.some(part => mentions(haystack, part))
-      }
       for (const item of settingItems) {
-        if (matchesSetting(prevTailText, item.name) || matchesSetting(sceneText, item.name)) settingHits.push(item)
+        if (matchesSettingMention(prevTailText, item.name) || matchesSettingMention(sceneText, item.name)) settingHits.push(item)
       }
       const settings = []
       const voided = []
@@ -3656,7 +3668,7 @@ export function apply(ctx, config) {
       let rawChapter = ''
       if (current.file) {
         rawChapter = (await readText(path.join(rootNow(), current.file))) ?? ''
-        current.status = await currentChapterStatus(rootNow(), meta.chapters[index], rawChapter, meta)
+        if (index < chapters.length) current.status = await currentChapterStatus(rootNow(), meta.chapters[index], rawChapter, meta)
         if (rewrite) chapterText = rawChapter
       }
       if (rewrite && !rawChapter.trim()) throw new Error('该章尚无正文，请选择续写装配')
