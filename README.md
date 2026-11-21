@@ -199,7 +199,7 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 1. **写作前约束**：普通 `novel_context({ chapter })` 和改写装配包都包含场景审稿纪律与最新交付流程，已有小说无需重建规范文件。`pass: "deai"` 额外带上机械命中线索。
 2. **阅读全文**：`novel_deai_pack({ chapter })` 返回全部非空正文段落、原文坐标、整章 `baseHash`、人物声口和完整文风卡。语义审稿先还原空间、动作、工具、时间、安全约束与技术因果，再检查对白、紧张场景的设定投放、格言式总结和无设定依据的逐项感官报幕。包内附设定索引，涉及机制时按需读取完整条目；缺失前因或存在矛盾时先修订或澄清，不能以脑补步骤登记完成。
 3. **按需修改**：`novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次提交多个不重叠修改，所有坐标基于同一版原文。原有单片段写法仍可用；每次写入后需要重新取包，不能复用旧哈希和坐标。
-4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`。带对话标签的段落另填 `dialogue.kind` 区分实际对白（`speech`）、内心（`thought`）、引用（`quotation`）或无法确定（`uncertain`）；实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，结合章纲和现场判断表达目的、听者、时间压力与措辞。按场景提交 `scenes`：连续的 `startIndex/endIndex` 必须覆盖全文，每场填写 `layout`（布局）、`mechanism`（主要因果链）、`timeline`（完整时间线）与 `actions`。关键动作逐条记录 `index` 和 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对位置、工具来源、前提、结果、耗时和危险禁令。同段多动作逐条记录；静态场景可用空动作数组，但须说明依据。再填写 `checks` 的 `continuity`、`timing`、`voice`、`narration`、`rhythm`、`facts`，调用 `novel_deai_review({ chapter, baseHash, checks, observations, timeBudgets, scenes, paragraphs })`。每项 `checks` 使用 `{ verdict, detail, evidence, counterargument }`，不再接受一句肯定话。`verdict` 为 `supported`、`conflict`、`uncertain` 或 `not-applicable`；至少一条正文逐字引文，确认矛盾至少两条不同引文。正文证据写 `{ source: "chapter", index, quote }`；其他来源为 `beats`、`outline`、`events`、`threads`，或带实际条目名 `name` 的 `character`、`setting`、`style`。工具验证引文存在、正文段号准确，并记录来源哈希。`counterargument` 说明最可能推翻结论的证据或缺失依据，不将推测当原文。记录保存在 `book.json` 对应章节的 `deaiReview` 中；正文、被引用资料或启用文风变化后失效。旧版无证据记录需重新提交。整章段落多、payload 很长时，可先把 `checks`、`observations`、`timeBudgets`、`scenes`、`paragraphs`（以及 `resolutions`）写成一个 JSON 对象文件，用 `novel_deai_review({ chapter, baseHash, payloadFile })` 传入：工具按同一套规则校验，直接传的字段优先于文件里的同名字段。多个写工具（如 `write`、shell heredoc）都可以拼出这份文件，从而避免单次工具调用过长被截断成非法 JSON。
+4. **登记复核**：对最终审稿包全部段落提交 `{ index, reason }`。带对话标签的段落另填 `dialogue.kind` 区分实际对白（`speech`）、内心（`thought`）、引用（`quotation`）或无法确定（`uncertain`）；实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，结合章纲和现场判断表达目的、听者、时间压力与措辞。按场景提交 `scenes`：连续的 `startIndex/endIndex` 必须覆盖全文，每场填写 `layout`（布局）、`mechanism`（主要因果链）、`timeline`（完整时间线）与 `actions`。关键动作逐条记录 `index` 和 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对位置、工具来源、前提、结果、耗时和危险禁令。同段多动作逐条记录；静态场景可用空动作数组，但须说明依据。再填写 `checks` 的 `continuity`、`timing`、`voice`、`narration`、`rhythm`、`facts`，调用 `novel_deai_review({ chapter, baseHash, styleHash, checks, observations, timeBudgets, scenes, paragraphs })`。启用文风时 `styleHash` 必填，取包后换卡或切换文风会拒绝登记。每项 `checks` 使用 `{ verdict, detail, evidence, counterargument }`，不再接受一句肯定话。`verdict` 为 `supported`、`conflict`、`uncertain` 或 `not-applicable`；至少一条正文逐字引文，确认矛盾至少两条不同引文。正文证据写 `{ source: "chapter", index, quote }`；其他来源为 `beats`、`outline`、`events`、`threads`，或带实际条目名 `name` 的 `character`、`setting`、`style`。工具验证引文存在、正文段号准确，并记录来源哈希。`counterargument` 说明最可能推翻结论的证据或缺失依据，不将推测当原文。记录保存在 `book.json` 对应章节的 `deaiReview` 中；正文、被引用资料或启用文风变化后失效。旧版无证据记录需重新提交。整章段落多、payload 很长时，可先把 `checks`、`observations`、`timeBudgets`、`scenes`、`paragraphs`（以及 `resolutions`）写成一个 JSON 对象文件，用 `novel_deai_review({ chapter, baseHash, payloadFile })` 传入：工具按同一套规则校验，直接传的字段优先于文件里的同名字段。多个写工具（如 `write`、shell heredoc）都可以拼出这份文件，从而避免单次工具调用过长被截断成非法 JSON。
 
 **报错定位**：`checks` 六维必须各带至少一条正文逐字引文；缺哪一维、缺哪一项会逐条列出（如 `voice.evidence 需至少一条 chapter 引文（段号 index ＋ 逐字 quote）`）。引文校验失败会给出具体来源与段落（如 `chapter 第 2 段 里找不到「…」`），不再只回一个来源键。
 5. **最后自查**：`novel_check({ chapter })` 默认开启机械线索检测；`aiTone: false` 仅关闭该检测，不跳过语义复核。当前版本未复核会报 `deai-review-pending`。`conflict` 和 `uncertain` 会实际保存为 `blocked`，按连续性、时间、信息缺失、对白、叙述和句段顺序回显；即使其余字段完整也不能标记 `final`。旧阻塞项转为通过时必须填写对应 `resolutions`，说明修复依据或更正原因，旧问题和处理理由保留在 `resolvedFindings`。机械结果与已登记语义问题分别显示；模型未登记的问题不会被伪称为自动检出。
@@ -212,6 +212,18 @@ novel_read({ source: 'D:\\books\\旧稿.txt', offset: 4000, limit: 4000 }) // �
 `beats-gap` 与 `info-missing` 使用字面近似匹配，只表示待对照的场景或信息，现放入非阻塞 `heuristicNotes`，不据此认定漏写。保存及全书巡检也会注明匹配局限；若模型确认必要信息确实缺失，仍可用逐字证据登记语义问题。
 
 登记与检查的可见回执直接显示 `status`、`certifiesSemantics: false` 及 conflict/uncertain 计数。有阻塞时状态为 `blocked`，“已登记”只描述保存动作。检查将机械及资料项、审稿阻塞、待登记提示分别计数，并列出机械及资料项的种类；这些数量不是已经确认的正文错误数。阶段内没有单步耗时不单独构成缺陷，也不要求为验收补计时句。
+
+### 章节状态与显式定稿
+
+- 空、纯空白或待写占位正文为 `planned`；其他非空正文通常为 `draft`，不能因导入时传 `planned` 而继续显示未写。
+- `recorded` 只开放定稿资格，不自动把草稿提升为 `final`。如需定稿，把当前完整正文原样作为 `content`，用 `novel_write({ chapter, content, status: "final" })` 明确请求；没有当前有效复核或仍有阻塞项时，整次写入在落盘前拒绝。
+- 已定稿章逐字写回且复核仍有效时保留 `final`；明确传 `draft` 则保持草稿。正文、引用资料、来源覆盖要求或启用文风变化后，章节列表、上下文与历史列表按当前有效性显示 `draft`，与 `novel_check` 的待复核/阻塞结果对应。
+- 新导入的非空原文为 `draft`，不能在正式 `novel_import` 中直接请求 `final`；先导入、审稿，再显式定稿。默认 skip 和空来源保护不改已有章节；覆盖后的旧 `final` 必须重新满足复核门槛。
+- 恢复历史正文仍先留存恢复前内容。仅已有 `final` 声明且恢复内容的复核仍有效时保留定稿；原本是草稿则不自动晋级，空/占位恢复为 `planned`。工具与 HTTP 恢复回执均返回实际 `status`。
+- 启用文风卡的完整指纹独立绑定，不因某一维度登记 `not-applicable` 而漏掉同名卡变化。`novel_deai_pack` 返回 `style.hash`；启用文风时登记必须提交 `styleHash`，取包后更换同名卡、切换到正文相同但名称不同的卡，或切换启用文风都会拒绝登记，要求重新取包。即使启用卡缺失或为空，审稿包也会显示可提交的指纹并标明资料不足。旧记录可沿用已引用文风的哈希；没有可验证指纹的旧记录需重新审稿。
+- 启用文风卡缺失或为空时，资料预检、登记和复核失效检查共用同一判定：即使 `narration`/`rhythm` 登记为 `not-applicable`，也会作为资料不足阻塞定稿，不能把缺资料当成无约束。
+- 正文保存、审稿登记、导入、恢复、建章、改书信息和切换文风都在同一把 `book.json` 写锁内读取当前书目、校验并提交；并发请求不会用旧快照覆盖新登记的阻塞审稿或状态。书目和文风启用都用同目录临时文件加原子替换写入，读取方不会解析到写了一半的 JSON。
+- 列表读取只投影当前有效状态，不重写作者的定稿声明或历史复核。`book.json` 中保存的 `deaiReview.status` 是登记时结果，当前复核以 `novel_check` 为准；正文与资料逐字恢复后，内容指纹匹配的记录可以重新有效。
 
 ### 登记校验（版本 6）
 

@@ -22,7 +22,7 @@ import { presentationContext, selectPresentationExcerpts, renderPresentationExce
 import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
-import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
+import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, deriveChapterStatus, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
 import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
 import { CHARACTERS_DIR } from './lib/book.js'
 import { CHARACTER_EXT } from './lib/book.js'
@@ -35,6 +35,7 @@ import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEA
 import { OUTLINE_FILE } from './lib/book.js'
 import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
 import { stampOf, stampToIso, shortHash } from './lib/book.js'
+import { withFileLock } from './lib/file-lock.js'
 
 export const name = 'novel'
 
@@ -42,7 +43,7 @@ export const name = 'novel'
 export const inject = ['tools', 'webServer', 'agents', 'llm']
 
 const API_PREFIX = '/novel-api'
-const PLUGIN_REVISION = 'scoped-diagnostics-v2'
+const PLUGIN_REVISION = 'review-status-v2'
 
 const REVIEW_SOURCE_ROLES = {
   chapter: { role: 'written-content', label: '当前正文', policy: '核对叙述、对白和推断各自声称了什么；人物说法不自动成为作者事实。' },
@@ -93,6 +94,16 @@ function toLosslessJson(value, seen = new WeakSet()) {
 
 /** 一次调用作用域里的书根（工具/路由各自解析，互不串书）。 */
 const rootContext = new AsyncLocalStorage()
+
+/** 书目读-校验-写共用一把锁：防止并发请求用旧快照覆盖新登记的审稿或状态。 */
+function withBookLock(root, task) {
+  return withFileLock(path.join(root, BOOK_FILE), task)
+}
+
+/** 工具执行整体进入书目写锁；正文缓冲、核验与最终落盘都留在同一临界区。 */
+function bookLocked(rootNow, handler) {
+  return args => withBookLock(rootNow(), () => handler(args))
+}
 
 /**
  * 会话的工作目录。优先问 workingDirectory 服务，其次读会话 header。
@@ -1063,21 +1074,35 @@ function activeStyleName(meta) {
   return typeof meta?.style === 'string' ? meta.style.trim() : ''
 }
 
+/**
+ * 启用文风的指纹：名称与卡片正文一起计算，避免内容相同但名称不同的卡共享指纹。
+ * contentHash 仅供旧记录沿用已引用文风哈希；名称变化另由 review.styleName 校验。
+ */
+async function activeStyleSnapshot(root, meta) {
+  const name = activeStyleName(meta)
+  const text = name ? (await readStyle(root, name)) ?? '' : ''
+  const contentHash = name ? createHash('sha256').update(text).digest('hex') : ''
+  const hash = name ? createHash('sha256').update(`${name}\u0000${text}`).digest('hex') : ''
+  return { name, text, hash, contentHash }
+}
+
 async function activateStyle(root, name) {
   const safe = String(name ?? '').trim() ? safeStyleName(name) : ''
-  const bookPath = path.join(root, BOOK_FILE)
-  let raw = {}
-  try {
-    raw = JSON.parse(await fsp.readFile(bookPath, 'utf8'))
-  } catch {
-    raw = {}
-  }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {}
-  raw.version = raw.version ?? 1
-  if (safe) raw.style = safe
-  else delete raw.style
-  await fsp.writeFile(bookPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
-  return safe
+  return withBookLock(root, async () => {
+    const bookPath = path.join(root, BOOK_FILE)
+    let raw = {}
+    try {
+      raw = JSON.parse(await fsp.readFile(bookPath, 'utf8'))
+    } catch {
+      raw = {}
+    }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {}
+    raw.version = raw.version ?? 1
+    if (safe) raw.style = safe
+    else delete raw.style
+    await writeFileAtomic(bookPath, `${JSON.stringify(raw, null, 2)}\n`)
+    return safe
+  })
 }
 
 /** 认编码：BOM 优先，其次无 BOM 的 UTF-16，再按 UTF-8 试探，最后落到 GB18030（中文 txt 常见）。 */
@@ -1842,30 +1867,32 @@ async function reconcileHistory(root, options = {}) {
 
 /** 恢复到某一版：先把当前内容也留一版，所以「恢复」本身也能撤销。 */
 async function restoreVersion(root, chapterId, version) {
-  const { meta } = await loadBook(root)
-  const chapter = findChapter(meta.chapters, chapterId)
-  if (!chapter) throw new Error(`没有这一章「${chapterId}」`)
-  const target = await readVersion(root, chapter.id, version)
-  if (!target) throw new Error(`没有这一版「${version}」`)
+  return withBookLock(root, async () => {
+    const { meta } = await loadBook(root)
+    const chapter = findChapter(meta.chapters, chapterId)
+    if (!chapter) throw new Error(`没有这一章「${chapterId}」`)
+    const target = await readVersion(root, chapter.id, version)
+    if (!target) throw new Error(`没有这一版「${version}」`)
 
-  const currentFile = path.join(root, chapter.file)
-  const current = (await readText(currentFile)) ?? ''
-  const snapshot = current.trim()
-    ? await snapshotChapter(root, {
+    const currentFile = path.join(root, chapter.file)
+    const current = (await readText(currentFile)) ?? ''
+    const snapshot = current.trim()
+      ? await snapshotChapter(root, {
         chapter,
         text: current,
         source: 'restore',
         note: `恢复前留存（要恢复到 ${version}）`,
         style: activeStyleName(meta),
       })
-    : null
+      : null
 
-  await writeFileAtomic(currentFile, target.content)
-  await writeFileAtomic(lastSnapshotPath(root, chapter.id), target.content)
-  const chars = countChars(target.content)
-  if (chars > 0) chapter.status = 'draft'
-  await persistBook(root, { ...meta, chapters: meta.chapters }, meta.chapters)
-  return { version, chars, snapshot }
+    await writeFileAtomic(currentFile, target.content)
+    await writeFileAtomic(lastSnapshotPath(root, chapter.id), target.content)
+    const chars = countChars(target.content)
+    chapter.status = await currentChapterStatus(root, chapter, target.content, meta)
+    await persistBook(root, { ...meta, chapters: meta.chapters }, meta.chapters)
+    return { chapter: { id: chapter.id, title: chapter.title }, version, chars, status: chapter.status, snapshot }
+  })
 }
 
 /** 全书巡检：把逐章检查横向扫一遍，只报「能算出来的事实」，不给评语。 */
@@ -2035,7 +2062,7 @@ export function apply(ctx, config) {
   async function snapshot() {
     const { exists, meta } = await loadBook(rootNow())
     const chapters = []
-    for (const chapter of meta.chapters) chapters.push(await chapterStats(rootNow(), chapter, meta.targetChars))
+    for (const chapter of meta.chapters) chapters.push(await currentChapterStats(rootNow(), chapter, meta))
     const outline = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
     const characters = await listCharacters(rootNow())
     const threads = await loadThreads(rootNow())
@@ -2268,7 +2295,7 @@ export function apply(ctx, config) {
         )
       },
     },
-    execute: async args => {
+    execute: bookLocked(rootNow, async args => {
       const { meta } = await loadBook(rootNow())
       const next = { ...meta }
       const changed = []
@@ -2312,7 +2339,7 @@ export function apply(ctx, config) {
         changed,
         ...(scaffold ? { scaffold } : {}),
       }
-    },
+    }),
     presentCall: () => ({ card: 'generic', title: '改书的元信息', kind: 'write', rawInput: {} }),
   })
 
@@ -2337,7 +2364,7 @@ export function apply(ctx, config) {
         offset: { type: 'number', description: '从识别到的第几章开始（1 起，默认 1）' },
         dryRun: { type: 'boolean', description: 'true = 只展示切分结果、不写任何文件；省略或 false = 正式导入，建议先试读' },
         replace: { type: 'boolean', description: '省略或 false = 保留并跳过已有同名或可识别为同章号的章节；只有作者明确要求覆盖时才传 true，非空旧稿变化时先留历史快照' },
-        status: { type: 'string', enum: CHAPTER_STATUS, description: '导入后的章节状态，默认 planned' },
+        status: { type: 'string', enum: CHAPTER_STATUS, description: '兼容参数：非空正文实际为 draft，空正文为 planned；不能在导入时直接请求 final，须先复核再显式定稿' },
       },
       required: ['source'],
       additionalProperties: false,
@@ -2385,6 +2412,7 @@ export function apply(ctx, config) {
               ? '\n覆盖策略：本次显式启用 replace: true；非空旧稿内容变化时先留历史快照，再写入新正文。'
               : '\n覆盖策略：默认保留并跳过已有章节，未启用覆盖。') +
             (value.warnings.length ? `\n⚠ ${value.warnings.join('；')}` : '') +
+            '\n状态门槛：新导入的非空正文为 draft，空正文为 planned；覆盖的已有 final 仅在当前复核仍有效时保留。需要定稿时先完成复核，再用 novel_write 显式请求 status: "final"。' +
             '\n\n下一步：先 novel_status 核对章节与字数，再用 novel_beats 写结构化章纲（### 场景 scene-id：标题、- 时序：、- 出场：、#### 人物 character-id；标记 → 爽点 / → 钩子），人物用 novel_card 落卡。',
         )
       },
@@ -2451,6 +2479,7 @@ export function apply(ctx, config) {
         warnings.push(`${title} 原文里是空的（只有标题、没有正文）；新章节会登记为 planned，已有章节保留正文和元数据`)
       }
 
+      if (args.dryRun !== true && args.status === 'final') throw new Error('导入不能直接请求 final：请先导入为草稿，完成当前版本复核，再用 novel_write 显式定稿；未写入')
       if (args.dryRun === true) {
         return {
           mode: 'dry-run',
@@ -2467,75 +2496,80 @@ export function apply(ctx, config) {
         }
       }
 
-      const { meta } = await loadBook(root)
-      const chapters = [...meta.chapters]
-      const originalChapters = JSON.stringify(chapters)
-      const imported = []
-      const skipped = []
-      const empty = []
-      for (const segment of picked) {
-        const key = chapterNumberOf(segment.title)
-        const existing = chapters.find(
-          item => item.title.trim() === segment.title.trim() || (key > 0 && chapterNumberOf(item.title) === key),
-        )
-        if (existing && args.replace !== true) {
-          skipped.push(segment.title)
-          continue
-        }
-        const bodyChars = countChars(segment.body)
-        if (existing && bodyChars === 0) {
-          skipped.push(segment.title)
-          warnings.push(`${segment.title} 来源只有标题、没有正文；已保留已有章节的正文、状态和备注，未覆盖`)
-          continue
-        }
-        let chapter = existing
-        if (!chapter) {
-          const id = nextChapterId(chapters)
-          chapter = {
-            id,
-            title: segment.title,
-            file: `${CHAPTERS_DIR}/${id}.md`,
-            status: CHAPTER_STATUS.includes(args.status) ? args.status : 'planned',
-            targetChars: 0,
-            note: '原文摘录',
+      return withBookLock(root, async () => {
+        const { meta } = await loadBook(root)
+        const chapters = [...meta.chapters]
+        const originalChapters = JSON.stringify(chapters)
+        const imported = []
+        const skipped = []
+        const empty = []
+        for (const segment of picked) {
+          const key = chapterNumberOf(segment.title)
+          const existing = chapters.find(
+            item => item.title.trim() === segment.title.trim() || (key > 0 && chapterNumberOf(item.title) === key),
+          )
+          if (existing && args.replace !== true) {
+            skipped.push(segment.title)
+            continue
           }
-          chapters.push(chapter)
-        } else {
-          chapter = { ...chapter, note: chapter.note || '原文摘录' }
-          chapters[chapters.findIndex(item => item.id === chapter.id)] = chapter
+          const bodyChars = countChars(segment.body)
+          if (existing && bodyChars === 0) {
+            skipped.push(segment.title)
+            warnings.push(`${segment.title} 来源只有标题、没有正文；已保留已有章节的正文、状态和备注，未覆盖`)
+            continue
+          }
+          let chapter = existing
+          if (!chapter) {
+            const id = nextChapterId(chapters)
+            chapter = {
+              id,
+              title: segment.title,
+              file: `${CHAPTERS_DIR}/${id}.md`,
+              status: 'planned',
+              targetChars: 0,
+              note: '原文摘录',
+            }
+            chapters.push(chapter)
+          } else {
+            chapter = { ...chapter, note: chapter.note || '原文摘录' }
+            chapters[chapters.findIndex(item => item.id === chapter.id)] = chapter
+          }
+          if (bodyChars === 0) {
+            // 原文这一章就是空的：别留个 1 字节的空壳假装导入成功
+            chapter = { ...chapter, status: 'planned', note: '原文为空' }
+            chapters[chapters.findIndex(item => item.id === chapter.id)] = chapter
+            empty.push(`${chapter.id} ${chapter.title}`)
+            continue
+          }
+          const target = path.join(root, chapter.file)
+          const body = `${segment.body}\n`
+          if (CHAPTER_STATUS.includes(args.status)) chapter.status = args.status
+          chapter.status = await currentChapterStatus(root, chapter, body, meta)
+          await fsp.mkdir(path.dirname(target), { recursive: true })
+          const previous = (await readText(target)) ?? ''
+          if (previous.trim() && previous.trim() !== segment.body.trim()) {
+            await snapshotChapter(root, { chapter, text: previous, source: 'import:replace', note: '导入原文前留存', style: activeStyleName(meta) })
+          }
+          await writeFileAtomic(target, body)
+          // 种一次快照指纹，免得看门狗把这些章当成「被工具外改动」。
+          await writeFileAtomic(lastSnapshotPath(root, chapter.id), body)
+          imported.push({ id: chapter.id, title: chapter.title, chars: countChars(segment.body) })
         }
-        if (bodyChars === 0) {
-          // 原文这一章就是空的：别留个 1 字节的空壳假装导入成功
-          chapter = { ...chapter, status: 'planned', note: '原文为空' }
-          chapters[chapters.findIndex(item => item.id === chapter.id)] = chapter
-          empty.push(`${chapter.id} ${chapter.title}`)
-          continue
+        if (JSON.stringify(chapters) !== originalChapters) await persistBook(root, meta, chapters)
+        return {
+          mode: 'import',
+          source: args.source,
+          encoding: loaded.encoding,
+          bytes: loaded.bytes,
+          detected: total,
+          imported: imported.length,
+          skipped,
+          empty,
+          totalChars: imported.reduce((sum, item) => sum + item.chars, 0),
+          chapters: imported,
+          warnings,
         }
-        const target = path.join(root, chapter.file)
-        await fsp.mkdir(path.dirname(target), { recursive: true })
-        const previous = (await readText(target)) ?? ''
-        if (previous.trim() && previous.trim() !== segment.body.trim()) {
-          await snapshotChapter(root, { chapter, text: previous, source: 'import:replace', note: '导入原文前留存', style: activeStyleName(meta) })
-        }
-        await writeFileAtomic(target, `${segment.body}\n`)
-        // 种一次快照指纹，免得看门狗把这些章当成「被工具外改动」。
-        await writeFileAtomic(lastSnapshotPath(root, chapter.id), `${segment.body}\n`)
-        imported.push({ id: chapter.id, title: chapter.title, chars: countChars(segment.body) })
-      }
-      if (JSON.stringify(chapters) !== originalChapters) await persistBook(root, meta, chapters)
-      return {
-        mode: 'import',
-        source: args.source,
-        encoding: loaded.encoding,
-        bytes: loaded.bytes,
-        detected: total,
-        imported: imported.length,
-        skipped,
-        empty,
-        totalChars: imported.reduce((sum, item) => sum + item.chars, 0),
-        chapters: imported,
-        warnings,
-      }
+      })
     },
     presentCall: () => ({ card: 'generic', title: '导入原文到章节', kind: 'write', rawInput: {} }),
   })
@@ -2651,7 +2685,7 @@ export function apply(ctx, config) {
             required: ['start', 'end', 'content'],
           },
         },
-        status: { type: 'string', enum: CHAPTER_STATUS, description: '写完后的章节状态，默认 draft' },
+        status: { type: 'string', enum: CHAPTER_STATUS, description: '作者声明：final 必须有当前有效且无阻塞的复核；draft 不自动晋级，未传时保留仍有效的 final；空/占位正文为 planned，其他非空正文为 draft' },
         note: { type: 'string', description: '一句话说明这次改动（写进历史时间线，例如「按文风重写」「补了结尾」）' },
         carryOver: { type: 'boolean', description: 'true = 把本章章纲里还没写完的场景/信息自动顺延到下一章章纲，避免硬塞' },
       },
@@ -2689,7 +2723,7 @@ export function apply(ctx, config) {
         )
       },
     },
-    execute: async args => {
+    execute: bookLocked(rootNow, async args => {
       if (args.carryOver && args.chapter) {
         const { meta } = await loadBook(rootNow())
         const chapter = findChapter(meta.chapters, args.chapter)
@@ -2730,14 +2764,15 @@ export function apply(ctx, config) {
         chapters[index] = chapter
       }
 
-      if (CHAPTER_STATUS.includes(args.status)) chapter.status = args.status
-
+      const declaredStatus = CHAPTER_STATUS.includes(args.status) ? args.status : chapter.status
       const target = path.join(rootNow(), chapter.file)
       const previous = (await readText(target)) ?? ''
       const body = applyChapterEdit(previous, { ...args, mode })
-      const reviewed = await hasCurrentDeaiReview(rootNow(), chapter, body, meta)
-      if (args.status === 'final' && !reviewed) throw new Error('当前版本缺少有效审稿记录或仍有阻塞项，请先保存草稿、读取审稿包并如实登记；有效记录也不代表自动语义认证；未写入')
-      if (chapter.status === 'final' && !reviewed) chapter.status = 'draft'
+      const review = await deaiReviewState(rootNow(), chapter, body, meta)
+      let reviewed = review.status === 'recorded'
+      const status = deriveChapterStatus(body, declaredStatus, review.status)
+      if (args.status === 'final' && status !== 'final') throw new Error('当前版本缺少有效审稿记录或仍有阻塞项，请先保存草稿、读取审稿包并如实登记；有效记录也不代表自动语义认证；未写入')
+      chapter.status = status
 
       // 覆盖/追加前先留一版完整快照（正文 + 元数据），改写是破坏性操作。
       let backup = ''
@@ -2757,12 +2792,8 @@ export function apply(ctx, config) {
       await writeFileAtomic(lastSnapshotPath(rootNow(), chapter.id), body)
 
       const chars = countChars(body)
-      if (!CHAPTER_STATUS.includes(args.status)) {
-        chapter.status = chars > 0 && !isPlaceholderText(body) ? 'draft' : chapter.status
-      }
       await persistBook(rootNow(), { ...meta, chapters }, chapters)
 
-      const after = await snapshot()
       const chapterTarget = chapter.targetChars > 0 ? chapter.targetChars : meta.targetChars
       // 写完顺手对一遍章纲：漏掉的场景当场说出来，别等作者读完全章才发现。
       const warnings = validateChapterContent(body)
@@ -2878,8 +2909,19 @@ export function apply(ctx, config) {
           }
         }
       }
+      if (carriedOver) {
+        const currentReview = await deaiReviewState(rootNow(), chapter, body, meta)
+        reviewed = currentReview.status === 'recorded'
+        const currentStatus = deriveChapterStatus(body, declaredStatus, currentReview.status)
+        if (chapter.status !== currentStatus) {
+          chapter.status = currentStatus
+          await persistBook(rootNow(), { ...meta, chapters }, chapters)
+        }
+      }
+      if (args.status === 'final' && chapter.status !== 'final') warnings.push('章纲顺延改变了审稿来源，正文已保存，但本次 final 声明未保留；请重新取包复核后再显式定稿。')
       if (!reviewed) warnings.push(`【当前版本待复核】章节 ${chapter.id}：${DEAI_WORKFLOW}`)
       if (mode !== 'patch') warnings.push(`若本章中主角的资产、修为境界、关键道具去向、伤势或时间线有变动，记得调用 novel_ledger 更新状态台账（ledger.md），避免下一章写串。`)
+      const after = await snapshot()
       return {
         id: chapter.id,
         title: chapter.title,
@@ -2893,7 +2935,7 @@ export function apply(ctx, config) {
         ...(carriedOver ? { carriedOver } : {}),
         warnings,
       }
-    },
+    }),
     presentCall: args => ({
       card: 'generic',
       title: args.chapter ? `写入 ${args.chapter}` : '新建一章',
@@ -3393,6 +3435,7 @@ export function apply(ctx, config) {
       let rawChapter = ''
       if (current.file) {
         rawChapter = (await readText(path.join(rootNow(), current.file))) ?? ''
+        current.status = await currentChapterStatus(rootNow(), meta.chapters[index], rawChapter, meta)
         if (rewrite) chapterText = rawChapter
       }
       if (rewrite && !rawChapter.trim()) throw new Error('该章尚无正文，请选择续写装配')
@@ -4199,8 +4242,12 @@ export function apply(ctx, config) {
         if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
         lines.push('', '## 各维度 supported 所需来源（须在对应 checks 中引用）')
         for (const item of value.sourceRequirements ?? []) lines.push(`- ${item.aspect}：${item.source}:${item.name}${item.anchor ? '，请引用同类场景的锚点原文' : ''}`)
-        if (value.style.text) lines.push('', `## 文风样本与约束：${value.style.name}`, value.style.text)
-        lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review。')
+        if (value.style.text) {
+          lines.push('', `## 文风样本与约束：${value.style.name}（styleHash: ${value.style.hash}）`, value.style.text)
+        } else if (value.style.name) {
+          lines.push('', `## 启用文风「${value.style.name}」缺失或为空（styleHash: ${value.style.hash}）`, '这是资料不足，不能当作没有文风约束；登记后会阻塞定稿，请先补齐或取消启用。')
+        }
+        lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review；启用文风时一并提交上面显示的 styleHash。')
         for (const item of value.items) {
           lines.push('')
           lines.push(`### #${item.index} [${item.tags.join(' / ')}] (start=${item.start}, end=${item.end})`)
@@ -4220,18 +4267,17 @@ export function apply(ctx, config) {
         cards.push({ name: card.name, content: (await readCharacter(rootNow(), card.name)) ?? '' })
       }
       const packed = extractDeaiPack(raw, cards)
-      const styleName = activeStyleName(meta)
       const beats = await readBeats(rootNow(), chapter, meta.chapters)
-      const styleText = styleName ? (await readStyle(rootNow(), styleName)) ?? '' : ''
+      const style = await activeStyleSnapshot(rootNow(), meta)
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
         rules: `${DEAI_RULES}\n\n${SCENE_REVIEW_RULES}\n\n${REVIEW_EVIDENCE_RULES}\n\n${DEAI_WORKFLOW}`,
-        style: { name: styleName, text: readStyleCalibration(styleText).content },
+        style: { name: style.name, text: readStyleCalibration(style.text).content, hash: style.hash },
         dialogueContext: { beats: beats.section?.body ?? '' },
         settingReferences: (await listSettings(rootNow())).map(item => ({ name: item.name, summary: item.summary })),
         sourceRequirements: (await reviewSourceCoverage(rootNow(), meta, raw)).requirements,
-        materialPreflight: await materialPreflight(rootNow(), chapter, { chapters: meta.chapters, beatsText: beats.section?.body ?? '', styleName, styleText }),
+        materialPreflight: await materialPreflight(rootNow(), chapter, { chapters: meta.chapters, beatsText: beats.section?.body ?? '', styleName: style.name, styleText: style.text }),
       }
     },
     presentCall: args => ({ card: 'generic', title: `全文语义审稿 ${args.chapter}`, kind: 'read', rawInput: args }),
@@ -4239,12 +4285,13 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_deai_review',
-    description: '登记有证据的审稿结果。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
+    description: '登记有证据的审稿结果。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。干净的 recorded 只开放显式定稿资格，不自动把 draft 提升为 final；正文、引用资料或启用文风变化后资格失效。启用文风时须把取包返回的 styleHash 一并提交，取包后换卡或切换文风会拒绝登记。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
         chapter: { type: 'string' },
         baseHash: { type: 'string', description: '当前 novel_deai_pack 返回的整章哈希，发现矛盾也可登记' },
+        styleHash: { type: 'string', description: '当前 novel_deai_pack 返回的 style.hash（启用名称＋卡片正文的指纹）；启用文风时必填，防止取包后换卡或切换到同内容另一张卡仍按旧审稿登记' },
         payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段；顶层也可带 baseHash，直接参数缺省时采用文件里的值（chapter 仍要直接传）。' },
         checks: {
           type: 'object', additionalProperties: false,
@@ -4380,10 +4427,10 @@ export function apply(ctx, config) {
         ...(value.timingReports ?? []).map(item => `时间记账「${item.label}」：提交值合计 ${item.total}，明示耗时下界 ${item.minimum} / 可用 ${item.available} ${item.unit}；${item.uncertain ? `记账局限（不单凭估算或未知自动阻塞）：${(item.uncertainties ?? []).join('；')}。` : ''}动作可行性未获自动判定；新增计时句不能代替可行性判断。`),
         '## 工具提取的引文完整段落（包括 supported 项）',
         ...(value.evidenceContexts ?? []).map(item => `[${item.aspects.join('/')} · ${item.source}/${item.role ?? REVIEW_SOURCE_ROLES[item.source]?.role ?? ''}${item.name ? ':' + item.name : ''}${item.index ? ' #' + item.index : ''}]\n${item.context}`),
-        '请运行 novel_check 核对当前状态；登记记录不是自动自然度认证。',
+        '请运行 novel_check 核对当前状态；recorded 只开放显式定稿资格，draft 不自动晋级；登记记录不是自动自然度认证。',
       ].join('\n')),
     },
-    execute: async args => {
+    execute: async args => withBookLock(rootNow(), async () => {
       const root = rootNow()
       const { meta } = await loadBook(root)
       const chapter = findChapter(meta.chapters, args.chapter)
@@ -4403,18 +4450,21 @@ export function apply(ctx, config) {
       const packed = extractDeaiPack(raw, [])
       if (!raw.trim()) throw new Error(`第 ${chapter.id} 章正文为空，先写正文再登记复核；未登记`)
       const submittedHash = args.baseHash || payload.baseHash
+      const submittedStyleHash = args.styleHash || payload.styleHash
       if (!submittedHash) throw new Error('缺少 baseHash：请传 novel_deai_pack 返回的 baseHash（写在 payloadFile 顶层也可以）。重新取包不会改变哈希，只有正文变化才会；未登记')
       if (submittedHash !== packed.baseHash) throw new Error(`版本已变化：提交 ${String(submittedHash).slice(0, 12)}，当前正文 ${packed.baseHash.slice(0, 12)}；请重新调用 novel_deai_pack 取包后再登记；未登记`)
+      const style = await activeStyleSnapshot(root, meta)
+      if (submittedStyleHash !== undefined && submittedStyleHash !== style.hash) throw new Error('启用文风在取包后已变化：请重新调用 novel_deai_pack 取包并核对文风后再登记；未登记')
+      if (submittedStyleHash === undefined && style.name) throw new Error(`取包时未提交启用文风「${style.name}」的版本指纹。请重新调用 novel_deai_pack 取包，并把返回的 style.hash 作为 styleHash 提交，避免把旧文风的审稿登记到新卡；未登记`)
       const observations = reviewObservations(observationsInput, checks)
       let timing = calculateReviewTimeBudgets(timeBudgets, packed, checks)
       const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence])
       timing = calculateReviewTimeBudgets(timeBudgets, packed, checks, evidence.contexts)
-      const coverage = await reviewSourceCoverage(root, meta, raw, checks)
+      const coverage = await reviewSourceCoverage(root, meta, raw, checks, style)
       const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
       const sceneProblem = sceneReviewProblem(scenes, packed.totalItems)
       if (sceneProblem) throw new Error(`场景复核未通过：${sceneProblem}；未登记`)
-      const indices = new Set(Array.isArray(paragraphs) ? paragraphs.map(item => item?.index) : [])
-      if (!Array.isArray(paragraphs) || paragraphs.length !== packed.totalItems || indices.size !== packed.totalItems || packed.items.some(item => !indices.has(item.index)) || paragraphs.some(item => typeof item?.reason !== 'string' || !item.reason.trim())) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
+      if (!hasCompleteParagraphReviews(paragraphs, packed.totalItems)) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
       const byIndex = new Map(paragraphs.map(item => [item.index, item]))
       for (const item of packed.items) {
         if (!item.tags.includes('对话')) continue
@@ -4433,7 +4483,8 @@ export function apply(ctx, config) {
       chapter.deaiReview = {
         version: DEAI_REVIEW_VERSION,
         baseHash: packed.baseHash,
-        styleName: activeStyleName(meta),
+        styleName: style.name,
+        ...(style.name ? { styleHash: style.hash } : {}),
         reviewedAt: new Date().toISOString(),
         status,
         certifiesSemantics: false,
@@ -4449,10 +4500,10 @@ export function apply(ctx, config) {
         paragraphs,
         resolvedFindings: resolvedFindings.map(item => ({ ...item, resolution: resolutions[item.aspect] })),
       }
-      if (status === 'blocked' && chapter.status === 'final') chapter.status = 'draft'
+      chapter.status = deriveChapterStatus(raw, chapter.status, status)
       await persistBook(root, meta, meta.chapters)
       return { chapter: chapter.id, baseHash: packed.baseHash, reviewedParagraphs: paragraphs.length, status, certifiesSemantics: false, checkVerdicts: Object.fromEntries(Object.entries(checks).map(([aspect, check]) => [aspect, check.verdict])), findings, preferenceNotes: observations.notes, evidenceContexts: evidence.contexts, timingReports: timing.reports }
-    },
+    }),
     presentCall: args => ({ card: 'generic', title: `登记语义复核 ${args.chapter}`, kind: 'write', rawInput: args }),
   })
 
@@ -4874,7 +4925,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_restore',
     description:
-      '把某一章恢复到某个历史版本。恢复前会先把当前内容也留一版（所以随时能再恢复回来），恢复后章节状态回到 draft。' +
+      '把某一章恢复到某个历史版本。恢复前会先把当前内容也留一版（所以随时能再恢复回来）。恢复后仅原有 final 声明且复核仍有效时保留 final；其他非空正文为 draft，空/占位正文为 planned。' +
       '\n不知道有哪些版本就先 novel_history({ chapter })。',
     parameters: {
       type: 'object',
@@ -4893,20 +4944,16 @@ export function apply(ctx, config) {
           chapter: { type: 'object', additionalProperties: true },
           version: { type: 'string' },
           chars: { type: 'integer' },
+          status: { type: 'string', enum: CHAPTER_STATUS },
           snapshot: { type: 'object', additionalProperties: true },
         },
       },
       render: (_args, value) => {
         const kept = value.snapshot ? `当前内容已留存为 ${value.snapshot.version}。` : ''
-        return textRender(`已把 ${value.chapter.id} ${value.chapter.title} 恢复到 ${value.version}（${value.chars} 字）。${kept}`)
+        return textRender(`已把 ${value.chapter.id} ${value.chapter.title} 恢复到 ${value.version}（${value.chars} 字，${value.status}）。${kept}`)
       },
     },
-    execute: async args => {
-      const result = await restoreVersion(rootNow(), args.chapter, String(args.version).trim())
-      const { meta } = await loadBook(rootNow())
-      const chapter = findChapter(meta.chapters, args.chapter)
-      return { chapter: { id: chapter.id, title: chapter.title }, ...result }
-    },
+    execute: async args => await restoreVersion(rootNow(), args.chapter, String(args.version).trim()),
     presentCall: args => ({ card: 'generic', title: `恢复 ${args.chapter} → ${args.version}`, kind: 'write', rawInput: args }),
   })
 
@@ -5005,13 +5052,12 @@ export function apply(ctx, config) {
                 }
                 try {
                   const restored = await restoreVersion(rootNow(), payload.chapter, payload.version.trim())
-                  const { meta: restoreMeta } = await loadBook(rootNow())
-                  const chapter = findChapter(restoreMeta.chapters, payload.chapter)
                   sendJson(res, 200, {
                     ok: true,
-                    chapter: { id: chapter.id, title: chapter.title },
+                    chapter: restored.chapter,
                     version: restored.version,
                     chars: restored.chars,
+                    status: restored.status,
                     snapshot: restored.snapshot,
                   })
                 } catch (error) {
@@ -5638,7 +5684,7 @@ export function apply(ctx, config) {
                 chapters.push({
                   id: chapter.id,
                   title: chapter.title,
-                  status: chapter.status,
+                  status: (await currentChapterStats(rootNow(), chapter, historyMeta)).status,
                   versions: versions.length,
                   lastAt: versions.length ? versions[0].createdAt : '',
                   lastChars: versions.length ? versions[0].chars : 0,
@@ -5866,7 +5912,7 @@ const SCENE_REVIEW_RULES = [
 
 /** 写作约束与审稿钩子共用，避免只在改写后补救。 */
 
-const DEAI_WORKFLOW = '生成或改写前先核对 novel_context 内的 materialPreflight，或单独调用 novel_preflight({chapter})。区分剧情计划、表达约束和可能过时的备忘，计划原句不默认照抄；有分歧先核实意图，不擅自覆盖资料。审稿先调用 novel_deai_pack({chapter}) 阅读全文、资料及各维度 sourceRequirements。先查空间因果和物件状态，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,checks,observations,timeBudgets,scenes,paragraphs}) 如实登记：checks 提交 verdict/detail/evidence/counterargument：六个维度每一项都要至少一条正文引文（段号 index ＋ 逐字 quote），并按 sourceRequirements 补引人物卡／文风卡／设定；observations 逐条区分 conflict、missing-basis、preference，无发现填 []。conflict 须比较同一对象、同一属性和可比较时间，填写 comparison 并引用至少两条证据；仅历史备忘与正文不一致先记缺失依据，偏好不阻塞。timeBudgets 提交明示时间窗口和串并行任务，区分明示、估算、未知，无窗口填 []；scenes 和 paragraphs 覆盖全文。工具核算记账、检查来源覆盖并回显完整引文和来源角色。已登记的矛盾与具体依据不足、明示超时或无效记账依据可阻塞定稿，不单凭估算或未知耗时阻塞，即使 checks 写 supported。需要修改时在已获授权范围内修订并重新取包。旧阻塞项转为通过填写 resolutions。最后运行 novel_check；正文、引用资料、来源覆盖要求或启用文风变化后旧记录失效。登记、计算和引用校验不认证动作可行或文章自然。'
+const DEAI_WORKFLOW = '生成或改写前先核对 novel_context 内的 materialPreflight，或单独调用 novel_preflight({chapter})。区分剧情计划、表达约束和可能过时的备忘，计划原句不默认照抄；有分歧先核实意图，不擅自覆盖资料。审稿先调用 novel_deai_pack({chapter}) 阅读全文、资料及各维度 sourceRequirements。先查空间因果和物件状态，再查时间与信息缺失，最后审表达；目标字数仅供参考，超出不缩写。用 novel_deai_review({chapter,baseHash,styleHash,checks,observations,timeBudgets,scenes,paragraphs}) 如实登记：checks 提交 verdict/detail/evidence/counterargument：六个维度每一项都要至少一条正文引文（段号 index ＋ 逐字 quote），并按 sourceRequirements 补引人物卡／文风卡／设定；observations 逐条区分 conflict、missing-basis、preference，无发现填 []。conflict 须比较同一对象、同一属性和可比较时间，填写 comparison 并引用至少两条证据；仅历史备忘与正文不一致先记缺失依据，偏好不阻塞。timeBudgets 提交明示时间窗口和串并行任务，区分明示、估算、未知，无窗口填 []；scenes 和 paragraphs 覆盖全文。工具核算记账、检查来源覆盖并回显完整引文和来源角色。已登记的矛盾与具体依据不足、明示超时或无效记账依据可阻塞定稿，不单凭估算或未知耗时阻塞，即使 checks 写 supported。需要修改时在已获授权范围内修订并重新取包。旧阻塞项转为通过填写 resolutions。最后运行 novel_check；正文、引用资料、来源覆盖要求或启用文风变化后旧记录失效。登记、计算和引用校验不认证动作可行或文章自然。'
 
 const DEAI_REVIEW_ASPECTS = {
   continuity: '结合 scenes 动作链核对人物与设备位置、转场路线、工具来源、状态变化前因、技术因果和安全禁令，确认读者能连续还原现场，不能用脑补步骤消解矛盾。',
@@ -5875,6 +5921,14 @@ const DEAI_REVIEW_ASPECTS = {
   narration: '引用同类场景的锚点原文和本章段落，比较叙述距离、旁白声调、人物判断与反应怎样参与信息揭示。符合章纲限知视角只是叙述权限核对，还需说明是否迁移了样本的表达方式。检查参考专名、事件和独特原句混入，守住所需的解释和设定依据，证据不足时如实登记。',
   rhythm: '引用同类场景的锚点原文和本章段落，比较旁白句段怎样铺开和收短、对白在哪些时点加速、揭示前后怎样停顿。只有短问短答或没有套话不足以判为贴合。句长和标点偏差用于定位，结合现场压力判断。',
   facts: '核对事实、意图、因果、数字和信息点；尤其检查空间过渡、工具来源、动作前提和后果是否被缩写省略。区分已确认事实与原稿矛盾，修法不明先澄清，不编造补丁。',
+}
+
+/** 登记和失效检查共用当前全文段落覆盖，不能拿记录自己的长度证明完整。 */
+function hasCompleteParagraphReviews(paragraphs, totalItems) {
+  if (!Array.isArray(paragraphs) || paragraphs.length !== totalItems) return false
+  const indices = new Set(paragraphs.map(item => item?.index))
+  return indices.size === totalItems && paragraphs.every(item => Number.isInteger(item?.index)
+    && item.index >= 1 && item.index <= totalItems && typeof item.reason === 'string' && item.reason.trim())
 }
 
 /** 验证场景记录的结构与全文覆盖，物理和语义判断由会话审稿负责。 */
@@ -6127,7 +6181,7 @@ function calculateReviewTimeBudgets(budgets, packed, checks, contexts = []) {
 }
 
 /** 按维度要求对应资料，来源类型覆盖不等于语义支持。 */
-async function reviewSourceCoverage(root, meta, raw, checks) {
+async function reviewSourceCoverage(root, meta, raw, checks, styleSnapshot) {
   const requirements = [], findings = []
   const add = (aspect, source, name) => requirements.push({ aspect, source, name })
   for (const card of await listCharacters(root)) {
@@ -6135,8 +6189,14 @@ async function reviewSourceCoverage(root, meta, raw, checks) {
     if ([card.name, ...parseCardAliases(content)].some(name => mentions(raw, name))) add('voice', 'character', card.name)
   }
   const styleName = activeStyleName(meta)
-  const anchors = styleName ? styleAnchorText(await readStyle(root, styleName)) : ''
+  // 登记时复用同一份文风快照，避免指纹与覆盖校验读到不同版本。
+  const styleCard = styleSnapshot && styleSnapshot.name === styleName ? styleSnapshot.text : styleName ? await readStyle(root, styleName) : null
+  const anchors = styleName ? styleAnchorText(styleCard) : ''
   if (styleName) {
+    // 与预检同一口径：启用文风缺失或空白是资料不足，不能因维度 not-applicable 就当作没有约束。
+    if (!styleCard?.trim()) {
+      findings.push({ aspect: 'rhythm', verdict: 'uncertain', detail: `启用文风「${styleName}」的卡片缺失或为空，无法核对表达约束；请先补齐资料或取消启用，不把缺资料当成无冲突。`, evidence: [], counterargument: '缺失资料不证明正文违反文风，但在资料补齐前不能认证当前版本符合约束。' })
+    }
     for (const aspect of ['rhythm', 'narration']) {
       requirements.push({ aspect, source: 'style', name: styleName, ...(anchors.trim().length >= 8 ? { anchor: true } : {}) })
     }
@@ -6250,17 +6310,25 @@ async function deaiReviewState(root, chapter, text, meta) {
   const review = chapter.deaiReview
   if (review?.version !== DEAI_REVIEW_VERSION || review.baseHash !== createHash('sha256').update(text).digest('hex')
     || review.styleName !== activeStyleName(meta) || !hasCompleteReviewChecks(review.checks)
-    || !Array.isArray(review.sources) || !review.sources.length || !Array.isArray(review.paragraphs)
-    || !hasCompleteSceneReviews(review.scenes, review.paragraphs.length)) return pending
+    || !Array.isArray(review.observations) || !Array.isArray(review.sources) || !review.sources.length) return pending
+  const packed = extractDeaiPack(text, [])
+  if (!hasCompleteParagraphReviews(review.paragraphs, packed.totalItems)
+    || !hasCompleteSceneReviews(review.scenes, packed.totalItems)) return pending
   let validationFindings, timingReports, preferenceNotes
   try {
+    if (review.styleName) {
+      const stored = review.styleHash ?? review.sources.find(reference => reference.source === 'style' && reference.name === review.styleName)?.hash
+      const style = await activeStyleSnapshot(root, meta)
+      // 新记录绑定「名称＋正文」；旧记录只有正文哈希时由已校验的 styleName 补足名称。
+      if (stored !== style.hash && stored !== style.contentHash) return pending
+    }
     for (const reference of review.sources) {
       const current = reference.source === 'chapter' ? text : await readReviewSource(root, chapter, reference)
       if (current === null || createHash('sha256').update(current).digest('hex') !== reference.hash) return pending
     }
     const coverage = await reviewSourceCoverage(root, meta, text, review.checks)
     if (JSON.stringify(coverage.requirements) !== JSON.stringify(review.sourceCoverage)) return pending
-    const timing = calculateReviewTimeBudgets(review.timeBudgets, extractDeaiPack(text, []), review.checks, review.evidenceContexts ?? [])
+    const timing = calculateReviewTimeBudgets(review.timeBudgets, packed, review.checks, review.evidenceContexts ?? [])
     const observations = reviewObservations(review.observations, review.checks)
     validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
     preferenceNotes = observations.notes
@@ -6272,8 +6340,18 @@ async function deaiReviewState(root, chapter, text, meta) {
   return { status: findings.length ? 'blocked' : 'recorded', findings, checkVerdicts: Object.fromEntries(Object.entries(review.checks).map(([aspect, check]) => [aspect, check.verdict])), preferenceNotes, evidenceContexts: review.evidenceContexts, timingReports }
 }
 
-async function hasCurrentDeaiReview(root, chapter, text, meta) {
-  return (await deaiReviewState(root, chapter, text, meta)).status === 'recorded'
+async function currentChapterStatus(root, chapter, text, meta) {
+  if (chapter.status !== 'final') return deriveChapterStatus(text, chapter.status, 'pending')
+  const review = await deaiReviewState(root, chapter, text, meta)
+  return deriveChapterStatus(text, chapter.status, review.status)
+}
+
+/** 状态展示复用统计时读到的正文；只有声明定稿的章节需要读取审稿来源。 */
+async function currentChapterStats(root, chapter, meta) {
+  return chapterStats(root, chapter, meta.targetChars, async (item, text) => {
+    if (item.status !== 'final') return 'pending'
+    return (await deaiReviewState(root, item, text, meta)).status
+  })
 }
 
 /** 返回全部非空正文段落，机械标签只帮助定位，不决定审稿范围。 */
@@ -6424,8 +6502,9 @@ function inspectText(text, { cards, target }) {
   return { ok: issues.length === 0, chars, target, issues }
 }
 
-/** 把 planned 章节真正建出来：写一个只有标题的空文件，状态转 draft。 */
+/** 为 planned 章节建立标题文件，返回正文和当前复核允许的状态。 */
 async function startChapter(root, wanted) {
+  return withBookLock(root, async () => {
   const { meta } = await loadBook(root)
   const chapters = meta.chapters
   const chapter = findChapter(chapters, wanted)
@@ -6438,10 +6517,11 @@ async function startChapter(root, wanted) {
     await fsp.writeFile(file, `# ${chapter.title}\n\n`, 'utf8')
     created = true
   }
-  if (chapter.status !== 'draft' && chapter.status !== 'final') chapter.status = 'draft'
+  const stats = await currentChapterStats(root, chapter, meta)
+  chapter.status = stats.status
   await persistBook(root, meta, chapters)
-  const stats = await chapterStats(root, chapter, meta.targetChars)
   return { id: chapter.id, title: chapter.title, file: chapter.file, status: chapter.status, created, chars: stats.chars, target: stats.target }
+  })
 }
 
 
