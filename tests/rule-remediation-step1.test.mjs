@@ -9,6 +9,8 @@ import { apply } from '../index.js'
 import { moveScene, stageContext } from '../stage.js'
 import { BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, readBeats, writeBeats, writeBeatsBatch } from '../lib/beats.js'
 
+const structuredScene = (id, goal) => `### 场景 ${id}：${goal}\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：${goal}\n`
+
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'novel-remediation-step1-'))
   t.after(() => fs.rm(root, { recursive: true, force: true }))
@@ -107,31 +109,36 @@ test('显式覆盖保持章节 ID，并在正文变化时先保存历史', async
 test('章纲始终优先匹配目标 ID，不让前置相似标题抢占', async t => {
   const { root } = await fixture(t)
   const file = path.join(root, 'beats.md')
-  await fs.writeFile(file, '# 章纲\n\n## 0002 旧客归来\n内容 A\n\n## 0003 旧客\n内容 B\n', 'utf8')
+  const one = structuredScene('similar', '内容 A')
+  const two = structuredScene('target', '内容 B')
+  await fs.writeFile(file, `# 章纲\n\n## 0002 旧客归来\n${one}\n## 0003 旧客\n${two}`, 'utf8')
   const chapter = { id: '0003', title: '旧客' }
 
   const before = await readBeats(root, chapter)
-  assert.equal(before.section.body, '内容 B')
-  await writeBeats(root, chapter, '更新后的内容 B')
+  assert.equal(before.section.body, two.trim())
+  const replacement = structuredScene('target', '更新后的内容 B')
+  await writeBeats(root, chapter, replacement)
   const updated = await fs.readFile(file, 'utf8')
-  assert.match(updated, /## 0002 旧客归来\n内容 A/u)
-  assert.match(updated, /## 0003 旧客\n\n更新后的内容 B/u)
+  assert.ok(updated.includes(`## 0002 旧客归来\n${one}`))
+  assert.ok(updated.includes(`## 0003 旧客\n\n${replacement.trim()}`))
   assert.equal((updated.match(/^## 0003 旧客$/gmu) ?? []).length, 1)
 })
 
 test('其他 ID 不参与标题回退，目标不存在时追加新小节', async t => {
   const { root } = await fixture(t)
   const file = path.join(root, 'beats.md')
-  await fs.writeFile(file, '# 章纲\n\n## 0002 旧客归来\n原内容\n', 'utf8')
+  const original = structuredScene('original', '原内容')
+  await fs.writeFile(file, `# 章纲\n\n## 0002 旧客归来\n${original}`, 'utf8')
   const chapter = { id: '0003', title: '旧客' }
 
   const before = await readBeats(root, chapter)
   assert.equal(before.section, null)
   assert.equal(before.matchIssue, null)
-  await writeBeats(root, chapter, '新内容')
+  const replacement = structuredScene('new-target', '新内容')
+  await writeBeats(root, chapter, replacement)
   const updated = await fs.readFile(file, 'utf8')
-  assert.match(updated, /## 0002 旧客归来\n原内容/u)
-  assert.match(updated, /## 0003 旧客\n\n新内容/u)
+  assert.ok(updated.includes(`## 0002 旧客归来\n${original}`))
+  assert.ok(updated.includes(`## 0003 旧客\n\n${replacement.trim()}`))
 })
 
 test('唯一无 ID 旧标题可读写，并升级为规范 ID 标题', async t => {
@@ -143,10 +150,11 @@ test('唯一无 ID 旧标题可读写，并升级为规范 ID 标题', async t =
   const before = await readBeats(root, chapter)
   assert.equal(before.section.body, '旧格式内容')
   assert.equal(before.matchIssue, null)
-  await writeBeats(root, chapter, '规范后的内容')
+  const replacement = structuredScene('normalized', '规范后的内容')
+  await writeBeats(root, chapter, replacement)
   const updated = await fs.readFile(file, 'utf8')
   assert.doesNotMatch(updated, /^## 旧客$/mu)
-  assert.match(updated, /## 0003 旧客\n\n规范后的内容/u)
+  assert.ok(updated.includes(`## 0003 旧客\n\n${replacement.trim()}`))
 
   await fs.writeFile(file, '# 章纲\n\n## 3 旧客\n短 ID 内容\n', 'utf8')
   assert.equal((await readBeats(root, chapter)).section.body, '短 ID 内容')
@@ -238,13 +246,16 @@ test('双小节批量更新成功时同时移除源条目并保留目标原内�
   const { root } = await fixture(t)
   const chapters = [{ id: '0001', title: '源章' }, { id: '0002', title: '目标章' }]
   const file = path.join(root, 'beats.md')
-  await fs.writeFile(file, '# 章纲\n\n## 0001 源章\n待顺延条目\n\n## 0002 目标章\n目标原内容\n', 'utf8')
+  const moved = structuredScene('moved', '待顺延条目')
+  const remaining = structuredScene('remaining', '源章保留')
+  const target = structuredScene('target', '目标原内容')
+  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${moved}\n${remaining}\n## 0002 目标章\n${target}`, 'utf8')
   await writeBeatsBatch(root, [
-    { chapter: chapters[0], content: '' },
-    { chapter: chapters[1], prepend: '待顺延条目' },
+    { chapter: chapters[0], content: remaining },
+    { chapter: chapters[1], prepend: moved },
   ], chapters)
-  assert.equal((await readBeats(root, chapters[0], chapters)).section.body, '')
-  assert.equal((await readBeats(root, chapters[1], chapters)).section.body, '待顺延条目\n目标原内容')
+  assert.equal((await readBeats(root, chapters[0], chapters)).section.body, remaining.trim())
+  assert.equal((await readBeats(root, chapters[1], chapters)).section.body, `${moved.trim()}\n${target.trim()}`)
 })
 
 test('顺延保存会拒绝覆盖读取后出现的新修改', async t => {
@@ -331,7 +342,7 @@ test('整场移动用常规匹配规则定位目标并插在紧邻小节之前',
   ]
   const file = path.join(root, 'beats.md')
   const scene = '### 场景 move-me：待移动\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n'
-  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${scene}\n## 0002 目标章\n目标原内容\n\n## 归途\n无 ID 旧小节\n\n## 0004 四章\n四章内容\n`, 'utf8')
+  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${structuredScene('remaining', '源章保留')}\n${scene}\n## 0002 目标章\n${structuredScene('target', '目标原内容')}\n## 归途\n${structuredScene('legacy', '无 ID 旧小节')}\n## 0004 四章\n${structuredScene('fourth', '四章内容')}`, 'utf8')
 
   await moveScene(root, [...chapters, { id: '0001', title: '源章', file: 'chapters/0001.md' }], 'move-me', '0002')
   const text = await fs.readFile(file, 'utf8')
@@ -364,7 +375,7 @@ test('整场移动的截断边界接受制表符标题，不会剪走下一章',
     { id: '0003', title: '三章', file: 'chapters/0003.md' },
   ]
   const file = path.join(root, 'beats.md')
-  const original = '# 章纲\n\n## 0001 源章\n### 场景 tail：本章末场\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n\n##\t0003 三章\n三章正文\n\n### 场景 keep：三章场景\n- 时序：9\n- 出场：a\n\n#### 人物 a\n- 目标：留下\n\n## 0002 目标章\n目标原内容\n'
+  const original = `# 章纲\n\n## 0001 源章\n${structuredScene('remaining', '源章保留')}\n### 场景 tail：本章末场\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n\n##\t0003 三章\n三章正文\n\n### 场景 keep：三章场景\n- 时序：9\n- 出场：a\n\n#### 人物 a\n- 目标：留下\n\n## 0002 目标章\n目标原内容\n`
   await fs.writeFile(file, original, 'utf8')
   await moveScene(root, chapters, 'tail', '0002')
   const text = await fs.readFile(file, 'utf8')
@@ -383,7 +394,7 @@ test('移入无 ID 或短 ID 旧标题后，目标章能按 ID 读回场景', as
   ]
   const file = path.join(root, 'beats.md')
   const scene = '### 场景 move-me：待移动\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n'
-  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${scene}\n## 归途\n旧内容\n\n## 3 短号\n短号旧内容\n`, 'utf8')
+  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${structuredScene('remaining', '源章保留')}\n${scene}\n## 归途\n${structuredScene('returning', '旧内容')}\n## 3 短号\n${structuredScene('short-id', '短号旧内容')}`, 'utf8')
 
   await moveScene(root, chapters, 'move-me', '0002')
   let text = await fs.readFile(file, 'utf8')
@@ -422,7 +433,7 @@ test('单独的 ## 空行不会让目标小节索引错位', async t => {
   ]
   const file = path.join(root, 'beats.md')
   const scene = '### 场景 move-me：待移动\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n'
-  await fs.writeFile(file, `# 章纲\n\n##\n\n## 0001 源章\n${scene}\n## 0002 目标章\n目标原内容\n`, 'utf8')
+  await fs.writeFile(file, `# 章纲\n\n##\n\n## 0001 源章\n${structuredScene('remaining', '源章保留')}\n${scene}\n## 0002 目标章\n目标原内容\n`, 'utf8')
   await moveScene(root, chapters, 'move-me', '0002')
   const text = await fs.readFile(file, 'utf8')
   assert.equal((text.match(/## 0002 目标章/gu) ?? []).length, 1, '不能产生重复目标 ID')
@@ -438,7 +449,7 @@ test('多场与制表符标题混排时，移动只截取目标场景', async t 
     { id: '0003', title: '三章', file: 'chapters/0003.md' },
   ]
   const file = path.join(root, 'beats.md')
-  await fs.writeFile(file, '# 章纲\n\n##\t0001 源章\n### 场景 a：甲\n- 时序：1\n- 出场：a\n\n#### 人物 a\n- 目标：甲\n\n### 场景 b：乙\n- 时序：2\n- 出场：a\n\n#### 人物 a\n- 目标：乙\n\n##\t0002 目标章\n目标原内容\n\n## 0003 三章\n三章内容\n', 'utf8')
+  await fs.writeFile(file, `# 章纲\n\n##\t0001 源章\n### 场景 a：甲\n- 时序：1\n- 出场：a\n\n#### 人物 a\n- 目标：甲\n\n### 场景 b：乙\n- 时序：2\n- 出场：a\n\n#### 人物 a\n- 目标：乙\n\n##\t0002 目标章\n目标原内容\n\n## 0003 三章\n${structuredScene('third', '三章内容')}`, 'utf8')
   await moveScene(root, chapters, 'a', '0002')
   const text = await fs.readFile(file, 'utf8')
   const sourcePart = text.slice(text.indexOf('##\t0001 源章'), text.indexOf('## 0002 目标章'))
@@ -457,7 +468,7 @@ test('移入带制表符的目标标题后仍规范化为普通空格并可按 I
   ]
   const file = path.join(root, 'beats.md')
   const scene = '### 场景 move-me：待移动\n- 时序：5\n- 出场：a\n\n#### 人物 a\n- 目标：搬走\n'
-  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${scene}\n##\t0002 目标章\n目标原内容\n`, 'utf8')
+  await fs.writeFile(file, `# 章纲\n\n## 0001 源章\n${structuredScene('remaining', '源章保留')}\n${scene}\n##\t0002 目标章\n目标原内容\n`, 'utf8')
   await moveScene(root, chapters, 'move-me', '0002')
   const text = await fs.readFile(file, 'utf8')
   assert.match(text, /^## 0002 目标章$/mu, '制表符标题必须重写为普通空格')

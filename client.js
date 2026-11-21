@@ -859,7 +859,7 @@ window.__ModuleLoader__.load({
         body: JSON.stringify(body),
       })
       const value = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`)
+      if (!response.ok) throw Object.assign(new Error(value.error || `HTTP ${response.status}`), { status: response.status, code: value.code, issues: value.issues })
       return value
     }
 
@@ -2067,11 +2067,16 @@ window.__ModuleLoader__.load({
           const payload = { chapter, scene, character, baseHash: draft.baseHash }
           if (raw) payload.content = draft.values
           else payload.fields = Object.fromEntries(names.map(name => [name, draft.values[name] || '']))
-          await postJson(`${API}/beats`, payload)
+          const saved = await postJson(`${API}/beats`, payload)
           dropBeatDraft(key)
-          await onSaved()
+          await onSaved(saved)
           onClose()
-        } catch (error) { setNotice(`保存失败：${error.message}。草稿已保留；如版本冲突，请核对原始章纲后重新编辑。`) }
+        } catch (error) {
+          const detail = error.issues?.map(item => item.message).join('；')
+          const next = error.status === 409 ? '请重新读取并核对原始章纲后再编辑。'
+            : error.status === 400 ? '请修正上述结构或字段问题后再保存。' : '请检查服务端错误后重试。'
+          setNotice(`保存失败：${detail || error.message}。草稿已保留；${next}`)
+        }
         finally { setBusy(false) }
       }
       return h('div', { className: 'nvl-beat-editor' },
@@ -2110,7 +2115,11 @@ window.__ModuleLoader__.load({
       const names = Object.fromEntries(people.map(c => [c.id, c.name]))
       const button = (text, click) => h('button', { type: 'button', className: 'nvl-ask-btn', onClick: click }, text)
       const showFields = object => h(MarkdownView, { text: Object.entries(object || {}).map(([key, value]) => `- ${key}：${value}`).join('\n') || '（未安排，按本场需要填写）' })
-      const saved = async () => { await reload(); await onReload() }
+      const saved = async value => {
+        await reload()
+        await onReload()
+        setNotice(value.warnings?.length ? `已保存；${value.warnings.join('；')}` : '已保存。')
+      }
       async function review(record, action) {
         setBusy(true)
         try { await postJson(`${API}/character-history`, { action, character: record.character, id: record.id }); await reload(); setNotice('已更新。') }

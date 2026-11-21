@@ -773,20 +773,22 @@ test('建章入口保留有效 final，纠正失效 final 和缺失正文', asyn
   assert.equal(await fs.readFile(path.join(empty.root, 'chapters/0001.md'), 'utf8'), '')
 })
 
-test('同文保存后顺延引用章纲，回执与落盘状态使用顺延后的复核', async t => {
+test('旧逐行顺延触发严格结构校验时，正文已保存而章纲保持不变', async t => {
   const current = await fixture(t)
   const beat = '- 场景：王桥拿蓝钥匙到石桥折断后留下暗号'
-  await fs.writeFile(path.join(current.root, 'beats.md'), `# 章纲\n\n## 0001 第一章\n\n- 场景：七号炉的炉皮在跳\n${beat}\n`, 'utf8')
+  const beats = `# 章纲\n\n## 0001 第一章\n\n- 场景：七号炉的炉皮在跳\n${beat}\n`
+  await fs.writeFile(path.join(current.root, 'beats.md'), beats, 'utf8')
   const checks = baseChecks()
   checks.continuity.evidence.push({ source: 'beats', quote: beat })
   await finalize(current.call, checks)
   const result = await current.call('novel_write', { chapter: '0001', content: BODY, carryOver: true, status: 'final' })
-  assert.ok(result.carriedOver)
-  assert.equal(result.status, 'draft')
-  assert.match(result.warnings.join('\n'), /当前版本待复核/u)
-  assert.match(result.warnings.join('\n'), /final 声明未保留/u)
+  assert.equal(result.carriedOver, undefined)
+  assert.equal(result.status, 'final')
+  assert.match(result.warnings.join('\n'), /章纲结构校验失败/u)
+  assert.match(result.warnings.join('\n'), /正文已保存，但章纲未顺延/u)
+  assert.equal(await fs.readFile(path.join(current.root, 'beats.md'), 'utf8'), beats)
   const book = await current.readBook()
-  assert.equal(book.chapters[0].status, 'draft')
-  assert.equal(book.chapters[1].status, 'planned')
-  await assertCurrentState(current, 'draft', 'pending')
+  assert.equal(book.chapters[0].status, 'final')
+  assert.equal(book.chapters.length, 1)
+  await assertCurrentState(current, 'final', 'recorded')
 })

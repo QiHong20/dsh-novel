@@ -1,26 +1,32 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { createHash, randomUUID } from 'node:crypto'
-import { withFileLock } from './lib/file-lock.js'
-import { parseBeatSections } from './lib/beats.js'
-import { beatHeading, resolveBeatSection, scanBeatHeadings } from './lib/beat-match.js'
+import { randomUUID } from 'node:crypto'
+import { BEAT_SECTION_CHANGED, mutateBeatsFile, parseBeatSections } from './lib/beats.js'
+import { beatHeading, normalizeBeatId, resolveBeatSection, scanBeatHeadings } from './lib/beat-match.js'
+import { findChapter, loadBook } from './lib/book.js'
+import {
+  APPEARANCE_FIELDS,
+  CHAPTER_FIELDS,
+  PSYCHOLOGY_FIELDS,
+  ROLE_FIELDS,
+  SCENE_FIELDS,
+  hash,
+  parseScenes,
+  parseStageFields,
+  scanSceneHeadings,
+} from './lib/beat-structure.js'
 
-export const hash = value => createHash('sha256').update(value).digest('hex')
+export { APPEARANCE_FIELDS, CHAPTER_FIELDS, PSYCHOLOGY_FIELDS, ROLE_FIELDS, SCENE_FIELDS, hash, parseScenes }
+export const BEAT_REQUEST_INVALID = 'BEAT_REQUEST_INVALID'
 const safeId = value => {
   if (!/^[a-zA-Z0-9_-]+$/.test(value || '')) throw new Error('ID 必须为字母、数字、下划线或连字符')
   return value
 }
 const read = async file => { try { return await fs.readFile(file, 'utf8') } catch (e) { if (e.code === 'ENOENT') return ''; throw e } }
-const fields = text => Object.fromEntries([...text.matchAll(/^- ([^：\n]+)：([^\n]*)$/gm)].map(m => [m[1], m[2].trim()]))
-const list = text => (text || '').split(/[、,，]/).map(s => s.trim()).filter(Boolean)
+const fields = parseStageFields
+const stageEditError = (message, code = BEAT_REQUEST_INVALID) => Object.assign(new Error(message), { code })
 
-export const PSYCHOLOGY_FIELDS = ['心理触发', '心理内容', '叙事作用', '表达方式', '展开程度', '视角权限', '保留心声原句']
-export const APPEARANCE_FIELDS = ['登场性质', '观察者', '描写重点', '呈现时机', '第一印象', '已呈现与新增', '不描写原因']
-export const ROLE_FIELDS = ['已知', '未知', '误信', '怀疑', '目标', '关系与情绪', '表达意图', '触发', '计划变化', ...PSYCHOLOGY_FIELDS, ...APPEARANCE_FIELDS]
-export const SCENE_FIELDS = ['故事时间', '时序', '地点', '视角', '叙述方式', '出场', '提及', '事件', '冲突', '结果', '转折', '落点', '钩子']
-export const CHAPTER_FIELDS = ['本章目标', '收尾']
 export const PRESENTATION_RULES = '小说心理与登场原则：按关键决定、误解或认知转变安排心理材料，不设数量和密度配额，不在每句对白后解释。主配角均可有心理，但直接呈现必须遵守本场叙述视角；仅作者参考不写成可直接读取的内心。允许联想、短回忆、间接叙述，只有「保留心声原句」要求保留原句。重要人物首次正式登场应考虑体态、面容、衣着、声音等可辨认特征，融入观察和动作；暗处、伪装等可说明不描写原因。后续出场以唤起特征或变化为主，不用外貌篇幅代替人物重要性。计划不是已经向读者呈现的事实。'
-const pick = (f, keys) => Object.fromEntries(keys.filter(key => f[key]).map(key => [key, f[key]]))
 
 export function presentationChecks(scene, cards = []) {
   const items = []
@@ -51,27 +57,23 @@ export function cardIdentity(text) {
   return { id: f.ID || '', role: f.定位 || '', importance: f.重要程度 || '未设置' }
 }
 
-export function parseScenes(text, chapter = '') {
-  const starts = [...text.matchAll(/^### 场景 ([\w-]+)\s*[：:]\s*([^\n]*)$/gm)]
-  return starts.map((m, i) => {
-    const raw = text.slice(m.index, starts[i + 1]?.index ?? text.length).trim()
-    const head = raw.split(/^#### /m)[0]
-    const f = fields(head)
-    const roles = [...raw.matchAll(/^#### 人物 ([\w-]+)[ \t]*\r?$/gm)].map((r, j, all) => {
-      const constraints = raw.slice(r.index + r[0].length, all[j + 1]?.index ?? raw.length).trim()
-      const rf = fields(constraints)
-      return { id: r[1], constraints, fields: rf, psychology: pick(rf, PSYCHOLOGY_FIELDS), appearance: pick(rf, APPEARANCE_FIELDS) }
-    })
-    return { id: m[1], title: m[2].trim(), chapter, raw, fields: f, viewpoint: f.视角 || '', narration: f.叙述方式 || '', cast: list(f.出场), mentioned: list(f.提及),
-      time: /^-?\d+$/.test(f.时序 || '') ? Number(f.时序) : null,
-      storyTime: f.故事时间 || '', events: list(f.事件), roles }
-  })
-}
-
 export async function stageBook(root, chapters) {
   const beats = await read(path.join(root, 'beats.md'))
-  const sections = [...beats.matchAll(/^## (\d+)\b[^\n]*\n/gm)]
-  const scenes = sections.flatMap((s, i) => parseScenes(beats.slice(s.index + s[0].length, sections[i + 1]?.index ?? beats.length), s[1]))
+  // 场景归属沿用章纲读写的同一套匹配规则：章 ID 优先，无 ID 旧标题只在唯一认领时回退。
+  const sections = parseBeatSections(beats)
+  const claimed = new Set()
+  const scenes = chapters.flatMap(chapter => {
+    const resolved = resolveBeatSection(sections, chapter, chapters)
+    if (resolved.kind !== 'matched') return []
+    claimed.add(resolved.section)
+    return parseScenes(resolved.section.body, chapter.id)
+  })
+  // 只回退书目中完全找不到对应章的数字小节；已登记章（含匹配歧义）保留诊断，不载入场景。
+  const bookIds = new Set(chapters.map(chapter => normalizeBeatId(chapter.id)))
+  for (const section of sections) {
+    if (claimed.has(section) || !section.id || bookIds.has(section.id)) continue
+    scenes.push(...parseScenes(section.body, section.id))
+  }
   scenes.sort((a, b) => chapters.findIndex(c => c.id === a.chapter) - chapters.findIndex(c => c.id === b.chapter))
   const cards = []
   for (const file of await fs.readdir(path.join(root, 'characters')).catch(e => { if (e.code === 'ENOENT') return []; throw e })) {
@@ -92,6 +94,11 @@ export async function stageBook(root, chapters) {
   const warn = (detail, scope = {}) => {
     warnings.push(detail)
     diagnostics.push({ detail, ...scope })
+  }
+  // 匹配歧义不静默跳过：场景上下文与章纲接口给出同一诊断。
+  for (const chapter of chapters) {
+    const resolved = resolveBeatSection(sections, chapter, chapters)
+    if (resolved.kind === 'ambiguous') warn(`${resolved.message}；本章场景未载入`, { chapter: chapter.id })
   }
   for (const [label, items] of [['人物', cards], ['场景', scenes]]) {
     const seen = new Set()
@@ -178,28 +185,34 @@ export async function stageContext(root, chapters, chapter, sceneId) {
     records: book.records.filter(r => r.chapter === chapter), baseHash: book.baseHash, text }
 }
 
-export function patchStageText(text, args) {
-  if (!args.baseHash || args.baseHash !== hash(text)) throw new Error('章纲已变化，请重新读取后保存；未覆盖其他修改')
-  if (!args.fields || typeof args.fields !== 'object' || Array.isArray(args.fields)) throw new Error('需要 fields 字段对象')
-  const chapters = [...text.matchAll(/^## (\d+)\b[^\n]*(?:\n|$)/gm)]
-  const matches = chapters.filter(m => m[1] === args.chapter)
-  if (matches.length !== 1) throw new Error('章节不存在或重复')
-  const chapter = matches[0]
-  let start = chapter.index + chapter[0].length
-  let end = chapters[chapters.indexOf(chapter) + 1]?.index ?? text.length
+export function patchStageText(text, args, chapter = null, chapters = chapter ? [chapter] : []) {
+  if (!args.baseHash || args.baseHash !== hash(text)) throw stageEditError('章纲已变化，请重新读取后保存；未覆盖其他修改', BEAT_SECTION_CHANGED)
+  if (!args.fields || typeof args.fields !== 'object' || Array.isArray(args.fields)) throw stageEditError('需要 fields 字段对象')
+  // 与章纲读写共用标题扫描和匹配规则：制表符标题、无 ID 旧小节都不会被误算进上一章。
+  const headings = scanBeatHeadings(text)
+  const sections = headings.map((hit, index) => ({ id: hit.id, heading: hit.heading, body: text.slice(hit.end, headings[index + 1]?.index ?? text.length) }))
+  const target = chapter ?? { id: args.chapter }
+  const resolved = resolveBeatSection(sections, target, chapters.length ? chapters : [target])
+  if (resolved.kind === 'ambiguous') throw stageEditError(resolved.message, BEAT_SECTION_CHANGED)
+  if (resolved.kind !== 'matched') throw stageEditError('章节不存在或重复', BEAT_SECTION_CHANGED)
+  const chapterIndex = sections.indexOf(resolved.section)
+  const chapterStart = headings[chapterIndex].end
+  const chapterEnd = headings[chapterIndex + 1]?.index ?? text.length
+  let start = chapterStart
+  let end = chapterEnd
   let allowed = CHAPTER_FIELDS
   if (args.scene) {
-    const scenes = [...text.slice(start, end).matchAll(/^### 场景 ([\w-]+)\s*[：:][^\n]*(?:\n|$)/gm)]
-    const found = scenes.filter(m => m[1] === args.scene)
-    if (found.length !== 1) throw new Error('场景不存在或重复')
-    const scene = found[0]
-    end = start + (scenes[scenes.indexOf(scene) + 1]?.index ?? (end - start))
-    start += scene.index + scene[0].length
+    const scenes = scanSceneHeadings(text.slice(chapterStart, chapterEnd))
+    const found = scenes.find(hit => hit.id === args.scene)
+    if (!found || scenes.filter(hit => hit.id === args.scene).length !== 1) throw stageEditError('场景不存在或重复', BEAT_SECTION_CHANGED)
+    const sceneIndex = scenes.indexOf(found)
+    end = chapterStart + (scenes[sceneIndex + 1]?.index ?? (chapterEnd - chapterStart))
+    start = chapterStart + found.bodyStart
     allowed = SCENE_FIELDS
     if (args.character) {
       const roles = [...text.slice(start, end).matchAll(/^#### 人物 ([\w-]+)[ \t]*\r?(?:\n|$)/gm)]
       const foundRoles = roles.filter(m => m[1] === args.character)
-      if (foundRoles.length !== 1) throw new Error('人物块不存在或重复，请在原始章纲中补充')
+      if (foundRoles.length !== 1) throw stageEditError('人物块不存在或重复，请在原始章纲中补充', BEAT_SECTION_CHANGED)
       const role = foundRoles[0]
       end = start + (roles[roles.indexOf(role) + 1]?.index ?? (end - start))
       start += role.index + role[0].length
@@ -209,17 +222,17 @@ export function patchStageText(text, args) {
       if (next) end = start + next.index
     }
   } else {
-    if (args.character) throw new Error('编辑人物需要指定场景')
+    if (args.character) throw stageEditError('编辑人物需要指定场景')
     const next = /^### /m.exec(text.slice(start, end))
     if (next) end = start + next.index
   }
   const newline = text.includes('\r\n') ? '\r\n' : '\n'
   let body = text.slice(start, end)
   for (const [key, value] of Object.entries(args.fields)) {
-    if (!allowed.includes(key) || typeof value !== 'string' || /[\r\n]/.test(value)) throw new Error(`不支持的字段或多行值：${key}`)
+    if (!allowed.includes(key) || typeof value !== 'string' || /[\r\n]/.test(value)) throw stageEditError(`不支持的字段或多行值：${key}`)
     const re = new RegExp(`^- ${key}：[^\\n]*(?:\\n|$)`, 'gm')
     const found = [...body.matchAll(re)]
-    if (found.length > 1) throw new Error(`字段 ${key} 重复，请在原始章纲中核对`)
+    if (found.length > 1) throw stageEditError(`字段 ${key} 重复，请在原始章纲中核对`)
     if (found.length) body = body.replace(re, () => value ? `- ${key}：${value}${newline}` : '')
     else if (value) body += (body && !body.endsWith('\n') ? newline : '') + `- ${key}：${value}${newline}`
   }
@@ -227,15 +240,10 @@ export function patchStageText(text, args) {
 }
 
 export async function editStageFields(root, args) {
-  const file = path.join(root, 'beats.md')
-  return withFileLock(file, async () => {
-    const original = await read(file)
-    const text = patchStageText(original, args)
-    const tmp = `${file}.${randomUUID()}.tmp`
-    await fs.writeFile(tmp, text, 'utf8')
-    await fs.rename(tmp, file)
-    return { ok: true, baseHash: hash(text) }
-  })
+  const { meta } = await loadBook(root)
+  const chapter = findChapter(meta.chapters, args.chapter) ?? { id: args.chapter }
+  const saved = await mutateBeatsFile(root, original => ({ text: patchStageText(original ?? '', args, chapter, meta.chapters) }), args.baseHash)
+  return { ok: true, baseHash: saved.baseHash, issues: saved.issues, warnings: saved.warnings }
 }
 
 const locks = new Map()
@@ -296,10 +304,8 @@ export const historyParameters = {
 }
 
 export async function moveScene(root, chapters, sceneId, targetChapter) {
-  const file = path.join(root, 'beats.md')
-  return withFileLock(file, async () => {
-    const original = await read(file)
-    let text = original.replace(/\r\n/g, '\n')
+  const saved = await mutateBeatsFile(root, original => {
+    let text = (original ?? '').replace(/\r\n/g, '\n')
     const target = chapters.find(c => c.id === targetChapter)
     if (!target) throw new Error('需要唯一场景和不同的有效目标章节')
     // 目标章节沿用整章保存的匹配规则：ID 唯一优先，无 ID 旧条目只在唯一认领时回退。
@@ -340,9 +346,13 @@ export async function moveScene(root, chapters, sceneId, targetChapter) {
       const at = nextHeadings[targetIndex + 1]?.index ?? text.length
       text = text.slice(0, at).trimEnd() + `\n\n${block}\n\n` + text.slice(at)
     }
-    const tmp = `${file}.${randomUUID()}.tmp`
-    await fs.writeFile(tmp, text, 'utf8')
-    await fs.rename(tmp, file)
-    return { moved: sceneId, chapter: targetChapter, warnings: ['场景已整块移动；人物入场状态按时序重新计算，原位置确认记录需重新提取核对。'] }
+    return { text, moved: sceneId, chapter: targetChapter }
   })
+  return {
+    moved: saved.moved,
+    chapter: saved.chapter,
+    baseHash: saved.baseHash,
+    issues: saved.issues,
+    warnings: [...saved.warnings, '场景已整块移动；人物入场状态按时序重新计算，原位置确认记录需重新提取核对。'],
+  }
 }

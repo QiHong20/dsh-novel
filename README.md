@@ -80,7 +80,7 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 十二个写接口（都要求头 `x-novel-action: 1`，其余方法一律 405）：
 `POST /novel-api/start-chapter`（`{ id }`，右栏点 `planned` 章节时建章）、`POST /novel-api/outline`（`{ content }`，大纲页保存）、`POST /novel-api/beats`（`{ chapter, content }`，章纲页保存）、`POST /novel-api/setting`（`{ name, content }`，设定页保存）、`POST /novel-api/thread`（`{ thread, planted?, payoff?, status? }`，伏笔页「收回 / 重开」与登记）、`POST /novel-api/style`（`{ name, content }`，文风页保存）、`POST /novel-api/style-active`（`{ name }`，切换在用文风，空名字＝取消）、`POST /novel-api/style-clone`（文风页选择 TXT 或 Markdown 文件，最多 32 MB。桌面端优先通过 `{ source, name? }` 交由宿主读取；网页端通过 `{ file: { name, data }, name? }` 上传，`data` 为原文字节的 Base64）、`POST /novel-api/style-delete`（`{ name }`，删一张文风卡：卡和参考原文一起挪进 `styles/.trash/`，删的正好是在用的那套就顺手取消启用）、`POST /novel-api/event`（`{ line, content }`，整段替换一条事件线）、`POST /novel-api/export`（`{ from?, to?, format?, mode? }`，把全书或区间导出到 `export/`）、`POST /novel-api/restore`（`{ chapter, version }`，恢复到某一版，先给当前内容留一版）。
 
-**写入时会做格式校验，但只警告不拒绝**：`novel_card` / `novel_setting` / `novel_beats` / `novel_write` / `novel_threads` 的返回里都带 `warnings`，渲染成「⚠ 格式提醒（已写入，但下面这些位置读不到）」——比如关系小节写成了散文、状态小节没写 `@0003`、设定首行没写 `- 分类：`、章纲里手打了 `## 0003` 标题、正文里混进了 `## 关系`。写歪的内容照样落盘，只是不会被关系图/时间线读到。
+**写入时会做格式校验**：章纲的全部写入入口共用严格结构校验；无结构化场景、缺失或非法时序、缺出场、缺人物块时会拒绝整次写入，文件保持不变。超过 8 场及语义核对线索仍只返回 `warnings`。`novel_card` / `novel_setting` / `novel_write` / `novel_threads` 继续按各自规则返回格式提醒。
 
 书库根目录解析顺序：`config.root`（钉死）→ **会话自己的工作目录** → 环境变量 `DSH_NOVEL_ROOT` → 进程 `cwd`（兜底）。
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { stageContext, updateHistory, moveScene, parseScenes } from '../stage.js'
+import { stageBook, stageContext, updateHistory, moveScene, parseScenes } from '../stage.js'
 import { apply } from '../index.js'
 import { Readable } from 'node:stream'
 
@@ -20,6 +20,41 @@ async function fixture(t) {
   return { root, chapters }
 }
 const proposal = { action: 'propose', character: 'a', scene: 'first', kind: '已知', content: '看到信物', source: '亲眼看见', evidence: '甲看见信物。' }
+
+test('已登记章出现重复 ID 时保留歧义诊断，不把两份小节场景都载入', async t => {
+  const { root, chapters } = await fixture(t)
+  const file = path.join(root, 'beats.md')
+  const text = await fs.readFile(file, 'utf8')
+  await fs.writeFile(file, text.replace('## 0003 倒叙\n', '## 0002 后续副本\n### 场景 duplicated：重复\n- 时序：99\n- 出场：a\n#### 人物 a\n- 目标：重复\n\n## 0003 倒叙\n'))
+  const context = await stageContext(root, chapters, '0002')
+  assert.equal(context.scenes.length, 0, '歧义章节不能载入任一小节的场景')
+  assert.match(context.warnings.join('\n'), /请核对并为目标小节保留唯一章 ID/u)
+  const book = await stageBook(root, chapters)
+  assert.ok(!book.scenes.some(scene => scene.id === 'later' || scene.id === 'duplicated'), '歧义章节的场景不能进入全书场景表')
+  await assert.rejects(
+    updateHistory(root, chapters, { ...proposal, character: 'a', scene: 'duplicated', evidence: '甲看见信物。' }),
+    /唯一场景/u,
+    '人物历史不能依据歧义章节登记',
+  )
+  // 书目之外的数字小节仍保留，用于诊断陈旧章纲。
+  await fs.writeFile(file, `${text}\n## 0009 未登记\n### 场景 orphan：遗留\n- 时序：99\n- 出场：a\n#### 人物 a\n- 目标：遗留\n`)
+  assert.ok((await stageBook(root, chapters)).scenes.some(scene => scene.id === 'orphan'))
+})
+
+test('场景读取与局部编辑共用章纲匹配：制表符与无 ID 标题不会归入上一章', async t => {
+  const { root, chapters } = await fixture(t)
+  const file = path.join(root, 'beats.md')
+  const text = await fs.readFile(file, 'utf8')
+  await fs.writeFile(file, text.replace('## 0002 后续', '##\t0002 后续'))
+  const first = await stageContext(root, chapters, '0001')
+  assert.ok(!first.scenes.some(item => item.id === 'later'), '制表符标题所属场景不能算进上一章')
+  assert.ok((await stageContext(root, chapters, '0002')).scenes.some(item => item.id === 'later'))
+  const renamed = chapters.map(chapter => chapter.id === '0002' ? { ...chapter, title: '后续' } : chapter)
+  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '测试', chapters: renamed }))
+  await fs.writeFile(file, text.replace('## 0002 后续', '## 后续'))
+  assert.ok(!(await stageContext(root, renamed, '0001')).scenes.some(item => item.id === 'later'))
+  assert.ok((await stageContext(root, renamed, '0002')).scenes.some(item => item.id === 'later'), '唯一无 ID 旧标题仍按标题认领')
+})
 
 test('场景诊断按章节和场景归属过滤，不依赖 ID 前缀；全局冲突保留', async t => {
   const { root, chapters } = await fixture(t)
@@ -94,13 +129,16 @@ test('逐字证据、关系方向、引用与路径受到校验', async t => {
 
 test('整场移动保持约束和 ID，原确认失效', async t => {
   const { root, chapters } = await fixture(t)
+  const file = path.join(root, 'beats.md')
+  const original = (await fs.readFile(file, 'utf8')).replaceAll('- 计划变化：怀疑旧约\n', '- 计划变化：怀疑旧约\n#### 人物 b\n- 目标：隐瞒真相\n')
+  await fs.writeFile(file, original.replace('## 0002 后续', '### 场景 remaining：留守\n- 时序：15\n- 出场：a\n#### 人物 a\n- 目标：留守\n\n## 0002 后续'))
   const { record } = await updateHistory(root, chapters, proposal)
   await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: record.id })
   await moveScene(root, chapters, 'first', '0002')
   const context = await stageContext(root, chapters, '0002', 'first')
   assert.equal(context.scenes[0].id, 'first')
   assert.match(context.scenes[0].roles[0].constraints, /计划变化：怀疑旧约/)
-  assert.equal((await stageContext(root, chapters, '0001')).scenes.length, 0)
+  assert.deepEqual((await stageContext(root, chapters, '0001')).scenes.map(scene => scene.id), ['remaining'])
   assert.match(context.warnings.join(''), /待复核/)
 })
 

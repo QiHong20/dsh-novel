@@ -21,7 +21,7 @@ import { countChars, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, 
 import { presentationContext, selectPresentationExcerpts, renderPresentationExcerpts } from './lib/presentation.js'
 import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
+import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS, BEAT_REQUEST_INVALID } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, deriveChapterStatus, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
 import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
 import { CHARACTERS_DIR } from './lib/book.js'
@@ -31,7 +31,7 @@ import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
 import { parseCadence } from './lib/people.js'
 import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, resolveBeatSection, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
-import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED } from './lib/beats.js'
+import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_STRUCTURE_INVALID } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
 import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
 import { stampOf, stampToIso, shortHash } from './lib/book.js'
@@ -363,24 +363,15 @@ function validateStyleContent(content) {
   return warnings
 }
 
-function validateBeatsContent(content) {
-  const warnings = []
-  const body = String(content ?? '')
-  if (/^\s{0,3}#{1,6}\s+\d{3,4}/mu.test(body)) warnings.push('章纲里不要再写「## 数字」这种章标题：标题由插件生成（写了也会被剥掉），正文只写场景。')
-  const scenes = parseScenes(body)
-  if (!scenes.length) {
-    warnings.push('没有解析到结构化场景（必须使用 `### 场景 英文ID：标题` + `- 时序：10` + `- 出场：人物ID` + `#### 人物 人物ID`）。')
-  } else {
-    if (scenes.length > 8) warnings.push(`写了 ${scenes.length} 场，超过 8 场：一章塞不下，考虑拆一点到下一章。（只是提醒，内容已完整保存。）`)
-    for (const scene of scenes) {
-      if (scene.time === null) warnings.push(`场景 ${scene.id} 缺少整数「- 时序：10」。`)
-      if (!scene.cast.length) warnings.push(`场景 ${scene.id} 缺少「- 出场：人物ID」。`)
-      for (const id of scene.cast) {
-        if (!scene.roles.some(r => r.id === id)) warnings.push(`场景 ${scene.id} 缺少「#### 人物 ${id}」约束块。`)
-      }
-    }
+function beatFailure(error) {
+  if (![BEAT_STRUCTURE_INVALID, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_REQUEST_INVALID].includes(error?.code)) throw error
+  return {
+    ok: false,
+    written: false,
+    code: error.code,
+    error: error.message,
+    issues: error.issues ?? [{ code: error.code, severity: 'error', message: error.message }],
   }
-  return warnings
 }
 
 function validateChapterContent(content) {
@@ -2868,8 +2859,8 @@ export function apply(ctx, config) {
                 infos: missingInfos.size,
               }
             } catch (error) {
-              if (![BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error?.code)) throw error
-              warnings.push(`${error.message}；正文已保存，但未顺延，源章纲保持不变`)
+              if (![BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_STRUCTURE_INVALID].includes(error?.code)) throw error
+              warnings.push(`${error.message}；正文已保存，但章纲未顺延，源章纲保持不变`)
             }
           }
         } else {
@@ -3172,7 +3163,10 @@ export function apply(ctx, config) {
     description: '局部编辑章纲：先读取 novel_context 获得 stage.baseHash。提供 chapter、可选 scene/character、baseHash 和 fields。只更新指定对象的字段，保留其他人物、未知字段和正文。心理与登场字段：' + ROLE_FIELDS.join('、') + '。' + PRESENTATION_RULES,
     parameters: { type: 'object', additionalProperties: false, required: ['chapter', 'baseHash', 'fields'], properties: { chapter: { type: 'string' }, scene: { type: 'string' }, character: { type: 'string' }, baseHash: { type: 'string' }, fields: { type: 'object', additionalProperties: { type: 'string' } } } },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value)) },
-    execute: async args => editStageFields(rootNow(), args),
+    execute: async args => {
+      try { return await editStageFields(rootNow(), args) }
+      catch (error) { return beatFailure(error) }
+    },
     presentCall: args => ({ card: 'generic', title: '编辑章纲字段', kind: 'write', rawInput: args }),
   })
 
@@ -3181,7 +3175,10 @@ export function apply(ctx, config) {
     description: '将完整场景及人物约束移动到目标章节末尾，保留场景 ID 和故事时序；原位置认知记录失效，需重新核对。需要调整故事时间时再编辑章纲。',
     parameters: { type: 'object', additionalProperties: false, required: ['scene', 'chapter'], properties: { scene: { type: 'string' }, chapter: { type: 'string' } } },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
-    execute: async args => moveScene(rootNow(), (await loadBook(rootNow())).meta.chapters, args.scene, args.chapter),
+    execute: async args => {
+      try { return await moveScene(rootNow(), (await loadBook(rootNow())).meta.chapters, args.scene, args.chapter) }
+      catch (error) { return beatFailure(error) }
+    },
     presentCall: args => ({ card: 'generic', title: '整场顺延', kind: 'write', rawInput: args }),
   })
 
@@ -4544,6 +4541,10 @@ export function apply(ctx, config) {
         const warningText = value.warnings?.length
           ? `\n\n⚠ 章纲核对提醒：\n${value.warnings.map(item => `- ${item}`).join('\n')}`
           : ''
+        if (value.error) {
+          const details = (value.issues ?? []).map(item => `- ${item.message}`).join('\n')
+          return textRender(`章纲未写入：${value.error}${details ? `\n${details}` : ''}`)
+        }
         if (value.written) {
           return textRender(`已写入 ${value.chapter.id} ${value.chapter.title} 的章纲（${value.beats.chars} 字）。${warningText}\n${tail}${rhythmTail}`)
         }
@@ -4598,30 +4599,24 @@ export function apply(ctx, config) {
       }
 
       if (hasContent) {
-        const normalizedContent = String(args.content ?? '').replace(/^(### 场景 [\w-]+)\s*:\s*/gm, '$1：')
-        const parsedScenes = parseScenes(normalizedContent, chapter.id)
-        if (!parsedScenes.length) {
-          throw new Error(
-            '章纲格式不符合结构化场景要求，右栏页面无法渲染，已拒绝写入。请使用：\n' +
-              '### 场景 s0001-scene1：场景标题\n' +
-              '- 时序：10\n- 故事时间：...\n- 地点：...\n- 视角：人物英文ID\n- 出场：人物英文ID\n- 冲突：...\n- 叙述方式：限知\n\n' +
-              '#### 人物 人物英文ID\n- 已知：...\n- 目标：...\n\n' +
-              '（注意：场景 ID 只能是英文/数字/连字符；如只改已有场景的单个字段，请改用 novel_stage_edit。）',
-          )
-        }
-        const written = await writeBeats(rootNow(), chapter, normalizedContent, meta.chapters)
+        let written
+        try { written = await writeBeats(rootNow(), chapter, args.content, meta.chapters) }
+        catch (error) { return { ...beatFailure(error), chapter: { id: chapter.id, title: chapter.title } } }
         const writtenCoverage = await beatsCoverage(rootNow(), chapters)
         return {
+          ok: true,
           written: true,
-          warnings: [...new Set([...validateBeatsContent(normalizedContent), ...(writtenCoverage.warnings ?? [])])],
+          baseHash: written.baseHash,
+          issues: written.issues,
+          warnings: [...new Set([...written.warnings, ...(writtenCoverage.warnings ?? [])])],
           chapter: { id: chapter.id, title: chapter.title },
           beats: {
             heading: written.heading,
-            text: normalizedContent.trim(),
+            text: written.text,
             chars: written.chars,
             present: written.chars > 0,
-            infos: parseBeatInfos(normalizedContent),
-            scenes: parsedScenes,
+            infos: parseBeatInfos(written.text),
+            scenes: parseScenes(written.text, chapter.id),
           },
           coverage: writtenCoverage,
           rhythm: rhythmSummary,
@@ -5066,9 +5061,20 @@ export function apply(ctx, config) {
                 return
               }
               if (route === '/beats') {
-                if (payload.fields) {
+                if (Object.hasOwn(payload, 'fields')) {
+                  if (!payload.fields || typeof payload.fields !== 'object' || Array.isArray(payload.fields)) {
+                    sendJson(res, 400, { error: '需要 fields 字段对象', code: BEAT_REQUEST_INVALID })
+                    return
+                  }
+                  if (typeof payload.baseHash !== 'string' || !payload.baseHash) {
+                    sendJson(res, 400, { error: '缺少章纲 baseHash：请重新读取章纲后再保存，未写入', code: BEAT_REQUEST_INVALID })
+                    return
+                  }
                   try { sendJson(res, 200, await editStageFields(rootNow(), payload)) }
-                  catch (error) { sendJson(res, 409, { error: error.message }) }
+                  catch (error) {
+                    const failure = beatFailure(error)
+                    sendJson(res, [BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error.code) ? 409 : 400, failure)
+                  }
                   return
                 }
                 if (typeof payload.content !== 'string') {
@@ -5091,10 +5097,10 @@ export function apply(ctx, config) {
                 }
                 try {
                   const written = await writeBeats(rootNow(), chapter, payload.content, meta.chapters, payload.baseHash)
-                  sendJson(res, 200, { ok: true, chapter: { id: chapter.id, title: chapter.title }, chars: written.chars })
+                  sendJson(res, 200, { ok: true, chapter: { id: chapter.id, title: chapter.title }, chars: written.chars, baseHash: written.baseHash, issues: written.issues, warnings: written.warnings })
                 } catch (error) {
-                  if (![BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error?.code)) throw error
-                  sendJson(res, 409, { error: error.message })
+                  const failure = beatFailure(error)
+                  sendJson(res, [BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error.code) ? 409 : 400, failure)
                 }
                 return
               }
@@ -5500,7 +5506,8 @@ export function apply(ctx, config) {
                 sections: board.sections.map(section => sectionView(section)),
                 chapterMatches,
                 coverage,
-                warnings: coverage.warnings,
+                issues: board.issues,
+                warnings: [...new Set([...(coverage.warnings ?? []), ...board.issues.filter(item => item.severity === 'warning').map(item => item.message)])],
                 rhythm: {
                   payoff: rhythm.payoff,
                   withPayoff: rhythm.withPayoff,
