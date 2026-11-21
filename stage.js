@@ -1,6 +1,9 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { withFileLock } from './lib/file-lock.js'
+import { parseBeatSections } from './lib/beats.js'
+import { beatHeading, resolveBeatSection, scanBeatHeadings } from './lib/beat-match.js'
 
 export const hash = value => createHash('sha256').update(value).digest('hex')
 const safeId = value => {
@@ -175,7 +178,6 @@ export async function stageContext(root, chapters, chapter, sceneId) {
     records: book.records.filter(r => r.chapter === chapter), baseHash: book.baseHash, text }
 }
 
-const locks = new Map()
 export function patchStageText(text, args) {
   if (!args.baseHash || args.baseHash !== hash(text)) throw new Error('章纲已变化，请重新读取后保存；未覆盖其他修改')
   if (!args.fields || typeof args.fields !== 'object' || Array.isArray(args.fields)) throw new Error('需要 fields 字段对象')
@@ -225,21 +227,18 @@ export function patchStageText(text, args) {
 }
 
 export async function editStageFields(root, args) {
-  const previous = locks.get(root) || Promise.resolve()
-  const next = previous.catch(() => {}).then(async () => {
-    const file = path.join(root, 'beats.md')
+  const file = path.join(root, 'beats.md')
+  return withFileLock(file, async () => {
     const original = await read(file)
     const text = patchStageText(original, args)
-    if (await read(file) !== original) throw new Error('章纲已变化，请重新读取')
     const tmp = `${file}.${randomUUID()}.tmp`
     await fs.writeFile(tmp, text, 'utf8')
     await fs.rename(tmp, file)
     return { ok: true, baseHash: hash(text) }
   })
-  locks.set(root, next)
-  try { return await next } finally { if (locks.get(root) === next) locks.delete(root) }
 }
 
+const locks = new Map()
 export async function updateHistory(root, chapters, args) {
   const previous = locks.get(root) || Promise.resolve()
   const next = previous.catch(() => {}).then(() => updateUnlocked(root, chapters, args))
@@ -297,31 +296,53 @@ export const historyParameters = {
 }
 
 export async function moveScene(root, chapters, sceneId, targetChapter) {
-  const book = await stageBook(root, chapters)
-  const scene = book.scenes.find(s => s.id === sceneId)
-  const target = chapters.find(c => c.id === targetChapter)
-  if (!scene || book.scenes.filter(s => s.id === sceneId).length !== 1 || !target || scene.chapter === targetChapter) throw new Error('需要唯一场景和不同的有效目标章节')
   const file = path.join(root, 'beats.md')
-  const original = await read(file)
-  let text = original.replace(/\r\n/g, '\n')
-  const startMatch = new RegExp(`^### 场景 ${sceneId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[：:]`, 'm').exec(text)
-  if (!startMatch) throw new Error('在 beats.md 中找不到该场景标题')
-  const start = startMatch.index
-  const endMatch = /^##(?:#)? /gm
-  endMatch.lastIndex = start + 1
-  const end = endMatch.exec(text)?.index ?? text.length
-  const block = text.slice(start, end).trim()
-  text = text.slice(0, start) + text.slice(end)
-  const headings = [...text.matchAll(/^## (\d+)\b[^\n]*\n/gm)]
-  const index = headings.findIndex(m => m[1] === targetChapter)
-  if (index < 0) text += `\n\n## ${targetChapter} ${target.title}\n\n${block}\n`
-  else {
-    const at = headings[index + 1]?.index ?? text.length
-    text = text.slice(0, at).trimEnd() + `\n\n${block}\n\n` + text.slice(at)
-  }
-  if (await read(file) !== original) throw new Error('章纲已变化，请重试')
-  const tmp = `${file}.${randomUUID()}.tmp`
-  await fs.writeFile(tmp, text, 'utf8')
-  await fs.rename(tmp, file)
-  return { moved: sceneId, chapter: targetChapter, warnings: ['场景已整块移动；人物入场状态按时序重新计算，原位置确认记录需重新提取核对。'] }
+  return withFileLock(file, async () => {
+    const original = await read(file)
+    let text = original.replace(/\r\n/g, '\n')
+    const target = chapters.find(c => c.id === targetChapter)
+    if (!target) throw new Error('需要唯一场景和不同的有效目标章节')
+    // 目标章节沿用整章保存的匹配规则：ID 唯一优先，无 ID 旧条目只在唯一认领时回退。
+    const sections = parseBeatSections(text)
+    const resolved = resolveBeatSection(sections, target, chapters)
+    if (resolved.kind === 'ambiguous') throw new Error(`${resolved.message}；未移动`)
+    const targetIndex = resolved.kind === 'matched' ? sections.indexOf(resolved.section) : -1
+
+    // 唯一性和原归属都以锁内实际要写入的版本为准，避免排队期间新增同 ID 场景后移错小节。
+    const scenePattern = new RegExp(`^### 场景 ${sceneId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[：:]`, 'gm')
+    const sceneHits = [...text.matchAll(scenePattern)]
+    if (sceneHits.length !== 1) throw new Error('场景不存在或重复')
+    const start = sceneHits[0].index
+    const headings = scanBeatHeadings(text)
+    const ownerIndex = headings.reduce((found, item, index) => item.index < start ? index : found, -1)
+    if (ownerIndex < 0) throw new Error('在 beats.md 中找不到该场景的所属章节')
+    if (targetIndex >= 0 && ownerIndex === targetIndex) throw new Error('需要唯一场景和不同的有效目标章节')
+
+    // 结束位置取「下一场景 / 下一章 / 文件末尾」最早者，移动首场时后续场景必须留在原地。
+    const nextScene = /^###\s[^\n]*(?:\n|$)/gm
+    nextScene.lastIndex = start + 1
+    const sceneEnd = nextScene.exec(text)?.index ?? text.length
+    const end = Math.min(sceneEnd, headings[ownerIndex + 1]?.index ?? text.length)
+    const block = text.slice(start, end).trim()
+    text = text.slice(0, start) + text.slice(end)
+    if (targetIndex < 0) text += `\n\n## ${beatHeading(target)}\n\n${block}\n`
+    else {
+      // 命中旧标题时同一次保存内规范化，否则 stageBook 仍按数字标题读不到这一章。
+      const targetHit = scanBeatHeadings(text)[targetIndex]
+      if (!targetHit) throw new Error('在 beats.md 中找不到目标章节')
+      // 比较原始标题行：`##\t0002 目标章` 去掉标记后与规范文本相同，但 stageBook 仍读不到。
+      const normalized = `## ${beatHeading(target)}`
+      if (targetHit.line !== normalized) {
+        text = text.slice(0, targetHit.index) + `${normalized}\n` + text.slice(targetHit.end)
+      }
+      // 插入边界取紧邻的下一个任意二级标题；无 ID 的旧小节也占据自己的标题行。
+      const nextHeadings = scanBeatHeadings(text)
+      const at = nextHeadings[targetIndex + 1]?.index ?? text.length
+      text = text.slice(0, at).trimEnd() + `\n\n${block}\n\n` + text.slice(at)
+    }
+    const tmp = `${file}.${randomUUID()}.tmp`
+    await fs.writeFile(tmp, text, 'utf8')
+    await fs.rename(tmp, file)
+    return { moved: sceneId, chapter: targetChapter, warnings: ['场景已整块移动；人物入场状态按时序重新计算，原位置确认记录需重新提取核对。'] }
+  })
 }

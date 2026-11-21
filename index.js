@@ -21,7 +21,7 @@ import { countChars, isPlaceholderText, INTERIOR_RE, MONEY_RE, AI_TONE_PHRASES, 
 import { presentationContext, selectPresentationExcerpts, renderPresentationExcerpts } from './lib/presentation.js'
 import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, hash as stageHash, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
+import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
 import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
 import { CHARACTERS_DIR } from './lib/book.js'
@@ -29,9 +29,9 @@ import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
 import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
 import { parseCadence } from './lib/people.js'
-import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
+import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, resolveBeatSection, beatsCoverage, beatCoverage, beatRhythm, payoffBudget } from './lib/beats.js'
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
-import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL } from './lib/beats.js'
+import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
 import { THREADS_FILE, LEDGER_FILE, LEDGER_CATEGORIES, EVENTS_FILE, SETTINGS_DIR, settingCategory, settingSummary, listSettings, readSetting, writeSetting, SETTING_VOID_RE, setSettingStatus, deleteSetting, parseThreads, latestWrittenId, decorateThreads, loadThreads, writeThread, validateThreadPatch, parseLedger, loadLedger, writeLedger, validateLedgerPatch, parseChapterRange, parseEventLines, readEvents, eventTimeline, writeEventLine } from './lib/library.js'
 import { stampOf, stampToIso, shortHash } from './lib/book.js'
@@ -748,7 +748,7 @@ async function loadStyleTrialChapter(root, wanted) {
   const { meta } = await loadBook(root)
   const chapter = findChapter(meta.chapters, wanted)
   if (!chapter) throw new Error('请选择有效的试写章节')
-  const { section } = await readBeats(root, chapter)
+  const { section } = await readBeats(root, chapter, meta.chapters)
   if (!section?.body.trim()) throw new Error('该章没有章纲，请选择有章纲的章节')
   const scenes = parseScenes(section.body, chapter.id)
   return { chapter, chapters: meta.chapters, scenes: scenes.length ? scenes : [{ id: '', title: '本章首场', raw: section.body }] }
@@ -1238,7 +1238,7 @@ function materialMemoSections(text, chapter) {
 
 /** 复用现有字面规则生成候选，不推断语义冲突或材料权威。 */
 async function materialPreflight(root, chapter, known = {}) {
-  const beatsText = known.beatsText ?? (await readBeats(root, chapter)).section?.body ?? ''
+  const beatsText = known.beatsText ?? (await readBeats(root, chapter, known.chapters)).section?.body ?? ''
   const styleName = known.styleName ?? activeStyleName((await loadBook(root)).meta)
   const styleText = known.styleText ?? (styleName ? (await readStyle(root, styleName)) ?? '' : '')
   const memoText = (await readText(path.join(root, THREADS_FILE))) ?? ''
@@ -1894,7 +1894,7 @@ async function auditBook(root) {
       if (row.chars < goal * 0.7) add('warn', 'short', label + '：' + row.chars + '/' + goal + ' 字，差 ' + (goal - row.chars), row.id)
     }
     if (sections.length) {
-      const section = matchBeatSection(sections, row)
+      const section = matchBeatSection(sections, row, rows)
       if (section) {
         const body = (await readText(path.join(root, row.file))) ?? ''
         const cover = beatCoverage(body, section.body)
@@ -2322,7 +2322,7 @@ export function apply(ctx, config) {
       '把一份原文文件里的章节「原样搬进」chapters/ —— 由宿主按行切片搬字节，**不经过你读正文**（省上下文、省 token，也不会被改写）。' +
       '\n\n先探测再落盘：novel_import({ source, dryRun: true }) 只返回识别到的章数、标题、每章字数；确认无误再 dryRun: false 真正写入。' +
       '\n\n边界谁定：默认按「第N章」这类标题行自动切（也认 Chapter N / ## 标题 / N、标题）；标题格式怪就给 pattern（正则）；边界要人工干预就给 ranges: [{ title, from, to }]（行号从 1 起，你只报边界，正文不经过你）。' +
-      '\n\n拆书/导入旧稿的正确用法：novel_import 落章节原文 → 再逐章 novel_beats 写章纲 / novel_card 建人物 —— 不要让 AI 把整本书重抄一遍。默认跳过「同名或同章号」的已有章节（「第一章 日记」和「第1章 日记」算同一章），replace: true 才覆盖原文件。',
+      '\n\n拆书/导入旧稿的正确用法：novel_import 落章节原文 → 再逐章 novel_beats 写章纲 / novel_card 建人物 —— 不要让 AI 把整本书重抄一遍。默认保留并跳过「同名或可识别为同章号」的已有章节（「第一章 日记」和「第1章 日记」算同一章）；只有作者明确要求覆盖时才传 replace: true，非空旧稿内容变化时先留历史快照，再写原文件。',
     parameters: {
       type: 'object',
       properties: {
@@ -2335,8 +2335,8 @@ export function apply(ctx, config) {
         },
         limit: { type: 'number', description: '最多导入多少章（默认 50，上限 500）' },
         offset: { type: 'number', description: '从识别到的第几章开始（1 起，默认 1）' },
-        dryRun: { type: 'boolean', description: 'true = 只探测不写盘，建议先跑一次' },
-        replace: { type: 'boolean', description: 'true = 已存在同名章节也覆盖' },
+        dryRun: { type: 'boolean', description: 'true = 只展示切分结果、不写任何文件；省略或 false = 正式导入，建议先试读' },
+        replace: { type: 'boolean', description: '省略或 false = 保留并跳过已有同名或可识别为同章号的章节；只有作者明确要求覆盖时才传 true，非空旧稿变化时先留历史快照' },
         status: { type: 'string', enum: CHAPTER_STATUS, description: '导入后的章节状态，默认 planned' },
       },
       required: ['source'],
@@ -2359,7 +2359,7 @@ export function apply(ctx, config) {
           warnings: { type: 'array', items: { type: 'string' } },
         },
       },
-      render: (_args, value) => {
+      render: (args, value) => {
         const lines = value.chapters
           .slice(0, 12)
           .map(item => `- ${item.id ? `${item.id} ` : `${item.index}. `}${item.title}（${item.chars} 字）`)
@@ -2371,18 +2371,21 @@ export function apply(ctx, config) {
               lines.join('\n') +
               more +
               (value.warnings.length ? `\n⚠ ${value.warnings.join('；')}` : '') +
-              '\n\n确认没问题就再调一次同样的参数、加 dryRun: false 真正落盘。',
+              '\n\n确认切分无误后，沿用 source/pattern/ranges/offset/limit，改为 dryRun: false 正式导入。默认不传 replace，保留并跳过已有章节；只有作者明确要求覆盖时才传 replace: true，试读不代表授权覆盖。',
           )
         }
         return textRender(
           `已导入 ${value.imported} 章进 chapters/（共 ${value.totalChars} 字）` +
-            (value.skipped.length ? `；跳过同名 ${value.skipped.length} 章` : '') +
-        (value.empty && value.empty.length ? `；原文为空的 ${value.empty.length} 章（已建成 planned，等你补）：${value.empty.join('、')}` : '') +
+            (value.skipped.length ? `；保留并跳过已有同名或同章号章节 ${value.skipped.length} 章：${value.skipped.join('、')}` : '') +
+            (value.empty && value.empty.length ? `；原文为空的 ${value.empty.length} 章（已建成 planned，等你补）：${value.empty.join('、')}` : '') +
             '\n' +
             lines.join('\n') +
             more +
+            (args?.replace === true
+              ? '\n覆盖策略：本次显式启用 replace: true；非空旧稿内容变化时先留历史快照，再写入新正文。'
+              : '\n覆盖策略：默认保留并跳过已有章节，未启用覆盖。') +
             (value.warnings.length ? `\n⚠ ${value.warnings.join('；')}` : '') +
-            '\n\n下一步：每章 novel_beats 写章纲（3–6 条「- 场景：…」+「→ 爽点 / → 钩子」），人物用 novel_card 落卡。',
+            '\n\n下一步：先 novel_status 核对章节与字数，再用 novel_beats 写结构化章纲（### 场景 scene-id：标题、- 时序：、- 出场：、#### 人物 character-id；标记 → 爽点 / → 钩子），人物用 novel_card 落卡。',
         )
       },
     },
@@ -2445,7 +2448,7 @@ export function apply(ctx, config) {
       const totalChars = preview.reduce((sum, item) => sum + item.chars, 0)
       const emptyTitles = picked.filter(segment => countChars(segment.body) === 0).map(segment => segment.title)
       for (const title of emptyTitles) {
-        warnings.push(`${title} 原文里是空的（只有标题、没有正文），导入时会建成 planned 章，等你补写`)
+        warnings.push(`${title} 原文里是空的（只有标题、没有正文）；新章节会登记为 planned，已有章节保留正文和元数据`)
       }
 
       if (args.dryRun === true) {
@@ -2466,6 +2469,7 @@ export function apply(ctx, config) {
 
       const { meta } = await loadBook(root)
       const chapters = [...meta.chapters]
+      const originalChapters = JSON.stringify(chapters)
       const imported = []
       const skipped = []
       const empty = []
@@ -2478,8 +2482,13 @@ export function apply(ctx, config) {
           skipped.push(segment.title)
           continue
         }
-        if (mode === 'patch' && !existing) throw new Error('局部改写必须指定已有章节')
-      let chapter = existing
+        const bodyChars = countChars(segment.body)
+        if (existing && bodyChars === 0) {
+          skipped.push(segment.title)
+          warnings.push(`${segment.title} 来源只有标题、没有正文；已保留已有章节的正文、状态和备注，未覆盖`)
+          continue
+        }
+        let chapter = existing
         if (!chapter) {
           const id = nextChapterId(chapters)
           chapter = {
@@ -2495,7 +2504,6 @@ export function apply(ctx, config) {
           chapter = { ...chapter, note: chapter.note || '原文摘录' }
           chapters[chapters.findIndex(item => item.id === chapter.id)] = chapter
         }
-        const bodyChars = countChars(segment.body)
         if (bodyChars === 0) {
           // 原文这一章就是空的：别留个 1 字节的空壳假装导入成功
           chapter = { ...chapter, status: 'planned', note: '原文为空' }
@@ -2514,7 +2522,7 @@ export function apply(ctx, config) {
         await writeFileAtomic(lastSnapshotPath(root, chapter.id), `${segment.body}\n`)
         imported.push({ id: chapter.id, title: chapter.title, chars: countChars(segment.body) })
       }
-      if (imported.length) await persistBook(root, meta, chapters)
+      if (JSON.stringify(chapters) !== originalChapters) await persistBook(root, meta, chapters)
       return {
         mode: 'import',
         source: args.source,
@@ -2685,7 +2693,8 @@ export function apply(ctx, config) {
       if (args.carryOver && args.chapter) {
         const { meta } = await loadBook(rootNow())
         const chapter = findChapter(meta.chapters, args.chapter)
-        const board = chapter ? await readBeats(rootNow(), chapter) : null
+        const board = chapter ? await readBeats(rootNow(), chapter, meta.chapters) : null
+        if (board?.matchIssue) throw new Error(`${board.matchIssue.message}；未写入正文，也未顺延章纲`)
         if (board?.section?.scenes?.length) throw new Error('结构化场景请用 novel_move_scene 整场顺延，再保存正文；不能按行拆分人物约束')
       }
       const { meta } = await loadBook(rootNow())
@@ -2698,6 +2707,7 @@ export function apply(ctx, config) {
       if (args.chapter && !existing) {
         throw new Error(`找不到章节 "${args.chapter}"；要新建一章请省略 chapter`)
       }
+      if (mode === 'patch' && !existing) throw new Error('局部改写必须指定已有章节')
 
       let chapter = existing
       const created = !chapter
@@ -2759,7 +2769,8 @@ export function apply(ctx, config) {
       const stageAfterWrite = await stageContext(rootNow(), chapters, chapter.id)
       warnings.push(...stageAfterWrite.warnings)
       if (stageAfterWrite.scenes.length) warnings.push('写后请逐场核对实际认知与关系变化：novel_character_history propose 提交逐字正文依据，再确认；章纲计划不会自动进入历史。')
-      const beat = await readBeats(rootNow(), chapter)
+      const beat = await readBeats(rootNow(), chapter, chapters)
+      if (beat.matchIssue) warnings.push(beat.matchIssue.message)
       let carriedOver = null
       if (beat.section && beat.section.chars > 0) {
         const gap = beatCoverage(body, beat.section.body)
@@ -2800,9 +2811,9 @@ export function apply(ctx, config) {
             keptLines.push(line)
           }
           if (movedLines.length) {
-            await writeBeats(rootNow(), chapter, keptLines.join('\n').trim())
             const curIdx = chapters.findIndex(item => item.id === chapter.id)
             let nextChapter = curIdx >= 0 && curIdx + 1 < chapters.length ? chapters[curIdx + 1] : null
+            const createdNextChapter = !nextChapter
             if (!nextChapter) {
               const nextId = nextChapterId(chapters)
               nextChapter = {
@@ -2813,15 +2824,21 @@ export function apply(ctx, config) {
                 targetChars: 0,
               }
               chapters.push(nextChapter)
-              await persistBook(rootNow(), { ...meta, chapters }, chapters)
             }
-            const nextBeat = await readBeats(rootNow(), nextChapter)
-            const nextBody = nextBeat.section && nextBeat.section.body ? `${movedLines.join('\n')}\n${nextBeat.section.body}` : movedLines.join('\n')
-            await writeBeats(rootNow(), nextChapter, nextBody)
-            carriedOver = {
-              nextChapter: { id: nextChapter.id, title: nextChapter.title },
-              scenes: missingScenes.size,
-              infos: missingInfos.size,
+            try {
+              await writeBeatsBatch(rootNow(), [
+                { chapter, content: keptLines.join('\n').trim() },
+                { chapter: nextChapter, prepend: movedLines.join('\n') },
+              ], chapters, beat.baseHash)
+              if (createdNextChapter) await persistBook(rootNow(), { ...meta, chapters }, chapters)
+              carriedOver = {
+                nextChapter: { id: nextChapter.id, title: nextChapter.title },
+                scenes: missingScenes.size,
+                infos: missingInfos.size,
+              }
+            } catch (error) {
+              if (![BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error?.code)) throw error
+              warnings.push(`${error.message}；正文已保存，但未顺延，源章纲保持不变`)
             }
           }
         } else {
@@ -3148,7 +3165,7 @@ export function apply(ctx, config) {
       const { meta } = await loadBook(root)
       const chapter = findChapter(meta.chapters, args.chapter)
       if (!chapter) throw new Error(`找不到章节「${args.chapter}」，请先核对章节清单`)
-      return await materialPreflight(root, chapter, { styleName: activeStyleName(meta) })
+      return await materialPreflight(root, chapter, { chapters: meta.chapters, styleName: activeStyleName(meta) })
     },
     presentCall: args => ({ card: 'generic', title: `资料预检 ${args.chapter}`, kind: 'read', rawInput: args }),
   })
@@ -3237,7 +3254,7 @@ export function apply(ctx, config) {
       const outlinePart = outlineExcerpt(outlineText, current, Math.max(200, Math.min(900, Math.round(budget * 0.35))))
 
       // 章纲优先：有这一章的 beats 就按清单配额给它，大纲退成背景参考。
-      const beats = await readBeats(rootNow(), current)
+      const beats = await readBeats(rootNow(), current, [...meta.chapters.filter(item => item.id !== current.id), current])
       const stage = await stageContext(rootNow(), meta.chapters, current.id, args.scene)
       const selectedScene = args.scene ? stage.scenes[0] : null
       const contextBeats = contextBeatScope(beats.section, selectedScene)
@@ -3249,7 +3266,7 @@ export function apply(ctx, config) {
       let gapBefore = 0
       const chapterIndex = meta.chapters.findIndex(item => item.id === current.id)
       for (let i = chapterIndex - 1; i >= 0; i -= 1) {
-        const section = matchBeatSection(beats.sections, meta.chapters[i])
+        const section = matchBeatSection(beats.sections, meta.chapters[i], meta.chapters)
         if (!section || section.chars === 0) continue
         if ((section.marks?.payoff.length ?? 0) > 0) break
         gapBefore += 1
@@ -3391,7 +3408,7 @@ export function apply(ctx, config) {
         if (chapter.chars > 0) priorTexts.push({ id: chapter.id, title: chapter.title, text: (await readText(path.join(rootNow(), chapter.file))) ?? '' })
       }
       const presentationSources = selectPresentationExcerpts(priorTexts, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
-      const preflight = await materialPreflight(rootNow(), current, { beatsText, styleName, styleText: styleRaw ?? '' })
+      const preflight = await materialPreflight(rootNow(), current, { chapters: [...meta.chapters.filter(item => item.id !== current.id), current], beatsText, styleName, styleText: styleRaw ?? '' })
       return assembleNovelContext({
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: contextBeats,
@@ -3924,7 +3941,7 @@ export function apply(ctx, config) {
         }
       }
       // 有章纲就再对一遍：这一步以前没做，结果模型写了三条 beat 就收笔，章纲第 4、5 场没人发现。
-      const beat = await readBeats(rootNow(), chapter ?? null)
+      const beat = await readBeats(rootNow(), chapter ?? null, meta.chapters)
     const beatBody = beat && beat.section ? String(beat.section.body ?? '') : ''
     if (beatBody) {
       const beatLines = beatBody.split(/\r?\n/u)
@@ -3965,7 +3982,7 @@ export function apply(ctx, config) {
           let gapBefore = 0
           const index = meta.chapters.findIndex(item => item.id === chapter.id)
           for (let i = index - 1; i >= 0; i -= 1) {
-            const section = matchBeatSection(beat.sections, meta.chapters[i])
+            const section = matchBeatSection(beat.sections, meta.chapters[i], meta.chapters)
             if (!section || section.chars === 0) continue
             if ((section.marks?.payoff.length ?? 0) > 0) break
             gapBefore += 1
@@ -4204,7 +4221,7 @@ export function apply(ctx, config) {
       }
       const packed = extractDeaiPack(raw, cards)
       const styleName = activeStyleName(meta)
-      const beats = await readBeats(rootNow(), chapter)
+      const beats = await readBeats(rootNow(), chapter, meta.chapters)
       const styleText = styleName ? (await readStyle(rootNow(), styleName)) ?? '' : ''
       return {
         chapter: { id: chapter.id, title: chapter.title },
@@ -4214,7 +4231,7 @@ export function apply(ctx, config) {
         dialogueContext: { beats: beats.section?.body ?? '' },
         settingReferences: (await listSettings(rootNow())).map(item => ({ name: item.name, summary: item.summary })),
         sourceRequirements: (await reviewSourceCoverage(rootNow(), meta, raw)).requirements,
-        materialPreflight: await materialPreflight(rootNow(), chapter, { beatsText: beats.section?.body ?? '', styleName, styleText }),
+        materialPreflight: await materialPreflight(rootNow(), chapter, { chapters: meta.chapters, beatsText: beats.section?.body ?? '', styleName, styleText }),
       }
     },
     presentCall: args => ({ card: 'generic', title: `全文语义审稿 ${args.chapter}`, kind: 'read', rawInput: args }),
@@ -4473,16 +4490,23 @@ export function apply(ctx, config) {
             ` · 有爽点的章 ${value.rhythm.withPayoff}/${value.rhythm.withBeats} · 钩子 ${value.rhythm.hooks} 章 · 最长断档 ${value.rhythm.longestGap} 章` +
             (value.rhythm.currentGap >= (value.rhythm.gapLimit || 2) ? `\n⚠ 已经连续 ${value.rhythm.currentGap} 章没有爽点（每 ${value.rhythm.gapLimit || 2} 章至少一次）` : '')
           : ''
+        const warningText = value.warnings?.length
+          ? `\n\n⚠ 章纲核对提醒：\n${value.warnings.map(item => `- ${item}`).join('\n')}`
+          : ''
         if (value.written) {
-          return textRender(`已写入 ${value.chapter.id} ${value.chapter.title} 的章纲（${value.beats.chars} 字）。${warnText(value.warnings)}\n${tail}${rhythmTail}`)
+          return textRender(`已写入 ${value.chapter.id} ${value.chapter.title} 的章纲（${value.beats.chars} 字）。${warningText}\n${tail}${rhythmTail}`)
         }
         if (value.chapter) {
-          const body = value.beats && value.beats.present ? value.beats.text : '（这一章还没有章纲；可以给 content 写一段，或让我按大纲拆）'
+          const body = value.beats && value.beats.present
+            ? value.beats.text
+            : value.warnings?.length
+              ? '（章纲目标存在歧义，未选择任何小节；请按下方提示核对。）'
+              : '（这一章还没有章纲；可以给 content 写一段，或让我按大纲拆）'
           const marks = value.marks
           const markLine = marks
             ? `\n本章标记：爽点 ${marks.payoff}（${marks.labels.length ? marks.labels.join('、') : '未写类型'}） · 钩子 ${marks.hook ? '有' : '无'} · 转折 ${marks.turn}`
             : ''
-          return textRender(`【章纲】${value.chapter.id} ${value.chapter.title}\n\n${body}${markLine}\n\n${tail}${rhythmTail}`)
+          return textRender(`【章纲】${value.chapter.id} ${value.chapter.title}\n\n${body}${markLine}${warningText}\n\n${tail}${rhythmTail}`)
         }
         const lines = ['【全书章纲】']
         if (!value.sections.length) lines.push('（beats.md 还是空的）')
@@ -4492,7 +4516,7 @@ export function apply(ctx, config) {
           const flag = mark ? ` · 爽×${mark.payoff}${mark.hook ? ' 钩' : ''}` : ''
           lines.push(`- ${section.heading}（${section.chars} 字${flag}）`)
         }
-        lines.push('', tail + rhythmTail)
+        lines.push('', tail + rhythmTail + warningText)
         return textRender(lines.join('\n'))
       },
     },
@@ -4534,10 +4558,11 @@ export function apply(ctx, config) {
               '（注意：场景 ID 只能是英文/数字/连字符；如只改已有场景的单个字段，请改用 novel_stage_edit。）',
           )
         }
-        const written = await writeBeats(rootNow(), chapter, normalizedContent)
+        const written = await writeBeats(rootNow(), chapter, normalizedContent, meta.chapters)
+        const writtenCoverage = await beatsCoverage(rootNow(), chapters)
         return {
           written: true,
-          warnings: validateBeatsContent(normalizedContent),
+          warnings: [...new Set([...validateBeatsContent(normalizedContent), ...(writtenCoverage.warnings ?? [])])],
           chapter: { id: chapter.id, title: chapter.title },
           beats: {
             heading: written.heading,
@@ -4547,12 +4572,12 @@ export function apply(ctx, config) {
             infos: parseBeatInfos(normalizedContent),
             scenes: parsedScenes,
           },
-          coverage: await beatsCoverage(rootNow(), chapters),
+          coverage: writtenCoverage,
           rhythm: rhythmSummary,
         }
       }
 
-      const board = await readBeats(rootNow(), chapter)
+      const board = await readBeats(rootNow(), chapter, meta.chapters)
       // 不带参数时 schema 里的 chapter / beats 就不出现（写成 null 会被判 "must be an object"）。
       return {
         written: false,
@@ -4579,6 +4604,7 @@ export function apply(ctx, config) {
             }
           : {}),
         coverage,
+        warnings: chapter ? (board.matchIssue ? [board.matchIssue.message] : []) : coverage.warnings,
         rhythm: rhythmSummary,
         sections: board.sections.map(section => ({ id: section.id, heading: section.heading, chars: section.chars })),
       }
@@ -4994,7 +5020,6 @@ export function apply(ctx, config) {
                 return
               }
               if (route === '/beats') {
-                if (payload.baseHash && payload.baseHash !== stageHash((await readText(path.join(rootNow(), BEATS_FILE))) || '')) { sendJson(res, 409, { error: '章纲已变化，请重新读取后保存' }); return }
                 if (payload.fields) {
                   try { sendJson(res, 200, await editStageFields(rootNow(), payload)) }
                   catch (error) { sendJson(res, 409, { error: error.message }) }
@@ -5008,14 +5033,23 @@ export function apply(ctx, config) {
                   sendJson(res, 400, { error: '需要 chapter（哪一章）' })
                   return
                 }
+                if (typeof payload.baseHash !== 'string' || !payload.baseHash) {
+                  sendJson(res, 400, { error: '缺少章纲 baseHash：请重新读取章纲后再保存，未写入' })
+                  return
+                }
                 const { meta } = await loadBook(rootNow())
                 const chapter = findChapter(meta.chapters, payload.chapter)
                 if (!chapter) {
                   sendJson(res, 404, { error: `没有这一章「${payload.chapter}」` })
                   return
                 }
-                const written = await writeBeats(rootNow(), chapter, payload.content)
-                sendJson(res, 200, { ok: true, chapter: { id: chapter.id, title: chapter.title }, chars: written.chars })
+                try {
+                  const written = await writeBeats(rootNow(), chapter, payload.content, meta.chapters, payload.baseHash)
+                  sendJson(res, 200, { ok: true, chapter: { id: chapter.id, title: chapter.title }, chars: written.chars })
+                } catch (error) {
+                  if (![BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error?.code)) throw error
+                  sendJson(res, 409, { error: error.message })
+                }
                 return
               }
               if (route === '/setting') {
@@ -5371,30 +5405,56 @@ export function apply(ctx, config) {
                 sendJson(res, 404, { error: `没有这一章「${wanted}」` })
                 return
               }
-              const board = await readBeats(rootNow(), chapter)
+              const board = await readBeats(rootNow(), chapter, meta.chapters)
+              if (board.matchIssue) {
+                sendJson(res, 409, { error: board.matchIssue.message })
+                return
+              }
+              const coverage = await beatsCoverage(rootNow(), meta.chapters)
               const rhythm = await beatRhythm(rootNow(), meta.chapters)
               const castCards = await listCharacters(rootNow())
-              sendJson(res, 200, {
-                present: board.present,
-                chapter: chapter ? { id: chapter.id, title: chapter.title } : null,
-                text: board.section ? board.section.body : '',
-                chars: board.section ? board.section.chars : 0,
-                baseHash: stageHash((await readText(path.join(rootNow(), BEATS_FILE))) || ''),
-                fields: { role: ROLE_FIELDS, scene: SCENE_FIELDS, chapter: CHAPTER_FIELDS },
-                sections: board.sections.map(section => ({
-                  id: section.id,
+              const sectionView = (section, id = section.id) => {
+                const scenes = parseScenes(section.body, id)
+                return {
+                  id,
                   heading: section.heading,
                   chars: section.chars,
                   text: section.body,
-                  scenes: section.scenes,
-                  overview: { ...chapterOverview(section.body, section.id), reviewCount: section.scenes.flatMap(scene => presentationChecks(scene, castCards)).length },
+                  scenes,
+                  overview: { ...chapterOverview(section.body, id), reviewCount: scenes.flatMap(scene => presentationChecks(scene, castCards)).length },
                   payoff: section.marks.payoff.length,
                   labels: section.marks.payoff.map(item => item.label).filter(Boolean),
                   hook: section.marks.hook > 0,
                   turn: section.marks.turn,
                   infos: (section.infos ?? []).length,
-                })),
-                coverage: await beatsCoverage(rootNow(), meta.chapters),
+                }
+              }
+              const chapterMatches = meta.chapters.map(item => {
+                const resolved = resolveBeatSection(board.sections, item, meta.chapters)
+                const rawId = resolved.kind === 'matched' ? (/^(\d{1,6})\b/u.exec(resolved.section.heading) ?? [])[1] ?? '' : ''
+                const needsNormalization = resolved.kind === 'matched' && rawId !== String(item.id)
+                return {
+                  id: item.id,
+                  status: resolved.kind,
+                  ...(resolved.kind === 'matched' ? {
+                    section: sectionView(resolved.section, item.id),
+                    needsNormalization,
+                    ...(needsNormalization ? { warning: `当前小节标题「${resolved.section.heading}」尚未规范为章 ID ${item.id}；请先打开“原始章纲”并保存，再使用场景或字段编辑` } : {}),
+                  } : {}),
+                  ...(resolved.kind === 'ambiguous' ? { warning: resolved.message, candidates: resolved.candidates } : {}),
+                }
+              })
+              sendJson(res, 200, {
+                present: board.present,
+                chapter: chapter ? { id: chapter.id, title: chapter.title } : null,
+                text: board.section ? board.section.body : '',
+                chars: board.section ? board.section.chars : 0,
+                baseHash: board.baseHash,
+                fields: { role: ROLE_FIELDS, scene: SCENE_FIELDS, chapter: CHAPTER_FIELDS },
+                sections: board.sections.map(section => sectionView(section)),
+                chapterMatches,
+                coverage,
+                warnings: coverage.warnings,
                 rhythm: {
                   payoff: rhythm.payoff,
                   withPayoff: rhythm.withPayoff,
@@ -5417,7 +5477,7 @@ export function apply(ctx, config) {
               const eventBoard = await readEvents(rootNow())
               const beatBoard = await readBeats(rootNow(), null)
               const wanted = (url.searchParams.get('chapter') ?? '').trim()
-              const spine = eventTimeline(eventBoard, wanted ? chapters.filter(item => item.id === wanted) : chapters, beatBoard.sections)
+              const spine = eventTimeline(eventBoard, wanted ? chapters.filter(item => item.id === wanted) : chapters, beatBoard.sections, meta.chapters)
               sendJson(res, 200, {
                 present: spine.present,
                 text: eventBoard.text,

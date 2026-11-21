@@ -23,7 +23,7 @@ chapters/0001.md   正文，一章一个文件
 
 | 他说 | 你要做 |
 |---|---|
-| 「拆一下这本书」「这本书帮我拆下书」 | **把它建成一本能接着写的书**：先 `novel_import({ source, dryRun: true })` 看清切出来多少章，再 `novel_import({ source, limit: N, replace: true })` 把原文**搬**进 chapters/（不要自己抄正文）→ 需要摘要时再用 `novel_write` 补 → `novel_card` 主配角 → `novel_setting` 地点/规矩/物品 → `novel_threads` 埋设与回收 → `novel_beats` 每章场景 + `→ 爽点` / `→ 钩子`。**不要交分析报告当成果** |
+| 「拆一下这本书」「这本书帮我拆下书」 | **把它建成一本能接着写的书**：先 `novel_import({ source, dryRun: true })` 看清切出来多少章，再沿用切分参数调用 `novel_import({ source, limit: N, dryRun: false })` 把原文**搬**进 chapters/（不要自己抄正文）→ 需要摘要时再用 `novel_write` 补 → `novel_card` 主配角 → `novel_setting` 地点/规矩/物品 → `novel_threads` 埋设与回收 → `novel_beats` 每章场景 + `→ 爽点` / `→ 钩子`。默认保留并跳过已有章节；只有作者明确要求覆盖时才加 `replace: true`。**不要交分析报告当成果** |
 | 「写第三章」/「接着写」 | `novel_context({ chapter })` 拿装配包 → 按它写 → `novel_write` → `novel_deai_pack` 全文审稿与必要修改 → `novel_deai_review` → `novel_check` |
 | 「这章有问题吧」/「帮我查一下」 | `novel_check({ chapter })`，然后只讲要改的三件事 |
 | 「按 XX 的风格写」 | 有文风卡就 `novel_context` 带上；没有先用 `novel_style({ clone: true, source })` 生成待校准卡 |
@@ -35,7 +35,7 @@ chapters/0001.md   正文，一章一个文件
 | 「大纲看看」/「改大纲」 | `novel_outline` |
 | 「这版不如上一版」/「回到刚才那稿」 | `novel_history` 看时间线 → `novel_restore` |
 | 「这本书现在什么状态」 | `novel_status` |
-| 「导入我写的 txt」 | `novel_import({ source, dryRun: true })` 探测切分 → 确认后 `novel_import({ source })` 原样搬进 chapters/（边界怪就给 `ranges`/`pattern`）→ `novel_status` 核对 |
+| 「导入我写的 txt」 | `novel_import({ source, dryRun: true })` 探测切分 → 确认后沿用切分参数调用 `novel_import({ source, dryRun: false })` 原样搬进 chapters/（边界怪就给 `ranges`/`pattern`）→ `novel_status` 核对。默认保留并跳过已有章节；只有作者明确要求覆盖时才加 `replace: true` |
 
 两条底线：**正文只走 `novel_write`**（用 `write` 直接写 `chapters/` 会没有历史版本）；**"拆书"默认是要建书，不是要报告**。
 

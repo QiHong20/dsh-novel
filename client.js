@@ -2122,7 +2122,10 @@ window.__ModuleLoader__.load({
         record.status === 'candidate' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'confirm') }, '已核对正文，确认') : null,
         record.status !== 'revoked' ? h('button', { className: 'nvl-ask-btn', disabled: busy, onClick: () => review(record, 'revoke') }, '撤销') : null)
       let body
-      if (!data) body = h('p', null, error || '读取中…')
+      if (route.tab === 'raw') body = sectionHash
+        ? h(BeatFieldEditor, { chapter: route.chapter, values: section?.text || '', raw: true, baseHash: sectionHash, onSaved: saved, onClose: onBack })
+        : h('p', null, '章纲尚未加载完成，请返回刷新后再编辑；不会用空内容覆盖已有章纲。')
+      else if (!data) body = h('p', null, error || '读取中…')
       else if (route.tab === 'people') body = people.map(person => h('div', { key: person.id, className: 'nvl-beat-sec' },
         button(`${person.name} · ${person.role || '未设置定位'}`, () => onNavigate({ ...route, tab: 'person', person: person.id })),
         h('p', null, scenes.filter(s => s.cast.includes(person.id)).map(s => s.title).join('、'))))
@@ -2173,7 +2176,6 @@ window.__ModuleLoader__.load({
           ...scene.cast.map(id => button(names[id] || id, () => onNavigate({ ...route, tab: 'person', person: id }))),
           h(BeatFieldEditor, { chapter: route.chapter, scene: scene.id, values: scene.fields, names: fields.scene, baseHash: data.baseHash, onSaved: saved, onClose: onBack })) : h('p', null, '场景已删除，请返回刷新。')
       } else if (route.tab === 'chapter') body = h(BeatFieldEditor, { chapter: route.chapter, values: section?.overview?.fields || {}, names: fields.chapter, baseHash: sectionHash, onSaved: saved, onClose: onBack })
-      else if (route.tab === 'raw') body = h(BeatFieldEditor, { chapter: route.chapter, values: section?.text || '', raw: true, baseHash: sectionHash, onSaved: saved, onClose: onBack })
       return h('div', { className: 'nvl-pane' },
         h('div', { className: 'nvl-head' }, button('← 返回', onBack), h('span', null, `${route.chapter} / ${{ people: '本章人物', person: '人物详情', scene: '场景', events: '本章事件', allEvents: '全书事件线', review: '待核对', chapter: '章节目标', raw: '原始章纲' }[route.tab]}`)),
         h('div', { className: 'nvl-outline' }, body, h('p', { role: 'status' }, notice)))
@@ -2282,25 +2284,35 @@ window.__ModuleLoader__.load({
       const back = () => setStack(current => current.slice(0, -1))
       useBackStep(!!route, back)
       useEffect(() => { if (!route && scroll.current) scroll.current.scrollTop = savedScroll.current }, [route])
-      const sections = Object.fromEntries((board?.sections || []).map(s => [s.id, s]))
+      const matches = Object.fromEntries((board?.chapterMatches || []).map(item => [item.id, item]))
+      const sections = Object.fromEntries((board?.chapterMatches || []).filter(item => item.status === 'matched').map(item => [item.id, item.section]))
       const fields = board?.fields || { role: [], scene: [], chapter: [] }
       const button = (label, next) => h('button', { type: 'button', className: 'nvl-ask-btn', onClick: () => open(next) }, label)
+      const routeMatch = route ? matches[route.chapter] : null
       return h('div', { className: 'nvl-pane' },
         h('div', { className: 'nvl-pane', style: { display: route ? 'none' : 'flex' } },
           h('div', { className: 'nvl-head' }, h('span', { className: 'nvl-title' }, '小说章纲'), h('span', { className: 'nvl-meta' }, `已规划 ${board?.coverage?.covered?.length || 0}/${board?.coverage?.total || 0} 章`)),
           h('div', { className: 'nvl-outline', ref: scroll },
             error ? h('p', null, error) : null,
+            ...(board?.warnings || []).map((text, index) => h('p', { key: `warning-${index}`, role: 'alert', className: 'nvl-err' }, text)),
             !board ? h('p', null, '读取中…') : null,
             ...(novel?.chapters || []).map(chapter => {
+              const match = matches[chapter.id]
+              if (match?.status === 'ambiguous') return h('section', { key: chapter.id, className: 'nvl-beat-sec' },
+                h('h3', null, `${chapter.id} ${chapter.title}`),
+                h('p', { role: 'alert', className: 'nvl-err' }, match.warning),
+                h('p', { className: 'nvl-hint' }, '章纲目标存在歧义，未选择任何小节；请先核对 beats.md 中的章 ID。'))
               const section = sections[chapter.id]
               const overview = section?.overview
+              const needsNormalization = match?.needsNormalization === true
               return h('section', { key: chapter.id, className: 'nvl-beat-sec' },
                 h('h3', null, `${chapter.id} ${chapter.title}`),
+                needsNormalization ? h('p', { role: 'alert', className: 'nvl-err' }, match.warning) : null,
                 overview?.fields?.本章目标 ? h('p', null, `本章目标：${overview.fields.本章目标}`) : null,
                 ...(overview?.scenes || []).map(scene => h('div', { key: scene.id, className: 'nvl-outline-sec' },
                   h('strong', null, scene.title), h(MarkdownView, { text: scene.summary || '尚未填写冲突与结果' }),
-                  button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
-                  ...scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id })))),
+                  needsNormalization ? null : button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
+                  ...(needsNormalization ? [] : scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id }))))),
                 overview?.fields?.收尾 ? h('p', null, `收尾：${overview.fields.收尾}`) : null,
                 !overview?.scenes?.length
                   ? (section?.text && section.text.trim()
@@ -2310,16 +2322,23 @@ window.__ModuleLoader__.load({
                       : h('p', { className: 'nvl-hint' }, '暂无章纲，请用 novel_beats 创建结构化场景。'))
                   : null,
                 h('div', { className: 'nvl-beats-foot' },
-                  button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),
-                  button(`事件线 ${overview?.events?.length || 0}`, { chapter: chapter.id, tab: 'events' }),
-                  button(`表现核对 ${overview?.reviewCount || 0}`, { chapter: chapter.id, tab: 'review' }),
-                  button('章节目标', { chapter: chapter.id, tab: section ? 'chapter' : 'raw' }),
-                  button('原始章纲', { chapter: chapter.id, tab: 'raw' }),
-                  button('AI 装配包', { chapter: chapter.id, tab: 'context' })))
+                  ...(needsNormalization ? [] : [
+                    button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),
+                    button(`事件线 ${overview?.events?.length || 0}`, { chapter: chapter.id, tab: 'events' }),
+                    button(`表现核对 ${overview?.reviewCount || 0}`, { chapter: chapter.id, tab: 'review' }),
+                    button('章节目标', { chapter: chapter.id, tab: section ? 'chapter' : 'raw' }),
+                    button('AI 装配包', { chapter: chapter.id, tab: 'context' }),
+                  ]),
+                  board?.baseHash ? button('原始章纲', { chapter: chapter.id, tab: 'raw' }) : null))
             }))),
-        route?.tab === 'context' ? h(BeatContext, { key: JSON.stringify(route), route, chapter: novel?.chapters?.find(item => item.id === route.chapter), scenes: sections[route.chapter]?.overview?.scenes ?? [], onBack: back })
+        route && (routeMatch?.status === 'ambiguous' || routeMatch?.needsNormalization && route.tab !== 'raw')
+          ? h('div', { className: 'nvl-pane' },
+              h('button', { type: 'button', className: 'nvl-ask-btn', onClick: back }, '← 返回'),
+              h('p', { role: 'alert', className: 'nvl-err' }, routeMatch.warning),
+              routeMatch.needsNormalization ? button('原始章纲', { chapter: route.chapter, tab: 'raw' }) : null)
+          : route?.tab === 'context' ? h(BeatContext, { key: JSON.stringify(route), route, chapter: novel?.chapters?.find(item => item.id === route.chapter), scenes: sections[route.chapter]?.overview?.scenes ?? [], onBack: back })
           : route ? h(BeatDetail, { key: JSON.stringify(route), route, section: sections[route.chapter], sectionHash: board?.baseHash, fields, onNavigate: open, onBack: back, onReload: reload }) : null,
-        !route ? h(AskBar, { head: '章纲讨论', book: novel?.book?.title || '', context: clipText((board?.sections || []).map(s => `${s.heading}\n${(s.overview?.scenes || []).map(scene => scene.summary).join('\n')}`).join('\n\n'), 1400), fallback: '请检查章纲的剧情推进与人物动机，需要时读取人物和事件详情。', placeholder: '想讨论哪一章？', hint: '带上剧情骨架发到主对话' }) : null)
+        !route ? h(AskBar, { head: '章纲讨论', book: novel?.book?.title || '', context: clipText(Object.values(sections).map(s => `${s.heading}\n${(s.overview?.scenes || []).map(scene => scene.summary).join('\n')}`).join('\n\n'), 1400), fallback: '请检查章纲的剧情推进与人物动机，需要时读取人物和事件详情。', placeholder: '想讨论哪一章？', hint: '带上剧情骨架发到主对话' }) : null)
     }
 
 
