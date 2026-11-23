@@ -828,6 +828,8 @@ async function readModelText(llm, options) {
   return output.trim()
 }
 
+const CHAPTER_PREFLIGHT_TIMEOUT_SECONDS = 240
+
 async function reviewChapterPlan(llm, exec, chapter, snapshot, previous, feedback) {
   const selection = exec?.agent?.model?.current?.()
   if (!selection?.provider || !selection.model) throw new Error('请先在当前会话选择模型，再执行章前预检')
@@ -848,12 +850,20 @@ async function reviewChapterPlan(llm, exec, chapter, snapshot, previous, feedbac
     revisions: previous?.status === 'recheck' ? previous.plan?.edits : undefined,
   })
   if (data.length > 160000) throw new Error('章前核对资料过长，模型未收到完整资料；请整理总纲或拆分关联资料后重试')
-  const timeout = AbortSignal.timeout(120000)
+  const timeout = AbortSignal.timeout(CHAPTER_PREFLIGHT_TIMEOUT_SECONDS * 1000)
   const signal = exec.signal ? AbortSignal.any([exec.signal, timeout]) : timeout
-  const output = await readModelText(llm, {
-    ...selection, sessionId: exec.agent.session.id, signal, system, maxTokens: 10000,
-    messages: [{ role: 'user', content: [{ type: 'text', text: data }] }],
-  })
+  let output
+  try {
+    output = await readModelText(llm, {
+      ...selection, sessionId: exec.agent.session.id, signal, system, maxTokens: 10000,
+      messages: [{ role: 'user', content: [{ type: 'text', text: data }] }],
+    })
+  } catch (error) {
+    if (timeout.aborted && signal.reason === timeout.reason) {
+      throw new Error(`章前预检模型调用超过 ${CHAPTER_PREFLIGHT_TIMEOUT_SECONDS} 秒，起稿已暂停`, { cause: error })
+    }
+    throw error
+  }
   const blocks = [...output.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map(match => match[1])
   for (const candidate of [output, ...blocks]) {
     let report
@@ -3392,7 +3402,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_chapter_preflight',
-    description: 'AI 新写、续写指定章前的剧情预检。check 调用会话模型核对剧情资料，引文不合格会在工具内自动纠正一次。如果工具回报纠正后仍不通过，向作者转述条目和原因并暂停，等待资料补充或作者明确重试。ready 后重取 novel_context 并在 novel_write 带 preflightId。blocked 返回一场 novel_grill 及完整问题清单：一次展示独立问题，按依赖处理后续问题；只展示待答问题。作者实际回答后逐题登记 answer 并传最新 baseHash，暂缓的阻塞项停止起稿。改答后复核受影响的决定，再用 summarize 登记。全部明确后用 preview 提交逐字修订及影响范围；apply 由宿主向作者展示完整清单并等待实际确认，然后自动修订、回读复检。结果 write-failed 可用 resume 恢复已确认的清单；recheck 用 check 重试。资料变化时用 check 重检。inspect 查看当前状态。零阻塞直接写作，不启用拷问。',
+    description: 'AI 新写、续写指定章前的剧情预检。check 调用会话模型核对剧情资料，引文不合格会在工具内自动纠正一次。如果工具回报超时或纠正后仍不通过，向作者转述条目和原因并暂停，等待资料补充或作者明确重试。ready 后重取 novel_context 并在 novel_write 带 preflightId。blocked 返回一场 novel_grill 及完整问题清单：一次展示独立问题，按依赖处理后续问题；只展示待答问题。作者实际回答后逐题登记 answer 并传最新 baseHash，暂缓的阻塞项停止起稿。改答后复核受影响的决定，再用 summarize 登记。全部明确后用 preview 提交逐字修订及影响范围；apply 由宿主向作者展示完整清单并等待实际确认，然后自动修订、回读复检。结果 write-failed 可用 resume 恢复已确认的清单；recheck 用 check 重试。资料变化时用 check 重检。inspect 查看当前状态。零阻塞直接写作，不启用拷问。',
     parameters: CHAPTER_PREFLIGHT_PARAMETERS,
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
     execute: async (args, exec) => {
