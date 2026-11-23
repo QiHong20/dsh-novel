@@ -1601,6 +1601,10 @@ function contextRequestArgs(params) {
     if (!raw.trim() || !Number.isSafeInteger(number) || number < minimum) throw new Error(`${key} 须为不小于 ${minimum} 的整数`)
     args[key] = number
   }
+  if (['1', 'true'].includes(String(params.get('full') ?? '').toLowerCase())) {
+    args.full = true
+    if (args.budget === undefined) args.budget = 200000
+  }
   return args
 }
 
@@ -3481,6 +3485,7 @@ export function apply(ctx, config) {
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
         title: { type: 'string', description: '尚未登记的下一章标题，与章前预检一致' },
         budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 60000、改写 80000，最多 200000；不限制正文字数' },
+        full: { type: 'boolean', description: '完整模式：不裁剪相关伏笔/设定/台账（默认只带最相关的少量），预算默认提到 200000。给作者看「完整装配包」用，正文写作时不要用。' },
         rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
         rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
@@ -3677,7 +3682,7 @@ export function apply(ctx, config) {
       const currentId = String(current.id)
       const threadRows = threads.rows
         .filter(item => item.open && (item.payoff === '' || item.payoff >= currentId))
-        .slice(0, 10)
+        .slice(0, args.full === true ? 500 : 10)
         .map(item => ({ thread: item.thread, planted: item.planted, payoff: item.payoff }))
 
       // 相关设定：只在被正文/章纲/大纲点名时才带，避免把整本世界观灌进上下文。
@@ -3688,7 +3693,7 @@ export function apply(ctx, config) {
       }
       const settings = []
       const voided = []
-      for (const item of settingHits.slice(0, 4)) {
+      for (const item of settingHits.slice(0, args.full === true ? 500 : 4)) {
         const content = await readSetting(rootNow(), item.name)
         if (content !== null && SETTING_VOID_RE.test(content)) {
           voided.push(item.name)

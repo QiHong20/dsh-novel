@@ -407,6 +407,7 @@ window.__ModuleLoader__.load({
 .nvl-beats-mode .nvl-ask-btn:disabled { opacity: 0.4; }
 .nvl-beats-pick { max-width: 46%; min-width: 0; font-size: 12px; }
 .nvl-beats-pick option { color: #333; background: #fff; }
+.nvl-ghost[data-on="true"] { border-color: var(--dsw-alias-brand-primary, #4d6bfe); color: var(--dsw-alias-brand-primary, #4d6bfe); }
 .nvl-beat-sec:last-child { border-bottom: 0; }
 .nvl-beat-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
 .nvl-beat-title { font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary, inherit); }
@@ -2195,6 +2196,7 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = useState('continue')
       const [scene, setScene] = useState(route.scene ?? '')
       const [budget, setBudget] = useState(0)
+      const [full, setFull] = useState(false)
       const [session, setSession] = useState(currentSessionId)
       const [refresh, setRefresh] = useState(0)
       const [state, setState] = useState(null)
@@ -2202,6 +2204,7 @@ window.__ModuleLoader__.load({
       const params = new URLSearchParams({ chapter: route.chapter, mode })
       if (mode === 'continue' && scene) params.set('scene', scene)
       if (budget) params.set('budget', budget)
+      if (full) { params.set('full', '1'); if (!budget) params.set('budget', '200000') }
       const url = `${API}/context?${params}`
       const key = JSON.stringify([session, url, refresh])
       useEffect(() => {
@@ -2263,6 +2266,7 @@ window.__ModuleLoader__.load({
               scene && !scenes.some(item => item.id === scene) ? h('option', { value: scene, disabled: true }, '所选场景已变化') : null,
               ...scenes.map(item => h('option', { key: item.id, value: item.id }, item.title)),
             ) : null,
+            h('button', { type: 'button', className: 'nvl-ghost', 'data-on': full, onClick: () => { setBudget(0); setFull(valueOn => !valueOn) } }, full ? '完整：开' : '完整：关'),
             h('button', { type: 'button', className: 'nvl-ghost', disabled: !current, onClick: () => setRefresh(count => count + 1) }, '重新装配'),
           ),
           !current ? h('p', { role: 'status' }, '正在装配…') : null,
