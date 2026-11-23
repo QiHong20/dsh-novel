@@ -1639,7 +1639,7 @@ function applyChapterEdit(previous, args) {
 }
 
 function isChapterRevision(previous, body, args, mode) {
-  if (!hasDraftProse(previous) || (mode !== 'patch' && !(args.mode === 'replace' && args.baseHash))) return false
+  if (!hasDraftProse(previous) || mode === 'append' || !args.baseHash) return false
 
   const paragraphs = text => text.split('\n').map(line => line.replace(/[\s\p{P}]/gu, '')).filter(Boolean)
   const expands = (before, after) => {
@@ -1664,7 +1664,24 @@ function isChapterRevision(previous, body, args, mode) {
 
   const original = Array.from(previous)
   const patches = args.patches ?? [{ start: args.start, end: args.end, content: args.content }]
-  return !patches.some(patch => expands(original.slice(patch.start, patch.end).join(''), patch.content))
+  const adjacent = []
+  for (const patch of [...patches].sort((first, second) => first.start - second.start)) {
+    const group = adjacent.at(-1)
+    const gap = group ? original.slice(group.end, patch.start).join('') : ''
+    if (group && !gap.trim()) {
+      group.end = patch.end
+      group.content += gap + patch.content
+      group.patches.push(patch)
+    } else {
+      adjacent.push({ ...patch, patches: [patch] })
+    }
+  }
+  const raw = patch => original.slice(patch.start, patch.end).join('')
+  return !adjacent.some(group => {
+    // 文字只在相邻段落之间移动时，局部字数增加不等于增写。
+    if (paragraphs(raw(group)).join('') === paragraphs(group.content).join('')) return false
+    return expands(raw(group), group.content) || group.patches.some(patch => expands(raw(patch), patch.content))
+  })
 }
 
 /** 禁忌分为字面禁止、少用提醒与待语义复核；不猜测语义规则是否违反。 */
@@ -2862,7 +2879,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_write',
     description:
-      'AI 新写和续写需提交当前版本的 preflightId；下一章可继承预检标题。改写已有正文须使用带 baseHash 的 patch 或显式 replace；新增段落或明显扩写时也需预检；导入作者提供的旧稿走 novel_import。写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。目标字数只作参考，允许超出，不要求缩写或提前收尾。按情节自然节点决定分章；确需顺延后续场景时可传 carryOver: true。' +
+      'AI 新写和续写需提交当前版本的 preflightId；下一章可继承预检标题。审稿返修用当前正文的 baseHash 和 patch 或 replace；默认也是 replace。返修无需重跑章前预检，新增剧情或明显扩写仍需预检；导入作者提供的旧稿走 novel_import。写一章正文。不给 chapter 就自动新建下一章；mode=replace 覆盖整章（默认，覆盖前会把旧稿备份到 chapters/.history/），mode=append 追加到章末。写完会同步 book.json，字数随之更新。目标字数只作参考，允许超出，不要求缩写或提前收尾。按情节自然节点决定分章；确需顺延后续场景时可传 carryOver: true。' +
       '\n改写先用 novel_deai_pack 阅读全文与声口；多个修改用 mode:"patch", baseHash, patches:[{start,end,content}] 一次提交，所有坐标均以同一版原文为准。单片段 start/end/content 仍可用。修改后重新取包并提交 novel_deai_review，再 novel_check；未完成当前版本复核不可标记 final。',
     parameters: {
       type: 'object',
@@ -2972,7 +2989,13 @@ export function apply(ctx, config) {
       if (exec?.agent && body !== previous && hasDraftProse(body) && !isChapterRevision(previous, body, args, mode)) {
         const gate = await chapterPreflightStatus(rootNow(), meta, existing ?? chapter, false)
         if (gate.status !== 'ready' || !args.preflightId || args.preflightId !== gate.preflightId) {
-          throw new Error(`章前剧情预检为 ${gate.status} 或编号失效；请先完成本章预检，再重新取写作上下文。正文未写入。`)
+          const existingDraft = hasDraftProse(previous)
+          const hint = existingDraft && mode === 'replace' && !args.baseHash
+            ? '已有正文且缺少 baseHash。审稿返修请用 novel_deai_pack 返回的 baseHash，按 mode:patch 保存必要的修改；如是续写或扩写，再重跑章前预检。'
+            : existingDraft && mode !== 'append'
+              ? '本次改动触发了新增段落或扩写检查。审稿返修请缩小补丁范围并保留剧情；如确需增写，再重跑章前预检。'
+              : '请先完成本章预检，再重新取写作上下文。'
+          throw new Error(`章前剧情预检为 ${gate.status} 或编号失效。${hint}正文未写入。`)
         }
       }
       let reviewed = review.status === 'recorded'
@@ -4437,7 +4460,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_deai_pack',
     description:
-      '交付前阅读全文审稿：返回全部非空段落、章纲、设定索引、人物卡和文风卡。先按场景追踪人物位置、工具来源、动作前提、耗时与救险因果，再审对白、设定讲解和朗诵腔。多个修改用同一 baseHash 和 patches 一次回写，修改后重新取包并调用 novel_deai_review 登记最终版本复核。',
+      '交付前阅读全文审稿：返回全部非空段落、章纲、设定索引、人物卡和文风卡。先按场景追踪人物位置、工具来源、动作前提、耗时与救险因果，再审对白、设定讲解和朗诵腔。审稿返修用本包的 baseHash 和 patches 一次回写，无须重跑章前预检；续写或新增剧情另走章前预检。返修后重新取包并调用 novel_deai_review 登记最终版本复核。',
     parameters: {
       type: 'object',
       properties: {
@@ -4490,7 +4513,7 @@ export function apply(ctx, config) {
         } else if (value.style.name) {
           lines.push('', `## 启用文风「${value.style.name}」缺失或为空（styleHash: ${value.style.hash}）`, '这是资料不足，不能当作没有文风约束；登记后会阻塞定稿，请先补齐或取消启用。')
         }
-        lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review；启用文风时一并提交上面显示的 styleHash。')
+        lines.push('', '## 全部正文（没有机械命中也必须阅读；有问题才修改）', '批量回写：novel_write({chapter,mode:"patch",baseHash,patches:[{start,end,content}]}）。沿用本包的 baseHash 修正已有正文，无须重跑章前预检；新增剧情另行预检。修改后本包失效，重新取包审稿；无须修改也要提交 novel_deai_review；启用文风时一并提交上面显示的 styleHash。')
         for (const item of value.items) {
           lines.push('')
           lines.push(`### #${item.index} [${item.tags.join(' / ')}] (start=${item.start}, end=${item.end})`)

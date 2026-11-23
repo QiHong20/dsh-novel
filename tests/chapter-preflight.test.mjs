@@ -672,3 +672,40 @@ test('结构修复无法确认时序时自动追加拷问并且保持资料原�
   await assert.rejects(preflight('preview', params), /仍有待处理的拷问/u)
   assert.equal(await fs.readFile(beats, 'utf8'), original)
 })
+
+test('首稿保存后按审稿包返修不需要重跑章前预检，实际续写仍受门禁', async t => {
+  const root = await createBook(t)
+  const chapter = '0001'
+  const line = '陆昭进城找活。'
+  await fs.writeFile(path.join(root, 'outline.md'), line + '\n')
+  let reviews = 0
+  const call = registerTools(root, {
+    review() {
+      reviews += 1
+      return { facts: [{ text: line, evidence: [{ file: 'outline.md', quote: line }] }], issues: [] }
+    },
+  })
+  const preflight = (action, args = {}) => call('novel_chapter_preflight', { chapter, action, ...args })
+  const write = args => call('novel_write', { chapter, ...args })
+  const pack = () => call('novel_deai_pack', { chapter })
+  const ready = await preflight('check')
+  const first = '他掂了掂钱袋。'
+  const second = '袋口磨得发白，几个铜钱压在掌心，藏在衣袖里，连走过两条长街都没听见碰响。'
+  const third = '他还欠九十文。'
+  const original = [first, second, third].join('\n\n')
+  await write({ content: original, preflightId: ready.preflightId })
+  assert.equal((await preflight('inspect')).status, 'stale')
+  await assert.rejects(write({ content: original.replace('九十', '三十'), preflightId: ready.preflightId }), /已有正文且缺少 baseHash.*审稿返修/u)
+
+  const audit = await pack()
+  await write({ mode: 'patch', baseHash: audit.baseHash, patches: [
+    { start: 0, end: first.length, content: first + second },
+    { start: first.length + 2, end: first.length + 2 + second.length, content: '' },
+  ] })
+  const revised = await pack()
+  const prose = (await fs.readFile(path.join(root, 'chapters', chapter + '.md'), 'utf8')).replace('九十', '三十')
+  await write({ baseHash: revised.baseHash, content: prose })
+  await assert.rejects(write({ mode: 'append', content: '此时有人来敲门。' }), /章前剧情预检/u)
+  assert.equal(reviews, 1)
+  assert.equal(await fs.readFile(path.join(root, 'chapters', chapter + '.md'), 'utf8'), prose)
+})
