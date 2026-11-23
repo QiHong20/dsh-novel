@@ -83,7 +83,7 @@ ovel_check 命中后会提示「照着这套句子写」，不是靠形容词叮
 十二个写接口（都要求头 `x-novel-action: 1`，其余方法一律 405）：
 `POST /novel-api/start-chapter`（`{ id }`，右栏点 `planned` 章节时建章）、`POST /novel-api/outline`（`{ content }`，大纲页保存）、`POST /novel-api/beats`（`{ chapter, content }`，章纲页保存）、`POST /novel-api/setting`（`{ name, content }`，设定页保存）、`POST /novel-api/thread`（`{ thread, planted?, payoff?, status? }`，伏笔页「收回 / 重开」与登记）、`POST /novel-api/style`（`{ name, content }`，文风页保存）、`POST /novel-api/style-active`（`{ name }`，切换在用文风，空名字＝取消）、`POST /novel-api/style-clone`（文风页选择 TXT 或 Markdown 文件，最多 32 MB。桌面端优先通过 `{ source, name? }` 交由宿主读取；网页端通过 `{ file: { name, data }, name? }` 上传，`data` 为原文字节的 Base64）、`POST /novel-api/style-delete`（`{ name }`，删一张文风卡：卡和参考原文一起挪进 `styles/.trash/`，删的正好是在用的那套就顺手取消启用）、`POST /novel-api/event`（`{ line, content }`，整段替换一条事件线）、`POST /novel-api/export`（`{ from?, to?, format?, mode? }`，把全书或区间导出到 `export/`）、`POST /novel-api/restore`（`{ chapter, version }`，恢复到某一版，先给当前内容留一版）。
 
-**写入时会做格式校验**：章纲的全部写入入口共用严格结构校验；无结构化场景、缺失或非法时序、缺出场、缺人物块时会拒绝整次写入，文件保持不变。超过 8 场及语义核对线索仍只返回 `warnings`。`novel_card` / `novel_setting` / `novel_write` / `novel_threads` 继续按各自规则返回格式提醒。
+**写入时会做格式校验**：章纲写入严格校验修改涉及的章节，并拦截新引入的跨章问题，例如重复场景 ID。其他未改章节已有的结构错误只返回历史警告。修改范围内的无场景、非法时序、缺出场或缺人物块仍会阻塞保存。`novel_card` / `novel_setting` / `novel_write` / `novel_threads` 继续按各自规则返回格式提醒。
 
 书库根目录解析顺序：`config.root`（钉死）→ **会话自己的工作目录** → 环境变量 `DSH_NOVEL_ROOT` → 进程 `cwd`（兜底）。
 
@@ -180,7 +180,7 @@ AI 新写或续写前调用 `novel_chapter_preflight({ action: "check", chapter 
 
 章前预检每次模型调用最多等待 240 秒。首次返回的核对问题格式或引文未通过校验时，工具会自动纠正一次，纠正调用使用同样的时限。
 
-存在阻塞时，本章生成一次 `novel_grill`，汇总有依据的问题、推荐方案和影响范围。作者可以批量回答独立问题，或暂缓。AI 用预检工具的 `answer` 按章节和问题 ID 登记原话，工具自动定位当前拷问会话。全部阻塞问题得到明确答复后，AI 用 `preview` 生成逐段修订清单，`apply` 通过宿主原生提问展示清单并等待作者确认。确认后工具按版本应用修订，回读复检。预检资料版本变化时旧结果失效；写入中途失败时用 `resume` 恢复已确认的清单，复检失败可用 `check` 重试。状态保存在书稿的 `.novel/chapter-preflight/`。
+存在阻塞时，本章生成一次 `novel_grill`，汇总有依据的问题、推荐方案和影响范围。作者可以批量回答独立问题，或暂缓。AI 用预检工具的 `answer` 按章节和问题 ID 登记原话，工具自动定位当前拷问会话。全部阻塞问题得到明确答复后，AI 用 `preview` 生成逐段修订清单。候选章纲结构校验失败时，`preview` 调用当前模型尝试修复一次，再复验。修复受限于作者已经提供的内容，缺少时序或出场依据则在同一拷问中继续询问。最终清单会列出结构修复和历史警告，`apply` 通过宿主原生提问展示清单并等待作者确认。确认后工具按版本应用修订，回读复检。预检资料版本变化时旧结果失效；写入中途失败时用 `resume` 恢复已确认的清单，复检失败可用 `check` 重试。状态保存在书稿的 `.novel/chapter-preflight/`。
 
 未登记的下一章会沿用预检时指定的标题。已有正文的拆段和小幅润色可按原稿版本保存。AI 增写段落或明显扩写时，保存需要当前版本的 `preflightId`。重检替换旧结果后，旧拷问会归档并保留回答。直接保存作者正文、`novel_import` 导入和历史恢复照常使用。章后的正文审稿流程继续适用。
 

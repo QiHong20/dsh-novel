@@ -242,12 +242,23 @@ test('低层批量保存校验完整候选，两端任一非法都不部分写�
   assert.equal(await read(), before)
 })
 
-test('局部编辑不会因只修改目标章而漏掉其他章的非法结构', async t => {
-  const { root, read } = await fixture(t)
-  const before = `${FULL}\n## 0003 空章\n`
+test('未修改章节的旧结构只作警告，新引入的跨章重复场景仍拒绝保存', async t => {
+  const { root, read, call } = await fixture(t)
+  const legacy = '## 0003 旧章\r\n旧式逐行章纲。\r\n\r\n\r\n'
+  const before = `${FULL.replaceAll('\n', '\r\n')}\r\n${legacy}`
   await fs.writeFile(path.join(root, 'beats.md'), before)
-  await assert.rejects(editStageFields(root, { chapter: '0001', scene: 'arrival', fields: { 地点: '门口' }, baseHash: digest(before) }), error => error.code === BEAT_STRUCTURE_INVALID)
-  assert.equal(await read(), before)
+  const result = await editStageFields(root, { chapter: '0001', scene: 'arrival', fields: { 地点: '门口' }, baseHash: digest(before) })
+  assert.ok(result.issues.some(issue => issue.chapter === '0003' && issue.historical && issue.severity === 'warning'))
+  assert.ok((await read()).endsWith(legacy))
+
+  const saved = await call('novel_beats', { chapter: '0001', content: CHAPTER_BODY })
+  assert.equal(saved.written, true)
+  const current = await read()
+  assert.ok(current.endsWith(legacy))
+  const duplicate = await call('novel_beats', { chapter: '0001', content: scene('later') })
+  assert.equal(duplicate.written, false)
+  assert.ok(duplicate.issues.some(issue => issue.code === 'scene-id-duplicate' && issue.relatedChapter === '0001'))
+  assert.equal(await read(), current)
 })
 
 test('整场移动校验最终全文，保留源章剩余场景与人物块', async t => {

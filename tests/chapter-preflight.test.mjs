@@ -597,3 +597,78 @@ test('章前问题的引文无效时自动纠正，确认冲突仍进入拷问',
   assert.equal(result.questions.length, 1)
   assert.equal(await fs.readFile(outline, 'utf8'), originalOutline)
 })
+
+test('章前预览自动修复本章结构，保留旧章并等作者确认后写入', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  const beats = path.join(root, 'beats.md')
+  const legacy = '## 0033 旧章\r\n- 场景：旧写法\r\n\r\n## 0102 另一旧章\r\n旧格式。\r\n'
+  await fs.appendFile(beats, '\n' + legacy)
+  const originalBeats = await fs.readFile(beats, 'utf8')
+  const originalOutline = await fs.readFile(outline, 'utf8')
+  let repairs = 0
+  const call = registerTools(root, {
+    review(request) {
+      if (!request.sections) return compensationReport(request.sources)
+      repairs += 1
+      assert.deepEqual(request.sections.map(section => section.chapter), [chapter])
+      assert.deepEqual(request.issues.map(issue => issue.code), ['scene-time-required'])
+      const [section] = request.sections
+      return { sections: [{ chapter, body: section.body.replace('- 时序:10', '- 时序：10') }] }
+    },
+    userQuestions: { async ask({ questions }) {
+      assert.match(questions[0].question, /自动结构修复/u)
+      assert.match(questions[0].question, /时序：10/u)
+      return { answers: [{ id: questions[0].id, selected: ['确认应用'] }] }
+    } },
+  })
+  const preflight = (action, args = {}) => call('novel_chapter_preflight', { action, chapter, ...args })
+  const blocked = await preflight('check')
+  await preflight('answer', {
+    questionId: blocked.questions[0].id, disposition: 'decided', answer: '按索赔写，修订总纲。',
+  })
+  const preview = await preflight('preview', { preflightId: blocked.preflightId, edits: [
+    { file: 'outline.md', before: wrongPrice, after: correctedLine, reason: '更正范本', issueIds: ['1'] },
+    { file: 'beats.md', before: '- 时序：10', after: '- 时序:10\n- 地点：坊口', reason: '补充场景地点', issueIds: ['1'] },
+  ] })
+  assert.equal(repairs, 1)
+  assert.equal(preview.structureRepairs.length, 1)
+  assert.deepEqual(preview.structureWarnings.map(issue => issue.chapter), ['0033', '0102'])
+  assert.equal(await fs.readFile(beats, 'utf8'), originalBeats)
+  assert.equal(await fs.readFile(outline, 'utf8'), originalOutline)
+
+  const applied = await preflight('apply', { planId: preview.planId })
+  assert.equal(applied.status, 'ready')
+  assert.equal(repairs, 1)
+  const written = await fs.readFile(beats, 'utf8')
+  assert.match(written, /时序：10\n- 地点：坊口/u)
+  assert.ok(written.endsWith(legacy))
+})
+
+test('结构修复无法确认时序时自动追加拷问并且保持资料原样', async t => {
+  const { root, chapter } = await createConflict(t)
+  const beats = path.join(root, 'beats.md')
+  const original = (await fs.readFile(beats, 'utf8')).replace('- 时序：10\n', '')
+  await fs.writeFile(beats, original)
+  const call = registerTools(root, {
+    review(request) {
+      if (!request.sections) return compensationReport(request.sources)
+      const [section] = request.sections
+      return { sections: [{ chapter, body: section.body.replace('- 出场：chen', '- 时序：20\n- 出场：chen') }] }
+    },
+  })
+  const preflight = (action, args = {}) => call('novel_chapter_preflight', { action, chapter, ...args })
+  const blocked = await preflight('check')
+  await preflight('answer', {
+    questionId: blocked.questions[0].id, disposition: 'decided', answer: '按索赔写。',
+  })
+  const params = { preflightId: blocked.preflightId, edits: [
+    { file: 'beats.md', before: '- 目标：索赔', after: '- 目标：索赔并列明费用', reason: '明确费用', issueIds: ['1'] },
+  ] }
+  const result = await preflight('preview', params)
+  assert.equal(result.status, 'blocked')
+  assert.equal(result.grillId, blocked.grillId)
+  assert.equal(result.planId, undefined)
+  assert.match(result.questions[1].text, /时序/u)
+  await assert.rejects(preflight('preview', params), /仍有待处理的拷问/u)
+  assert.equal(await fs.readFile(beats, 'utf8'), original)
+})

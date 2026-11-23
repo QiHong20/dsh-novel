@@ -420,7 +420,8 @@ export const historyParameters = {
 
 export async function moveScene(root, chapters, sceneId, targetChapter) {
   const saved = await mutateBeatsFile(root, original => {
-    let text = (original ?? '').replace(/\r\n/g, '\n')
+    let text = original ?? ''
+    const newline = text.includes('\r\n') ? '\r\n' : '\n'
     const target = chapters.find(c => c.id === targetChapter)
     if (!target) throw new Error('需要唯一场景和不同的有效目标章节')
     // 目标章节沿用整章保存的匹配规则：ID 唯一优先，无 ID 旧条目只在唯一认领时回退。
@@ -446,7 +447,7 @@ export async function moveScene(root, chapters, sceneId, targetChapter) {
     const end = Math.min(sceneEnd, headings[ownerIndex + 1]?.index ?? text.length)
     const block = text.slice(start, end).trim()
     text = text.slice(0, start) + text.slice(end)
-    if (targetIndex < 0) text += `\n\n## ${beatHeading(target)}\n\n${block}\n`
+    if (targetIndex < 0) text += `${newline}${newline}## ${beatHeading(target)}${newline}${newline}${block}${newline}`
     else {
       // 命中旧标题时同一次保存内规范化，否则 stageBook 仍按数字标题读不到这一章。
       const targetHit = scanBeatHeadings(text)[targetIndex]
@@ -454,12 +455,12 @@ export async function moveScene(root, chapters, sceneId, targetChapter) {
       // 比较原始标题行：`##\t0002 目标章` 去掉标记后与规范文本相同，但 stageBook 仍读不到。
       const normalized = `## ${beatHeading(target)}`
       if (targetHit.line !== normalized) {
-        text = text.slice(0, targetHit.index) + `${normalized}\n` + text.slice(targetHit.end)
+        text = text.slice(0, targetHit.index) + `${normalized}${newline}` + text.slice(targetHit.end)
       }
       // 插入边界取紧邻的下一个任意二级标题；无 ID 的旧小节也占据自己的标题行。
       const nextHeadings = scanBeatHeadings(text)
       const at = nextHeadings[targetIndex + 1]?.index ?? text.length
-      text = text.slice(0, at).trimEnd() + `\n\n${block}\n\n` + text.slice(at)
+      text = text.slice(0, at).trimEnd() + `${newline}${newline}${block}${newline}${newline}` + text.slice(at)
     }
     return { text, moved: sceneId, chapter: targetChapter }
   })
