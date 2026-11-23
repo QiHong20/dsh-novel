@@ -2230,7 +2230,7 @@ window.__ModuleLoader__.load({
         if (!ready || session !== currentSessionId) return
         try {
           await navigator.clipboard.writeText(value.text)
-          report('已复制完整装配包')
+          report('已复制装配包，请核对资料覆盖边界')
         } catch {
           report('复制失败，可在预览中手动选中文字', false)
         }
@@ -2240,7 +2240,7 @@ window.__ModuleLoader__.load({
         const task = mode === 'rewrite' ? '请按上面的装配包改写本章，先在对话中展示改写稿。'
           : value.scene ? '请按上面的装配包只写选定场景，先在对话中展示正文。'
             : '请按上面的装配包写本章正文，先在对话中展示。'
-        const how = await sendToComposer(`${value.text}\n\n${task}`)
+        const how = await sendToComposer(`${value.text}\n\n请先完成章前预检，再新建写作子代理，原样传递此装配包。子代理只返回正文和缺失依据，不写文件；你负责审核并展示。若宿主不支持子代理，请明确报告，不要声称已委派。\n${task}`)
         if (how === 'composer') report('已放入主对话输入框，按回车发送')
         else if (how === 'copied') report('装配包和写作任务已复制，可粘贴到主对话')
         else report('无法写入输入框或复制，可在预览中手动选中文字', false)

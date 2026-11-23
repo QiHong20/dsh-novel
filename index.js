@@ -1435,6 +1435,25 @@ function renderMaterialPreflight(value, compact = false) {
 }
 
 /** 按最终提示文本计预算；Unicode 字符含空白，不等同于 token。 */
+function contextThreads(rows, chapters, chapter) {
+  const order = chapters.map(item => String(item.id))
+  const target = order.indexOf(String(chapter))
+  const selected = [], missing = []
+  for (const row of rows) {
+    const planted = order.indexOf(row.planted)
+    if (planted < 0) { missing.push(`伏笔埋设位置未知：${row.thread}`); continue }
+    if (planted > target) continue
+    const recovered = order.indexOf(row.status)
+    const closed = !row.open || recovered >= 0
+    if (closed && recovered < 0) { missing.push(`伏笔实际回收位置未知：${row.thread}`); continue }
+    if (recovered >= 0 && recovered < target) continue
+    const payoff = order.indexOf(row.payoff)
+    selected.push({ ...row, scope: planted === target ? '本章埋设计划，非既成事实' : recovered === target ? '本章回收记录，须核对触发位置' : payoff >= 0 && payoff < target ? '逾期未收，待处理' : payoff === target ? '本章计划回收' : '此前已埋，回收计划不等于已回收' })
+  }
+  selected.sort((a, b) => Number(b.scope.includes('逾期') || b.scope.includes('本章')) - Number(a.scope.includes('逾期') || a.scope.includes('本章')))
+  return { rows: selected, missing }
+}
+
 function assembleNovelContext(value, budget) {
   const size = text => Array.from(text).length
   const rewrite = value.mode === 'rewrite'
@@ -1452,6 +1471,7 @@ function assembleNovelContext(value, budget) {
   const add = (id, label, body, required = false) => {
     if (body) blocks.push({ id, label, text: `## ${label}\n${body}`, required })
   }
+  if (value.full) add('coverage', '资料覆盖边界', '已选材料全部装配不代表全书依赖已核实；人物卡、设定及备忘可能包含作者计划，不得当作人物已知。关键依据不足须报告，不能补造。' + (value.missingMaterials?.length ? '\n缺项：\n' + value.missingMaterials.join('\n') : ''), true)
   if (value.chapterPreflight) {
     const result = value.chapterPreflight
     const facts = (result.facts ?? []).map(item => {
@@ -1522,17 +1542,18 @@ function assembleNovelContext(value, budget) {
       : '动态状态台账（人工维护的当前快照，仅适用于从当前进度向后续写）'
     add('ledger', label, value.ledger.map(item => `- [${item.category}] ${item.item}：${item.state}${item.chapter ? `（@${item.chapter}${item.note ? `｜${item.note}` : ''}）` : item.note ? `（${item.note}）` : ''}`).join('\n'), true)
   }
-  value.threads.forEach((item, i) => add(`thread-${i}`, '伏笔', `${item.thread}（埋于 ${item.planted}，回收 ${item.payoff}）`))
+  value.threads.forEach((item, i) => add(`thread-${i}`, '伏笔', `${item.thread}（埋于 ${item.planted}，计划回收 ${item.payoff || '未定'}；${item.scope || '待核对'}）`))
   value.aiTone.forEach((item, i) => add(`tone-${i}`, `AI 腔线索：${item.label}`, (item.samples || []).join('\n')))
   value.warnings.forEach((item, i) => add(`warning-${i}`, '写作提醒', item))
   const included = []
   const omitted = []
   const parts = [head]
   // 最低预算计算必要内容与有界装配标签；可选正文和锚点内容不抬高硬门槛。
+  if (value.full) for (const block of blocks) block.required = true
   const required = blocks.filter(item => item.required)
   const optional = blocks.filter(item => !item.required)
   const optionalLabels = optional.slice(0, 20).map(item => item.id + '=' + item.label)
-  const footer = '\n\n必要装配清单：' + required.map(item => item.id + '=' + item.label).join('；') + '\n可选条目可能因总预算不足而省略；用 novel_read、novel_style、novel_card、novel_setting 等补读。' + (value.style.requiredText !== undefined ? '\n文风可选规则与锚点按完整条目取舍；未装配明细见 style.omitted，完整卡用 novel_style 读取。' : '') + (optionalLabels.length ? '\n可选装配项：' + optionalLabels.join('；') + (optional.length > optionalLabels.length ? `；另有 ${optional.length - optionalLabels.length} 项见元数据` : '') : '')
+  const footer = (value.full ? '\n\n完整模式：所有已选材料均为必要块；预算不足将拒绝提供写作包。资料充分性仍须核对。' : '') + '\n\n必要装配清单：' + required.map(item => item.id + '=' + item.label).join('；') + '\n可选条目可能因总预算不足而省略；用 novel_read、novel_style、novel_card、novel_setting 等补读。' + (value.style.requiredText !== undefined ? '\n文风可选规则与锚点按完整条目取舍；未装配明细见 style.omitted，完整卡用 novel_style 读取。' : '') + (optionalLabels.length ? '\n可选装配项：' + optionalLabels.join('；') + (optional.length > optionalLabels.length ? `；另有 ${optional.length - optionalLabels.length} 项见元数据` : '') : '')
   // 预算数字本身也在提示中；求固定点，保证返回的 minimumBudget 可直接重试。
   let minimum = size([head, ...required.map(item => item.text)].join('\n\n') + footer)
   for (let index = 0; index < 8; index += 1) {
@@ -1560,7 +1581,7 @@ function assembleNovelContext(value, budget) {
       : compact
     const prompt = size(compact) <= budget ? compact : `上下文预算不足：需 ${minimum} 字符，当前 ${budget}；完整缺项见 missingRequired，未提供残缺正文。`
     const guidance = size(scoped) <= budget ? scoped : prompt
-    return { ...value, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), budgetUnit: 'unicode-code-points', ready: false, minimumBudget: minimum, requiredItems, missingRequired, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
+    return { ...value, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), budgetUnit: 'unicode-code-points', ready: false, selfContained: false, minimumBudget: minimum, requiredItems, missingRequired, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
   }
   for (const block of required) {
     parts.push(block.text)
@@ -1573,7 +1594,7 @@ function assembleNovelContext(value, budget) {
     } else omitted.push({ id: block.id, label: block.label, reason: '总预算不足，完整条目省略' })
   }
   const prompt = parts.join('\n\n') + footer
-  return { ...value, prompt, budget, budgetUsed: size(prompt), budgetUnit: 'unicode-code-points', minimumBudget: minimum, ready: true, requiredItems: (value.style.requiredItems ?? []).map(item => ({ ...item })), missingRequired: [], included, omitted }
+  return { ...value, prompt, budget, budgetUsed: size(prompt), budgetUnit: 'unicode-code-points', minimumBudget: minimum, ready: true, selfContained: false, packHash: createHash('sha256').update(prompt).digest('hex'), completeness: value.full ? 'selected-materials-complete' : 'tool-assisted', requiredItems: (value.style.requiredItems ?? []).map(item => ({ ...item })), missingRequired: [], included, omitted }
 }
 
 function rewriteSelection(text, start, limit) {
@@ -3485,7 +3506,7 @@ export function apply(ctx, config) {
         chapter: { type: 'string', description: '要写的章 id 或标题；省略则取第一个未写的章（没有就取下一章）' },
         title: { type: 'string', description: '尚未登记的下一章标题，与章前预检一致' },
         budget: { type: 'integer', description: '本次上下文提示的 Unicode 字符上限（含空白、标题、指令，非 token），续写默认 60000、改写 80000，最多 200000；不限制正文字数' },
-        full: { type: 'boolean', description: '完整模式：不裁剪相关伏笔/设定/台账（默认只带最相关的少量），预算默认提到 200000。给作者看「完整装配包」用，正文写作时不要用。' },
+        full: { type: 'boolean', description: '完整模式：默认预算 200000，已选相关资料全部作为必要块；检查 missingMaterials，不能将预算通过等同于资料完整。可用于复制到网页生成正文。' },
         rewriteStart: { type: 'integer', minimum: 0, description: '局部改写起点，Unicode 字符索引；提供后只装配该片段，保存必须 mode:patch' },
         rewriteLimit: { type: 'integer', minimum: 1, description: '局部改写字符数，默认 1000；下一段须重新获取上下文' },
         mode: {
@@ -3570,7 +3591,7 @@ export function apply(ctx, config) {
       let chapterPreflight = preflightTarget ? await chapterPreflightStatus(rootNow(), meta, preflightTarget) : null
 
       // 同步放宽总预算和材料内部额度；单位是 Unicode 字符，不是字节或 token。
-      const budget = clampInt(args.budget, args.mode === 'rewrite' ? 80000 : 60000, 300, 200000)
+      const budget = clampInt(args.budget, args.full === true ? 200000 : args.mode === 'rewrite' ? 80000 : 60000, 300, 200000)
       const prev = chapters.slice(0, index).reverse().find(item => item.chars > 0)
       const prevText = prev ? (await readText(path.join(rootNow(), prev.file))) ?? '' : ''
       const prevTailText = tail(prevText, Math.max(300, Math.min(6000, Math.round(budget * 0.15))))
@@ -3612,7 +3633,9 @@ export function apply(ctx, config) {
       const anchorIds = selectedScene?.events ?? beats.section?.events ?? []
       const spine = []
       for (const event of spineLookup) {
-        const inRange = event.from !== '' && current.id >= event.from && current.id <= event.to
+        const order = [...chapters.map(item => item.id), ...(index === chapters.length ? [current.id] : [])]
+        const from = order.indexOf(event.from), to = order.indexOf(event.to)
+        const inRange = from >= 0 && to >= from && index >= from && index <= to
         const anchored = anchorIds.includes(event.id)
         if (!anchored && (selectedScene || !inRange)) continue
         spine.push({
@@ -3662,7 +3685,7 @@ export function apply(ctx, config) {
       const historicalLedger = chapters.slice(index + 1).some(item => item.written) ||
         Boolean(current.written && (selectedScene || (args.mode === 'rewrite' && args.rewriteStart !== undefined)))
       const ledgerMode = historicalLedger ? 'historical' : args.mode === 'rewrite' && current.written ? 'frontier-rewrite' : 'current'
-      const ledgerRows = historicalLedger ? [] : ledger.rows.filter(item => item.active !== false).slice(0, 20)
+      const ledgerRows = historicalLedger ? [] : ledger.rows.filter(item => item.active !== false).slice(0, args.full === true ? undefined : 20)
       const ledgerMissing = historicalLedger ? ledger.rows.map(item => ({
         category: item.category,
         item: item.item,
@@ -3679,11 +3702,11 @@ export function apply(ctx, config) {
         includedCount: ledgerRows.length,
         ...(historicalLedger ? { reason: chapters.slice(index + 1).some(item => item.written) ? 'target-before-written-frontier' : 'target-position-inside-written-chapter' } : {}),
       }
-      const currentId = String(current.id)
-      const threadRows = threads.rows
-        .filter(item => item.open && (item.payoff === '' || item.payoff >= currentId))
-        .slice(0, args.full === true ? 500 : 10)
-        .map(item => ({ thread: item.thread, planted: item.planted, payoff: item.payoff }))
+      const threadScope = contextThreads(threads.rows, [...chapters.filter(item => item.id !== current.id), current].sort((a, b) => {
+        const position = id => id === current.id ? index : chapters.findIndex(item => item.id === id)
+        return position(a.id) - position(b.id)
+      }), current.id)
+      const threadRows = threadScope.rows.slice(0, args.full === true ? undefined : 10)
 
       // 相关设定：只在被正文/章纲/大纲点名时才带，避免把整本世界观灌进上下文。
       const settingItems = await listSettings(rootNow())
@@ -3693,7 +3716,7 @@ export function apply(ctx, config) {
       }
       const settings = []
       const voided = []
-      for (const item of settingHits.slice(0, args.full === true ? 500 : 4)) {
+      for (const item of settingHits.slice(0, args.full === true ? undefined : 4)) {
         const content = await readSetting(rootNow(), item.name)
         if (content !== null && SETTING_VOID_RE.test(content)) {
           voided.push(item.name)
@@ -3754,6 +3777,8 @@ export function apply(ctx, config) {
         if (latest.status !== 'ready' || latest.preflightId !== chapterPreflight.preflightId) chapterPreflight = { status: 'stale' }
       }
       return assembleNovelContext({
+        full: args.full === true,
+        missingMaterials: [...threadScope.missing, ...ledgerMissing.map(item => `历史台账缺失：${item.item}`)],
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: contextBeats,
         scene: selectedScene ? { id: selectedScene.id, title: selectedScene.title, opening: beats.section?.scenes[0]?.id === selectedScene.id } : null,
@@ -5657,6 +5682,11 @@ export function apply(ctx, config) {
                   scene: value.scene,
                   mode: value.mode,
                   ready: value.ready,
+                  selfContained: value.selfContained,
+                  missingMaterials: value.missingMaterials,
+                  omitted: value.omitted,
+                  packHash: value.packHash,
+                  completeness: value.completeness,
                   chars: value.budgetUsed,
                   budget: value.budget,
                   budgetUsed: value.budgetUsed,

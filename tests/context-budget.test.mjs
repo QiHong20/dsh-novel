@@ -112,3 +112,31 @@ test('表现包启用后人物卡必须完整装配，预算不足明确拒绝',
   assert.ok(ready.prompt.includes(value.presentationExcerpts))
   assert.equal(ready.budgetUsed, Array.from(ready.prompt).length)
 })
+
+
+test('完整模式的事件不能被预算静默省略，包指纹可复现', () => {
+  const value = { ...fixture('原文'), full: true, spine: [{ id: 'e1', title: '必须交代', because: '前因'.repeat(2000), so: '后果' }] }
+  assert.equal(assemble(value, 3000).ready, false)
+  const result = assemble(value, 20000)
+  assert.equal(result.ready, true)
+  assert.equal(result.omitted.length, 0)
+  assert.match(result.prompt, /必须交代/u)
+  assert.equal(result.packHash, assemble(value, 20000).packHash)
+  assert.equal(result.selfContained, false)
+})
+
+test('伏笔按书目截断，保留逾期，未知实际回收日期不推断', () => {
+  const from = source.indexOf('function contextThreads(')
+  const to = source.indexOf('function assembleNovelContext(', from)
+  const scope = vm.runInNewContext(source.slice(from, to) + '; contextThreads')
+  const chapters = ['z', 'a', 'q'].map(id => ({ id }))
+  const result = scope([
+    { thread: '未来', planted: 'q', payoff: '', status: 'open', open: true },
+    { thread: '逾期', planted: 'z', payoff: 'z', status: 'open', open: true },
+    { thread: '未知回收', planted: 'z', payoff: 'q', status: 'done', open: false },
+    { thread: '后章回收', planted: 'z', payoff: 'q', status: 'q', open: true },
+  ], chapters, 'a')
+  assert.deepEqual(Array.from(result.rows, r => r.thread), ['逾期', '后章回收'])
+  assert.match(result.rows[0].scope, /逾期/u)
+  assert.equal(result.missing.length, 1)
+})
