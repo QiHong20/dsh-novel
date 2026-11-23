@@ -96,11 +96,11 @@ test('章前剧情冲突须经拷问和确认修订，复检通过后方可保�
   assert.equal(reviewCount, 1)
   const edits = [{ file: 'outline.md', before: wrongPrice, after: correctedLine, reason: '更正本章费用含义', issueIds: ['1'] }]
   await assert.rejects(preflight('preview', { preflightId: blocked.preflightId, edits }), /未获明确回答/u)
-  const { baseHash } = await call('novel_grill', { action: 'inspect', id: blocked.grillId })
-  await call('novel_grill', {
-    action: 'answer', id: blocked.grillId, baseHash, questionId: blocked.questions[0].id,
-    disposition: 'decided', selected: ['A'], answer: '按索赔写，改总纲范本。',
-  })
+  const answer = { disposition: 'decided', selected: ['A'], answer: '按索赔写，改总纲范本。' }
+  await assert.rejects(preflight('answer', { ...answer, questionId: blocked.grillId }), /找不到该待答问题/u)
+  const answered = await preflight('answer', { ...answer, questionId: blocked.questions[0].id })
+  assert.equal(answered.questions[0].answer.text, answer.answer)
+  assert.equal(answered.grillId, blocked.grillId)
   const { planId } = await preflight('preview', { preflightId: blocked.preflightId, edits })
   assert.equal((await preflight('apply', { planId })).status, 'blocked')
   assert.ok((await fs.readFile(outline, 'utf8')).includes(wrongPrice))
