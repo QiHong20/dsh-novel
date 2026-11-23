@@ -433,3 +433,46 @@ test('阻塞拷问文件丢失时，查询与修订入口引导重检并可恢�
   assert.equal(confirmations, 0)
   assert.ok((await fs.readFile(outline, 'utf8')).includes(wrongPrice))
 })
+
+test('首章无需前文，章纲引文不合格时自动纠正一次', async t => {
+  const root = await createBook(t)
+  const chapter = '0001'
+  const line = '- 冲突：守门人拦住陆昭。'
+  await fs.writeFile(path.join(root, 'beats.md'), `## 0001 第 1 章\n### 场景 entrance：城门\n- 时序：10\n- 出场：hero\n${line}\n#### 人物 hero\n- 目标：入城\n`)
+  let attempts = 0
+  const call = registerTools(root, {
+    review({ sources, feedback }) {
+      assert.ok(!sources.find(source => source.file === 'chapters/0001.md').text)
+      assert.ok(sources.find(source => source.file === 'beats.md').text.includes(line))
+      attempts += 1
+      if (attempts === 1) {
+        assert.equal(feedback, undefined)
+        return { facts: [{ text: '守门人拦下了陆昭。', evidence: [] }], issues: [] }
+      }
+      assert.match(feedback, /第 1 条.*未提供引文/u)
+      return { facts: [{ text: '首场由守门人拦住陆昭。', evidence: [{ file: 'beats.md', quote: line }] }], issues: [] }
+    },
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(result.status, 'ready')
+  assert.equal(attempts, 2)
+  assert.equal((await call('novel_grill', { action: 'list' })).sessions.length, 0)
+})
+
+test('首章资料缺失时以拷问澄清起稿方向', async t => {
+  const root = await createBook(t)
+  const chapter = '0001'
+  const call = registerTools(root, {
+    review: () => ({
+      facts: [],
+      issues: [{
+        kind: 'missing-basis', detail: '缺少开篇剧情要求。', evidence: [],
+        question: '首章以哪场冲突开篇？',
+        options: [{ label: '城门受阻', effect: '开篇明确入城目标' }, { label: '河边遇险', effect: '开篇建立紧迫局势' }],
+      }],
+    }),
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(result.status, 'blocked')
+  assert.equal(result.questions.length, 1)
+})
