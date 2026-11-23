@@ -403,6 +403,10 @@ window.__ModuleLoader__.load({
 .nvl-beats-edit:focus { border-color: var(--dsw-alias-brand-primary, #4d6bfe); }
 .nvl-beats-foot { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .nvl-beat-sec { padding: 9px 0; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
+.nvl-beats-mode { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; flex: none; }
+.nvl-beats-mode .nvl-ask-btn:disabled { opacity: 0.4; }
+.nvl-beats-pick { max-width: 46%; min-width: 0; font-size: 12px; }
+.nvl-beats-pick option { color: #333; background: #fff; }
 .nvl-beat-sec:last-child { border-bottom: 0; }
 .nvl-beat-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
 .nvl-beat-title { font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary, inherit); }
@@ -2286,6 +2290,15 @@ window.__ModuleLoader__.load({
       const charactersFeed = useJson('/characters', 30000)
       const characterNames = Object.fromEntries((charactersFeed.data?.characters || []).map(c => [c.id, c.name]))
       const [stack, setStack] = useState([])
+      // 章纲显示方式：列表（全铺开）/ 翻页（一次一章）。存在本地，换会话也记得。
+      const [pager, setPager] = useState(() => {
+        try { return window.localStorage.getItem('nvl:beats-pager') === 'page' ? 'page' : 'list' } catch { return 'list' }
+      })
+      const [pageIdx, setPageIdx] = useState(0)
+      const pickPager = next => {
+        setPager(next)
+        try { window.localStorage.setItem('nvl:beats-pager', next) } catch {}
+      }
       const scroll = React.useRef(null)
       const savedScroll = React.useRef(0)
       const route = stack[stack.length - 1]
@@ -2294,6 +2307,9 @@ window.__ModuleLoader__.load({
       useBackStep(!!route, back)
       useEffect(() => { if (!route && scroll.current) scroll.current.scrollTop = savedScroll.current }, [route])
       const matches = Object.fromEntries((board?.chapterMatches || []).map(item => [item.id, item]))
+      const chapters = novel?.chapters || []
+      const pageAt = Math.min(pageIdx, Math.max(chapters.length - 1, 0))
+      const shown = pager === 'page' ? chapters.slice(pageAt, pageAt + 1) : chapters
       const sections = Object.fromEntries((board?.chapterMatches || []).filter(item => item.status === 'matched').map(item => [item.id, item.section]))
       const fields = board?.fields || { role: [], scene: [], chapter: [] }
       const button = (label, next) => h('button', { type: 'button', className: 'nvl-ask-btn', onClick: () => open(next) }, label)
@@ -2305,11 +2321,27 @@ window.__ModuleLoader__.load({
             `爽点 ${board.rhythm.payoff}${board.rhythm.budget ? ` / 计划 ${board.rhythm.budget}` : ''} · 有爽点的章 ${board.rhythm.withPayoff}/${board.rhythm.withBeats} · 钩子 ${board.rhythm.hooks} 章 · 最长断档 ${board.rhythm.longestGap} 章 · 阈值 ${board.rhythm.gapLimit}`,
             board.rhythm.currentBreached ? ` · ⚠ 截至 ${board.rhythm.currentChapter} 连续 ${board.rhythm.currentGap} 章无标记` : '',
             board.rhythm.complete === false ? ' · 统计不完整，请核对歧义章纲' : '') : null,
+          h('div', { className: 'nvl-beats-mode' },
+            h('span', { className: 'nvl-meta' }, '显示'),
+            h('button', { type: 'button', className: 'nvl-seg-btn', 'data-on': pager === 'list', onClick: () => pickPager('list') }, '列表'),
+            h('button', { type: 'button', className: 'nvl-seg-btn', 'data-on': pager === 'page', onClick: () => pickPager('page') }, '翻页'),
+            pager === 'page' ? h('select', {
+              className: 'nvl-select nvl-beats-pick',
+              value: String(pageAt),
+              'aria-label': '跳到哪一章',
+              onChange: event => {
+                const next = Number(event.target.value)
+                if (Number.isFinite(next)) setPageIdx(Math.min(Math.max(0, chapters.length - 1), next))
+              }
+            }, chapters.map((chapter, index) => h('option', { key: chapter.id, value: String(index) }, `${chapter.id} ${chapter.title}`))) : null,
+            pager === 'page' ? h('span', { className: 'nvl-meta' }, `第 ${pageAt + 1}/${chapters.length} 章`) : null,
+            pager === 'page' ? h('button', { type: 'button', className: 'nvl-ask-btn', disabled: pageAt <= 0, onClick: () => setPageIdx(Math.max(0, pageAt - 1)) }, '← 上一章') : null,
+            pager === 'page' ? h('button', { type: 'button', className: 'nvl-ask-btn', disabled: pageAt >= chapters.length - 1, onClick: () => setPageIdx(Math.min(chapters.length - 1, pageAt + 1)) }, '下一章 →') : null),
           h('div', { className: 'nvl-outline', ref: scroll },
             error ? h('p', null, error) : null,
             ...(board?.warnings || []).map((text, index) => h('p', { key: `warning-${index}`, role: 'alert', className: 'nvl-err' }, text)),
             !board ? h('p', null, '读取中…') : null,
-            ...(novel?.chapters || []).map(chapter => {
+            ...shown.map(chapter => {
               const match = matches[chapter.id]
               if (match?.status === 'ambiguous') return h('section', { key: chapter.id, className: 'nvl-beat-sec' },
                 h('h3', null, `${chapter.id} ${chapter.title}`),
