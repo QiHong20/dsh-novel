@@ -578,3 +578,22 @@ test('送审资料中不直接影响本章的已确认冲突也发起拷问', as
   assert.equal(result.questions[1].text, '第五章由谁保管这封信？')
   assert.equal((await call('novel_grill', { action: 'list' })).sessions.length, 1)
 })
+
+test('章前问题的引文无效时自动纠正，确认冲突仍进入拷问', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  const originalOutline = await fs.readFile(outline, 'utf8')
+  let attempts = 0
+  const call = registerTools(root, {
+    review({ sources, feedback }) {
+      const report = compensationReport(sources)
+      if (++attempts === 1) report.issues[0].evidence[1].quote = '改写过的范本文句。'
+      else assert.match(feedback, /章前问题第 1 条.*outline\.md.*改写过的范本文句/u)
+      return report
+    },
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(attempts, 2)
+  assert.equal(result.status, 'blocked')
+  assert.equal(result.questions.length, 1)
+  assert.equal(await fs.readFile(outline, 'utf8'), originalOutline)
+})
