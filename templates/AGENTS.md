@@ -24,7 +24,7 @@ chapters/0001.md   正文，一章一个文件
 | 他说 | 你要做 |
 |---|---|
 | 「拆一下这本书」「这本书帮我拆下书」 | **把它建成一本能接着写的书**：先 `novel_import({ source, dryRun: true })` 看清切出来多少章，再沿用切分参数调用 `novel_import({ source, limit: N, dryRun: false })` 把原文**搬**进 chapters/（不要自己抄正文）→ 需要摘要时再用 `novel_write` 补 → `novel_card` 主配角 → `novel_setting` 地点/规矩/物品 → `novel_threads` 埋设与回收 → `novel_beats` 每章场景 + `→ 爽点` / `→ 钩子`。默认保留并跳过已有章节；只有作者明确要求覆盖时才加 `replace: true`。**不要交分析报告当成果** |
-| 「写第三章」/「接着写」 | `novel_chapter_preflight({ action: "check", chapter })` → 有阻塞才汇总拷问、确认修订并复检 → 通过后取 `novel_context` 写正文 → `novel_write({ chapter, content, preflightId })` → `novel_deai_pack` 全文审稿与必要修改 → `novel_deai_review` → `novel_check` |
+| 「写第三章」/「接着写」 | `novel_chapter_preflight({ action: "check", chapter })` → 发现真冲突就汇总拷问、确认修订并复检 → 通过后取 `novel_context` 写正文 → `novel_write({ chapter, content, preflightId })` → `novel_deai_pack` 全文审稿与必要修改 → `novel_deai_review` → `novel_check` |
 | 「这章有问题吧」/「帮我查一下」 | `novel_check({ chapter })`，然后只讲要改的三件事 |
 | 「按 XX 的风格写」 | 有文风卡就 `novel_context` 带上；没有先用 `novel_style({ clone: true, source })` 生成待校准卡 |
 | 「加个人物」「这个人改成…」 | `novel_card`（一张一个文件，含 `## 关系` / `## 状态`） |
@@ -189,7 +189,7 @@ chapters/0001.md   正文，一章一个文件
 - 书名/题材/目标字数用 `novel_book`，那不算设定。
 
 1. `novel_status` —— 现在写到哪、目标多少字、缺什么（设定 0 条时会当场提醒）
-2. AI 起稿、续写先用 `novel_chapter_preflight({ action: "check", chapter })`。有阻塞就汇总拷问，按作者明确回答生成逐段修订清单，由工具原生确认、应用和复检。无阻塞直接继续。通过后用 `novel_context({ chapter })` 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 台账适用范围 + 未回收伏笔 + 相关设定」的装配包。`ready: true` 才表示全部 `[必选]` 文风已进入提示；旧章出现 `ledgerMissing` 时按提示查前文，不拿当前台账倒填。
+2. AI 起稿、续写先用 `novel_chapter_preflight({ action: "check", chapter })`。送审资料里每项确认冲突都应汇总进拷问，包括不直接影响本章的冲突。遇到关键依据缺失也要询问，按作者明确回答生成逐段修订清单，由工具原生确认、应用和复检。无阻塞直接继续。通过后用 `novel_context({ chapter })` 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 台账适用范围 + 未回收伏笔 + 相关设定」的装配包。`ready: true` 才表示全部 `[必选]` 文风已进入提示；旧章出现 `ledgerMissing` 时按提示查前文，不拿当前台账倒填。
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
 4. `novel_write({ chapter, content, preflightId })` —— 用当前章前核对编号落盘。目标字数仅供参考，超出不删减、不缩写、不提前收尾；先把当前场景的动作前提、空间过渡和因果后果写清。是否分章由情节自然节点决定，确需顺延尚未开始的后续场景时可传 `carryOver: true`，不能拆散当前动作链。
 5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。

@@ -23,8 +23,8 @@ function registerTools(root, { review, userQuestions } = {}) {
     tools: { register: tool => tools.set(tool.name, tool) },
     get: name => name === 'userQuestions' ? userQuestions : undefined,
     effect() {},
-    llm: { async *stream({ messages }) {
-      const report = await review(JSON.parse(messages[0].content[0].text))
+    llm: { async *stream({ messages, system }) {
+      const report = await review(JSON.parse(messages[0].content[0].text), system)
       const text = typeof report === 'string' ? report : JSON.stringify(report)
       yield { type: 'block-end', block: { type: 'text', text } }
       yield { type: 'finish', reason: { kind: 'stop' } }
@@ -494,4 +494,87 @@ test('首章引文二次失败时说明已自动纠正并暂停起稿', async t 
   await assert.rejects(preflight('check'), /已自动纠正一次.*起稿已暂停.*outline\.md/u)
   assert.equal(attempts, 2)
   assert.equal((await preflight('inspect')).status, 'pending')
+})
+
+test('章前预检按唯一逐字命中更正出处，范本措辞不成为起稿事实', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  const sample = '炉里嘶嘶响，陈麻子让他赔钱。'
+  await fs.writeFile(outline, `# 总纲\n\n## 附一 范本\n${sample}\n`)
+  let attempts = 0
+  const call = registerTools(root, {
+    review() {
+      attempts += 1
+      return {
+        facts: [
+          { text: compensation, evidence: [{ file: 'outline.md', quote: compensation }] },
+          { text: sample, evidence: [{ file: 'beats.md', quote: sample }] },
+        ],
+        issues: [],
+      }
+    },
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(result.status, 'ready')
+  assert.equal(attempts, 1)
+  assert.deepEqual(result.facts[0].evidence, [{ file: 'beats.md', quote: compensation, reportedFile: 'outline.md' }])
+  assert.equal(result.facts.length, 1)
+  assert.deepEqual(result.issues[0].evidence, [{ file: 'outline.md', quote: sample, reportedFile: 'beats.md' }])
+  assert.equal(result.issues[0].kind, 'note')
+  const context = await call('novel_context', { chapter })
+  assert.match(context.prompt, /依据：beats\.md/u)
+  assert.equal((await call('novel_grill', { action: 'list' })).sessions.length, 0)
+})
+
+test('总纲范本与章纲有实质冲突时，更正出处后仍须拷问', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  await fs.writeFile(outline, `# 总纲\n\n## 附一 范本\n${wrongPrice}\n`)
+  const call = registerTools(root, {
+    review({ sources }) {
+      const report = compensationReport(sources)
+      report.issues[0].evidence[0].file = 'outline.md'
+      report.issues[0].evidence[1].file = 'beats.md'
+      return report
+    },
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(result.status, 'blocked')
+  assert.deepEqual(result.issues[0].evidence.map(entry => entry.file), ['beats.md', 'outline.md'])
+  assert.equal(result.questions.length, 1)
+})
+
+test('错标的引文同时存在于两个来源时，不猜测出处', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  const quote = '陈麻子索赔。'
+  await fs.appendFile(outline, `\n${quote}\n`)
+  await fs.writeFile(path.join(root, 'events.md'), `# 事件线\n${quote}\n`)
+  const call = registerTools(root, {
+    review: () => ({ facts: [{ text: quote, evidence: [{ file: 'beats.md', quote }] }], issues: [] }),
+  })
+  await assert.rejects(call('novel_chapter_preflight', { action: 'check', chapter }), /已自动纠正一次.*beats\.md/u)
+})
+
+test('送审资料中不直接影响本章的已确认冲突也发起拷问', async t => {
+  const { root, chapter, outline } = await createConflict(t)
+  const outlineLine = '第五章由周掌柜保管封信。'
+  const eventLine = '第五章由钱管事保管同一封信。'
+  await fs.appendFile(outline, `\n${outlineLine}\n`)
+  await fs.writeFile(path.join(root, 'events.md'), `# 事件线\n${eventLine}\n`)
+  const call = registerTools(root, {
+    review({ sources }, system) {
+      assert.match(system, /每项真实冲突都列为 conflict.*不直接影响本章写法/u)
+      const report = compensationReport(sources)
+      report.issues.push({
+        kind: 'conflict', detail: '第五章同一封信的保管人冲突，暂不影响本章。',
+        evidence: [{ file: 'outline.md', quote: outlineLine }, { file: 'events.md', quote: eventLine }],
+        question: '第五章由谁保管这封信？',
+        options: [{ label: '周掌柜', effect: '同步事件线' }, { label: '钱管事', effect: '修订总纲' }],
+      })
+      return report
+    },
+  })
+  const result = await call('novel_chapter_preflight', { action: 'check', chapter })
+  assert.equal(result.status, 'blocked')
+  assert.equal(result.questions.length, 2)
+  assert.equal(result.questions[1].text, '第五章由谁保管这封信？')
+  assert.equal((await call('novel_grill', { action: 'list' })).sessions.length, 1)
 })

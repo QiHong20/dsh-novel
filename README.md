@@ -176,7 +176,7 @@ curl.exe -s "http://127.0.0.1:18080/novel-api/state"
 
 ## 章前剧情预检
 
-AI 新写或续写前调用 `novel_chapter_preflight({ action: "check", chapter })`。插件用当前会话模型核对本章章纲、总纲（含范本）、已有正文、相关人物和设定。只有影响本章写法的明确冲突或关键依据缺失才阻塞。未发现阻塞时直接返回 `ready` 和带引文的事实清单，AI 重新调用 `novel_context` 后开写，保存时把本章 ID 和 `preflightId` 传给 `novel_write`。
+AI 新写或续写前调用 `novel_chapter_preflight({ action: "check", chapter })`。插件用当前会话模型核对本章章纲、总纲（含范本）、已有正文、相关人物和设定。送审资料中每一项明确冲突都阻塞起稿并发起拷问，包括不直接影响本章写法的冲突。决定起稿方向的关键依据缺失时也会询问作者。未发现阻塞时直接返回 `ready` 和带引文的事实清单，AI 重新调用 `novel_context` 后开写，保存时把本章 ID 和 `preflightId` 传给 `novel_write`。
 
 章前预检每次模型调用最多等待 240 秒。首次返回的引文未通过校验时，工具会自动纠正一次，纠正调用使用同样的时限。
 
