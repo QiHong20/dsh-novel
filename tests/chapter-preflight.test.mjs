@@ -476,3 +476,22 @@ test('首章资料缺失时以拷问澄清起稿方向', async t => {
   assert.equal(result.status, 'blocked')
   assert.equal(result.questions.length, 1)
 })
+
+test('首章引文二次失败时说明已自动纠正并暂停起稿', async t => {
+  const root = await createBook(t)
+  const chapter = '0001'
+  await fs.writeFile(path.join(root, 'outline.md'), '陆昭从北门入城。\n')
+  let attempts = 0
+  const wrongQuote = '陆昭从南门入城。'
+  const call = registerTools(root, {
+    review({ feedback }) {
+      attempts += 1
+      if (attempts === 2) assert.ok(feedback.includes(wrongQuote))
+      return { facts: [{ text: '陆昭从南门入城。', evidence: [{ file: 'outline.md', quote: wrongQuote }] }], issues: [] }
+    },
+  })
+  const preflight = action => call('novel_chapter_preflight', { action, chapter })
+  await assert.rejects(preflight('check'), /已自动纠正一次.*起稿已暂停.*outline\.md/u)
+  assert.equal(attempts, 2)
+  assert.equal((await preflight('inspect')).status, 'pending')
+})
