@@ -24,7 +24,7 @@ chapters/0001.md   正文，一章一个文件
 | 他说 | 你要做 |
 |---|---|
 | 「拆一下这本书」「这本书帮我拆下书」 | **把它建成一本能接着写的书**：先 `novel_import({ source, dryRun: true })` 看清切出来多少章，再沿用切分参数调用 `novel_import({ source, limit: N, dryRun: false })` 把原文**搬**进 chapters/（不要自己抄正文）→ 需要摘要时再用 `novel_write` 补 → `novel_card` 主配角 → `novel_setting` 地点/规矩/物品 → `novel_threads` 埋设与回收 → `novel_beats` 每章场景 + `→ 爽点` / `→ 钩子`。默认保留并跳过已有章节；只有作者明确要求覆盖时才加 `replace: true`。**不要交分析报告当成果** |
-| 「写第三章」/「接着写」 | `novel_chapter_preflight({ action: "check", chapter })` → 发现真冲突就汇总拷问、确认修订并复检 → 通过后取 `novel_context` 写正文 → `novel_write({ chapter, content, preflightId })` → `novel_deai_pack` 全文审稿与必要修改 → `novel_deai_review` → `novel_check` |
+| 「写第三章」/「接着写」 | `novel_context({ chapter })` 拿装配包 → 写正文 → `novel_write({ chapter, content })` → `novel_deai_pack` 审稿 → `novel_deai_review` → `novel_check` |
 | 「这章有问题吧」/「帮我查一下」 | `novel_check({ chapter })`，然后只讲要改的三件事 |
 | 「按 XX 的风格写」 | 有文风卡就 `novel_context` 带上；没有先用 `novel_style({ clone: true, source })` 生成待校准卡 |
 | 「加个人物」「这个人改成…」 | `novel_card`（一张一个文件，含 `## 关系` / `## 状态`） |
@@ -194,9 +194,9 @@ chapters/0001.md   正文，一章一个文件
 - 书名/题材/目标字数用 `novel_book`，那不算设定。
 
 1. `novel_status` —— 现在写到哪、目标多少字、缺什么（设定 0 条时会当场提醒）
-2. AI 起稿、续写先用 `novel_chapter_preflight({ action: "check", chapter })`。送审资料里每项确认冲突都应汇总进拷问，包括不直接影响本章的冲突。遇到关键依据缺失也要询问，按作者明确回答生成逐段修订清单，由工具原生确认、应用和复检。无阻塞直接继续。通过后用 `novel_context({ chapter })` 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 台账适用范围 + 未回收伏笔 + 相关设定」的装配包。`ready: true` 才表示全部 `[必选]` 文风已进入提示；旧章出现 `ledgerMissing` 时按提示查前文，不拿当前台账倒填。
+2. AI 起稿、续写直接用 `novel_context({ chapter })` 拿「本章章纲 + 上一章结尾 + 出场人物卡 + 台账适用范围 + 未回收伏笔 + 相关设定」的装配包。`ready: true` 才表示全部 `[必选]` 文风已进入提示；旧章出现 `ledgerMissing` 时按提示查前文，不拿当前台账倒填。
 3. 按装配包写正文（1000 字左右一章，别一句话带过一个场景，也别把三章的事塞进一章）
-4. `novel_write({ chapter, content, preflightId })` —— 用当前章前核对编号落盘。目标字数仅供参考，超出不删减、不缩写、不提前收尾；先把当前场景的动作前提、空间过渡和因果后果写清。是否分章由情节自然节点决定，确需顺延尚未开始的后续场景时可传 `carryOver: true`，不能拆散当前动作链。
+4. `novel_write({ chapter, content })` —— 直接保存正文。目标字数仅供参考，超出不删减、不缩写、不提前收尾；先把当前场景的动作前提、空间过渡和因果后果写清。是否分章由情节自然节点决定，确需顺延尚未开始的后续场景时可传 `carryOver: true`，不能拆散当前动作链。
 5. **交付前阅读全文审稿**：调用 `novel_deai_pack({ chapter })`，结合人物声口与文风锚点阅读全部正文，检查时间压力是否与描写、交涉相容，细节是否反复证明同一标签，旁白是否过度解释，句段和人物是否模板化。机械命中仅作线索，正常重复、长句、对比和修辞可保留，不强制短句、粗口或抢话。有问题才用 `novel_write({ chapter, mode: "patch", baseHash, patches: [{ start, end, content }] })` 一次保存多个修改；坐标均以同一版原文为准，不可重叠。原有单片段 `start/end/content` 写法仍可用。
 6. 修改后重新调用 `novel_deai_pack` 审核最终版本，核对事实、意图、因果、数字与信息点未变。对包内每段填写 `{ index, reason }` 说明保留理由；带对话标签的段落另填 `dialogue.kind`（`speech` 实际对白 / `thought` 内心 / `quotation` 引用 / `uncertain` 无法确定）。实际对白必须填写 `speaker`、`listener`、`intent`、`pressure`、`assessment`，逐轮说明谁对谁说、想达到什么目的、现场压力和措辞是否当场听得懂；同段混有引用与实际对白时按实际对白审查，不把模糊狠话机械改成统一口语。按场景提交 `scenes`，用连续的 `startIndex/endIndex` 覆盖全部段落；本章有结构化章纲场景时，每场必须用 `sceneId` 声明该段对应的稳定场景 ID，不能按数组下标假定正文顺序等于章纲顺序，每个场景只能认领一个正文范围。每场记录 `layout`、`mechanism`、`timeline`、`actions`。每个关键动作记录段号 `index` 与 `actor/from/to/action/tools/prerequisites/result/timing/safety`，核对人物位置、通路、工具来源、状态变化前因、技术因果、耗时及危险禁令；同段多个关键动作分条列出。静态场景可用空动作数组，但须说明依据；不得脑补缺失步骤后登记完成。再填写 `checks` 的 `continuity`（连续性）、`timing`（时间压力）、`voice`（角色声口）、`narration`（设定投放、细节与解释）、`rhythm`（句段与冲突）、`facts`（事实与信息完整性），用 `novel_deai_review({ chapter, baseHash, checks, observations, timeBudgets, scenes, paragraphs })` 登记（启用文风时同时提交取包返回的 `styleHash`，不得沿用换卡前的取包结果）。每项 checks 提交 `{ verdict, detail, evidence, counterargument }`：verdict 取 supported/conflict/uncertain/not-applicable，至少一条 `{ source: "chapter", index, quote }` 正文逐字引文，确认矛盾至少两条不同引文；引用人物卡、设定、文风时注明 source 与 name，并先读取对应资料。说明最可能推翻结论的证据或缺失依据，不编造距离、耗时、器件结构或后文影响。发现矛盾和依据不足也应如实登记，工具保存为 blocked；记录完整不等于通过。旧阻塞项转为通过时另填对应 resolutions，说明修复依据或更正原因。再运行 `novel_check({ chapter })`；`deai-review-pending` 表示未完成当前版本复核，正文、引用资料或启用文风变化后旧复核失效，未复核或仍有阻塞项不能标记 `final`。`recorded` 只开放定稿资格，不自动把草稿晋级；作者明确要定稿且 `novel_check` 仍显示当前记录有效时，把当前完整正文原样作为 `content`，用 `novel_write({ chapter, content, status: "final" })` 显式定稿。`ai-tone` 或 `style-drift` 需结合语境审查，不能为了零命中强改正文；确有问题才局部修订，并重新复核。
    - 为什么不能拖到下一章：实测一份 80 章的书，句均字数从 17 一路掉到 10.1、对话段占比从 26% 涨到 64.5%——**漂移是累积的**，越晚纠越费事，而且后写的章会照着前面已经歪掉的稿子继续歪。
@@ -341,7 +341,7 @@ chapters/0001.md   正文，一章一个文件
 
 ## 正文生成委派
 
-章前预检通过并取得装配包后，新建写作子代理，原样传入冻结装配包。子代理只返回正文和缺失依据，不修改书稿；主代理负责审核、展示与保存。完整模式的已选资料不会静默省略，但不代表全部依赖已核实，须检查缺项及资料覆盖边界。工具辅助模式先统一补读再分发，避免不同模型收到不同依据。宿主不支持子代理或指定模型时明确报告，不声称已经委派或切换。实际模型必须由宿主调用参数指定，不能仅靠提示词保证。
+取得装配包后，新建写作子代理，原样传入冻结装配包。子代理只返回正文和缺失依据，不修改书稿；主代理负责审核、展示与保存。完整模式的已选资料不会静默省略，但不代表全部依赖已核实，须检查缺项及资料覆盖边界。工具辅助模式先统一补读再分发，避免不同模型收到不同依据。宿主不支持子代理或指定模型时明确报告，不声称已经委派或切换。实际模型必须由宿主调用参数指定，不能仅靠提示词保证。
 
 
 ## 场景事件、通用状态与章纲存储
@@ -364,7 +364,7 @@ chapters/0001.md   正文，一章一个文件
 
 `ready` 只表示预算等装配条件通过，不表示资料充分。要声明完整包可独立写作，先以 full:true 取包并阅读全部材料，解决 missingMaterials 的硬缺项，再调用 novel_context_review。保持 chapter/scene/mode/budget 与取包一致，提交 packHash 及 checks 的 dependencies/timeline/knowledge/revelation/continuity，每项填写 verdict/detail/counterargument/quotes（包内逐字引文）。未核实项填 uncertain，有矛盾填 conflict，不以凑齐字段替代实际核对。
 
-工具重新装配验证包版本，冻结核对过的原文。重取同一包会返回 independentReview；selfContained=true 仅表示核对者已对该精确包登记全部 supported，不是工具自动认证语义正确。任何包内容变化都需要重新核对。完整包的核对不代替正文生成前的剧情预检或写后的审稿定稿流程。当前核对入口支持整章续写、整章改写和场景续写；局部改写包暂不提供独立认证入口。
+工具重新装配验证包版本，冻结核对过的原文。重取同一包会返回 independentReview；selfContained=true 仅表示核对者已对该精确包登记全部 supported，不是工具自动认证语义正确。任何包内容变化都需要重新核对。完整包的核对不代替写后的审稿定稿流程。当前核对入口支持整章续写、整章改写和场景续写；局部改写包暂不提供独立认证入口。
 
 
 ## 人物卡与设定范围整理（更新独立包语义）
