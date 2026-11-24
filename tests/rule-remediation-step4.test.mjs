@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { apply } from '../index.js'
+import { loadBook, persistBook } from '../lib/book.js'
 import { stageContext } from '../stage.js'
 
 const digest = text => createHash('sha256').update(text).digest('hex')
@@ -32,7 +33,8 @@ async function fixture(t) {
     { id: '0002', title: '后续', file: 'chapters/0002.md', status: 'draft' },
     { id: '0003', title: '待写', file: 'chapters/0003.md', status: 'planned' },
   ]
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '第四步测试', style: '测试', targetChars: 3000, chapters }, null, 2))
+  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ style: '测试' }))
+  await persistBook(root, { title: '第四步测试', targetChars: 3000, targetCharsSet: true }, chapters)
   await fs.writeFile(path.join(root, 'chapters/0010.md'), BODY)
   await fs.writeFile(path.join(root, 'chapters/0002.md'), '甲带着暗号继续追查。')
   await fs.writeFile(path.join(root, 'chapters/0003.md'), '')
@@ -133,9 +135,9 @@ test('正文分场范围变化后旧确认记录重新待核对', async t => {
   const proposed = await call('novel_character_history', historyArgs('second', 2, '乙在后场说出暗号。'))
   await call('novel_character_history', { action: 'confirm', character: 'a', id: proposed.record.id })
 
-  const book = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(root)
   book.chapters[0].deaiReview.scenes = [{ startIndex: 1, endIndex: 2, sceneId: 'first' }, { startIndex: 3, endIndex: 3, sceneId: 'second' }]
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify(book, null, 2))
+  await persistBook(root, book, book.chapters)
   const changed = await stageContext(root, book.chapters, '0002', 'later')
   assert.equal(changed.scenes[0].characters[0].history.length, 0)
   assert.match(changed.warnings.join('\n'), /待复核/u)
@@ -145,10 +147,10 @@ test('正文分场范围变化后旧确认记录重新待核对', async t => {
 
 test('分场数量相同但正文顺序与章纲不同时，只认显式 sceneId', async t => {
   const { root, chapters, call } = await fixture(t)
-  const book = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(root)
   // 正文先写 second 再写 first；数量与章纲相同，但数组下标与章纲顺序相反。
   book.chapters[0].deaiReview.scenes = [{ startIndex: 1, endIndex: 1, sceneId: 'second' }, { startIndex: 2, endIndex: 3, sceneId: 'first' }]
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify(book, null, 2))
+  await persistBook(root, book, book.chapters)
 
   const swapped = await call('novel_character_history', historyArgs('second', 2, '乙在后场说出暗号。'))
   assert.equal(swapped.record.binding.status, 'pending')
@@ -157,9 +159,9 @@ test('分场数量相同但正文顺序与章纲不同时，只认显式 sceneId
   assert.equal((await call('novel_character_history', historyArgs('first', 2, '乙在后场说出暗号。'))).record.binding.status, 'bound')
 
   // 不声明 sceneId 的旧分场不能再按下标认领。
-  const legacy = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const { meta: legacy } = await loadBook(root)
   legacy.chapters[0].deaiReview.scenes = [{ startIndex: 1, endIndex: 1 }, { startIndex: 2, endIndex: 3 }]
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify(legacy, null, 2))
+  await persistBook(root, legacy, legacy.chapters)
   const unbound = await call('novel_character_history', historyArgs('second', 2, '乙在后场说出暗号。'))
   assert.equal(unbound.record.binding.status, 'pending')
   assert.match(unbound.record.binding.reason, /sceneId/u)
@@ -227,7 +229,7 @@ test('人物历史确认与正文覆盖共用书目锁，不会留下可继承�
   ])
   assert.equal(written.status, 'fulfilled')
   assert.ok(['fulfilled', 'rejected'].includes(confirmed.status))
-  const book = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(root)
   const context = await stageContext(root, book.chapters, '0002', 'later')
   assert.equal(context.scenes[0].characters[0].history.length, 0)
   if (confirmed.status === 'fulfilled') assert.match(context.warnings.join('\n'), /待复核/u)

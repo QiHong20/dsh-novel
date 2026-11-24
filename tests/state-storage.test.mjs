@@ -7,7 +7,7 @@ import { hash, stageBook, stageContext } from '../stage.js'
 import { updateState, stateBook, statesAt } from '../lib/state-history.js'
 import { manageBeatStorage, readBeatStorage, writeBeatStorage } from '../lib/beat-storage.js'
 import { readBeats, writeBeats } from '../lib/beats.js'
-import { readText, writeFileAtomic } from '../lib/book.js'
+import { persistBook, readText, writeFileAtomic } from '../lib/book.js'
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'novel-state-storage-'))
@@ -16,7 +16,7 @@ async function fixture(t) {
   await fs.mkdir(path.join(root, 'characters'))
   await fs.writeFile(path.join(root, 'characters/a.md'), '# 甲\n- ID：a\n- 定位：主角\n- 重要程度：核心')
   const chapters = ['0001', '0002', '0003'].map((id, i) => ({ id, title: id, file: `chapters/${id}.md`, deaiReview: { baseHash: hash('钥匙交给甲。'), scenes: [{ sceneId: `s${i}`, startIndex: 1, endIndex: 1 }] } }))
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '无题材测试', chapters }))
+  await persistBook(root, { title: '无题材测试' }, chapters)
   for (const c of chapters) await fs.writeFile(path.join(root, c.file), '钥匙交给甲。')
   const scene = i => `### 场景 s${i}：交接\n- 时序：${[10, 20, 5][i]}\n- 出场：a\n- 状态对象：key\n- 事件：e1\n- 本场推进：交接\n- 本场允许结果：归属变化\n- 禁止提前兑现：后续开门\n#### 人物 a\n- 目标：保管\n`
   const beats = '# 章纲\n\n' + chapters.map((c, i) => `## ${c.id} ${c.title}\n- 事件：e1\n${scene(i)}`).join('\n')

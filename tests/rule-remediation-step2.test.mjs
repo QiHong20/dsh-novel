@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { apply } from '../index.js'
+import { loadBook, persistBook } from '../lib/book.js'
 
 const BODY = '七号炉的炉皮在跳。\n\n他把手按上去。\n'
 const CHANGED_BODY = '七号炉的炉皮在跳。\n\n他收回手，退到门边。\n'
@@ -64,7 +65,7 @@ async function fixture(t, options = {}) {
     assert.ok(tool, `没有注册工具 ${name}`)
     return tool.output.render(args, value).map(part => part.text).join('\n')
   }
-  const readBook = async () => JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const readBook = async () => (await loadBook(root)).meta
   return { root, call, request, render, readBook }
 }
 
@@ -364,6 +365,50 @@ test('恢复不能覆盖并发登记的阻塞审稿', async t => {
   await assertCurrentState(current, 'draft', 'blocked')
 })
 
+test('书目只保存审稿引用，复核文件缺失或损坏时本章待复核', async t => {
+  const current = await fixture(t)
+  await finalize(current.call)
+  const bookFile = path.join(current.root, 'book.json')
+  const raw = JSON.parse(await fs.readFile(bookFile, 'utf8'))
+  const chapter = raw.chapters[0]
+  assert.equal(chapter.deaiReview, undefined)
+  assert.match(chapter.deaiReviewRef, /^deai-reviews\/[a-f0-9]{64}\.json$/u)
+  const reviewFile = path.join(current.root, chapter.deaiReviewRef)
+  const reviewText = await fs.readFile(reviewFile, 'utf8')
+  assert.equal(JSON.parse(reviewText).status, 'recorded')
+
+  await fs.writeFile(reviewFile, '损坏的复核文件')
+  await assertCurrentState(current, 'draft', 'pending')
+  await fs.unlink(reviewFile)
+  await assertCurrentState(current, 'draft', 'pending')
+  await current.call('novel_book', { title: '更名后' })
+  assert.equal(JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef, chapter.deaiReviewRef)
+  await fs.writeFile(reviewFile, reviewText)
+  await assertCurrentState(current, 'final', 'recorded')
+})
+
+test('新版审稿详情写入失败时保留旧书目和引用', async t => {
+  const current = await fixture(t)
+  await finalize(current.call)
+  const bookFile = path.join(current.root, 'book.json')
+  const before = await fs.readFile(bookFile, 'utf8')
+  const originalWrite = fs.writeFile
+  fs.writeFile = (file, ...args) => {
+    if (String(file).startsWith(path.join(current.root, 'deai-reviews') + path.sep)) {
+      return Promise.reject(new Error('模拟审稿详情写入失败'))
+    }
+    return originalWrite(file, ...args)
+  }
+  try {
+    const blocked = conflictReview()
+    await assert.rejects(registerReview(current.call, blocked.checks, { observations: blocked.observations }), /模拟审稿详情写入失败/u)
+  } finally {
+    fs.writeFile = originalWrite
+  }
+  assert.equal(await fs.readFile(bookFile, 'utf8'), before)
+  await assertCurrentState(current, 'final', 'recorded')
+})
+
 test('切换到内容相同的另一张文风卡时，旧包不能冒充新卡审稿', async t => {
   const current = await fixture(t, { style: '甲卡' })
   const checks = baseChecks()
@@ -636,7 +681,7 @@ test('旧记录可沿用已引用文风指纹，无可验证指纹的旧记录�
   const book = await cited.readBook()
   assert.match(book.chapters[0].deaiReview.styleHash, /^[a-f0-9]{64}$/u)
   delete book.chapters[0].deaiReview.styleHash
-  await fs.writeFile(path.join(cited.root, 'book.json'), JSON.stringify(book), 'utf8')
+  await persistBook(cited.root, book, book.chapters)
   await assertCurrentState(cited, 'final', 'recorded')
   await fs.appendFile(path.join(cited.root, `styles/${style}.md`), '\n- 少排比。\n', 'utf8')
   await assertCurrentState(cited, 'draft', 'pending')
@@ -648,7 +693,7 @@ test('旧记录可沿用已引用文风指纹，无可验证指纹的旧记录�
   await finalize(uncited.call, skippedChecks)
   const oldBook = await uncited.readBook()
   delete oldBook.chapters[0].deaiReview.styleHash
-  await fs.writeFile(path.join(uncited.root, 'book.json'), JSON.stringify(oldBook), 'utf8')
+  await persistBook(uncited.root, oldBook, oldBook.chapters)
   await assertCurrentState(uncited, 'draft', 'pending')
 })
 
@@ -746,7 +791,7 @@ for (const [label, invalidate] of INVALID_REVIEWS) {
     await finalize(current.call)
     const book = await current.readBook()
     invalidate(book.chapters[0].deaiReview)
-    await fs.writeFile(path.join(current.root, 'book.json'), JSON.stringify(book), 'utf8')
+    await persistBook(current.root, book, book.chapters)
     await assertCurrentState(current, 'draft', 'pending')
   })
 }

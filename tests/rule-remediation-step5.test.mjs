@@ -8,6 +8,7 @@ import { Readable } from 'node:stream'
 import { apply } from '../index.js'
 import { beatReactionCandidates, calculateBeatRhythm, parseBeatSections } from '../lib/beats.js'
 import { appearanceIndex, appearanceReport, listCharacters } from '../lib/people.js'
+import { loadBook, persistBook } from '../lib/book.js'
 
 const ASPECTS = ['continuity', 'timing', 'voice', 'narration', 'rhythm', 'facts']
 
@@ -279,10 +280,10 @@ test('人物戏份按目标章截断；章纲出场只是计划，确认记录�
     baseHash: createHash('sha256').update(chapters[0].text).digest('hex'),
     scenes: [{ startIndex: 1, endIndex: 1, sceneId: 's1' }],
   }
-  const book = JSON.parse(await fs.readFile(path.join(env.root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(env.root)
   book.chapters[0].deaiReview = review
   env.chapters[0].deaiReview = review
-  await fs.writeFile(path.join(env.root, 'book.json'), JSON.stringify(book, null, 2))
+  await persistBook(env.root, book, book.chapters)
   const proposed = await env.call('novel_character_history', {
     action: 'propose', character: 'lu-zhao', scene: 's1', kind: '登场', onStage: true,
     content: '陆昭独自走进大厅', source: '正文描写', evidence: '他独自走进大厅', evidenceIndex: 1,
@@ -359,10 +360,10 @@ test('转述类认知记录不证明人物实际登场，自检回执使用正�
     baseHash: createHash('sha256').update(chapters[1].text).digest('hex'),
     scenes: [{ startIndex: 1, endIndex: 1, sceneId: 's2' }],
   }
-  const book = JSON.parse(await fs.readFile(path.join(env.root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(env.root)
   book.chapters[1].deaiReview = review
   env.chapters[1].deaiReview = review
-  await fs.writeFile(path.join(env.root, 'book.json'), JSON.stringify(book, null, 2))
+  await persistBook(env.root, book, book.chapters)
 
   // 章纲把陆昭排进第二场，但正文只是旁人转述；认知记录即使确认也不证明本人登场。
   const proposed = await env.call('novel_character_history', {
@@ -411,10 +412,10 @@ test('画像或他人口述外貌的呈现记录不证明本人登场', async t 
     baseHash: createHash('sha256').update(chapters[1].text).digest('hex'),
     scenes: [{ startIndex: 1, endIndex: 1, sceneId: 's2' }],
   }
-  const book = JSON.parse(await fs.readFile(path.join(env.root, 'book.json'), 'utf8'))
+  const { meta: book } = await loadBook(env.root)
   book.chapters[1].deaiReview = review
   env.chapters[1].deaiReview = review
-  await fs.writeFile(path.join(env.root, 'book.json'), JSON.stringify(book, null, 2))
+  await persistBook(env.root, book, book.chapters)
 
   // 主角本人没有出现，只有通缉画像交代外貌；呈现记录不能清零欠场。
   const portrait = await env.call('novel_character_history', {

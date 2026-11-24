@@ -6,6 +6,7 @@ import os from 'node:os'
 import { Readable } from 'node:stream'
 import { parseScenes, presentationChecks, chapterOverview, patchStageText, hash, stageContext, updateHistory, moveScene } from '../stage.js'
 import { apply } from '../index.js'
+import { persistBook } from '../lib/book.js'
 
 const chapterBody = `- 本章目标：建立疑虑
 ### 场景 encounter：初见
@@ -91,7 +92,7 @@ async function fixture(t) {
   const chapters = ['0001', '0002'].map(id => ({ id, title: id, file: `chapters/${id}.md` }))
   const chapterOne = '她伸手接茶，露出磨旧的袖口。\n他留在原地等待。'
   chapters[0].deaiReview = { baseHash: hash(chapterOne), scenes: [{ startIndex: 1, endIndex: 1, sceneId: 'encounter' }, { startIndex: 2, endIndex: 2, sceneId: 'remainder' }] }
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ chapters }))
+  await persistBook(root, { title: '未命名作品' }, chapters)
   const planned = full.replace('## 0002 后续', '### 场景 remainder：留守\n- 时序：15\n- 出场：a\n#### 人物 a\n- 目标：等待\n\n## 0002 后续')
   await fs.writeFile(path.join(root, 'beats.md'), planned)
   await fs.writeFile(path.join(root, 'events.md'), '## main：主线\n### main-1 初见\n- 目标：结识\n')

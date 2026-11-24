@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { stageBook, stageContext, updateHistory, moveScene, parseScenes, hash } from '../stage.js'
 import { apply } from '../index.js'
+import { persistBook } from '../lib/book.js'
 import { Readable } from 'node:stream'
 
 async function fixture(t) {
@@ -14,7 +15,7 @@ async function fixture(t) {
   const chapterOne = '甲看见信物。乙只听说有人失踪。'
   const chapters = ['0001', '0002', '0003'].map(id => ({ id, title: id, file: `chapters/${id}.md` }))
   chapters[0].deaiReview = { baseHash: hash(chapterOne), scenes: [{ startIndex: 1, endIndex: 1, sceneId: 'first' }] }
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '测试', chapters }))
+  await persistBook(root, { title: '测试' }, chapters)
   for (const c of chapters) await fs.writeFile(path.join(root, c.file), c.id === '0001' ? chapterOne : '')
   for (const [id, name] of [['a', '甲'], ['b', '乙']]) await fs.writeFile(path.join(root, 'characters', `${name}.md`), `# ${name}\n- ID：${id}\n- 定位：重要配角\n- 重要程度：重要\n## 作者侧秘密\n真实身份不可当成角色已知。`)
   const scene = (id, time, cast = 'a、b') => `### 场景 ${id}：对质\n- 时序：${time}\n- 出场：${cast}\n- 提及：不在场的人\n- 冲突：追问信物\n#### 人物 a\n- 未知：幕后主使\n- 目标：查清真相\n- 触发：看到信物\n- 计划变化：怀疑旧约\n`
@@ -178,7 +179,7 @@ test('同章前场确认可供后场继承，修正历史不抹去过去，撤�
   const body = '甲看见信物。\n甲随后发现信物是假的。'
   await fs.writeFile(path.join(root, 'chapters/0001.md'), body)
   chapters[0].deaiReview = { baseHash: hash(body), scenes: [{ startIndex: 1, endIndex: 1, sceneId: 'first' }, { startIndex: 2, endIndex: 2, sceneId: 'second' }] }
-  await fs.writeFile(path.join(root, 'book.json'), JSON.stringify({ title: '测试', chapters }))
+  await persistBook(root, { title: '测试' }, chapters)
   const { record } = await updateHistory(root, chapters, { ...proposal, kind: '误信', content: '乙拿走了信物' })
   await updateHistory(root, chapters, { action: 'confirm', character: 'a', id: record.id })
   assert.equal((await stageContext(root, chapters, '0001', 'second')).scenes[0].characters[0].history[0].kind, '误信')

@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { loadBook } from '../lib/book.js'
 import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
@@ -61,7 +62,7 @@ test('真实审稿工具要求逐项回执、阻塞定稿，并随章纲变化�
   await assert.rejects(call('novel_write', { chapter: '0001', content: '他守在门边。', status: 'final' }), /复核|审稿/u)
   const success = await call('novel_deai_review', { ...payload, presentationReviews: [response(required)], resolutions: { narration: '重新核对要求：留守的动作足以体现选择，无须增加心理独白。' } })
   assert.equal(success.status, 'recorded')
-  let meta = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
+  const { meta } = await loadBook(root)
   assert.equal((await stageContext(root, meta.chapters, '0001')).presentationReview.reviewed, 1)
   assert.match(meta.chapters[0].deaiReview.priorSceneBindings.first, /^[a-f0-9]{64}$/u)
   await fs.writeFile(path.join(root, 'beats.md'), plan.replace('他决定留在门边。', '他决定离开门边。'))
