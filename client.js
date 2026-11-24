@@ -310,6 +310,22 @@ window.__ModuleLoader__.load({
 }
 .nvl-card:hover { background: var(--dsw-alias-bg-layer-1); }
 .nvl-card-name { font-weight: 600; }
+.nvl-card-role {
+  display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px;
+  border: 1px solid var(--dsw-alias-border-l1); color: var(--dsw-alias-label-secondary);
+  font-size: 11px; font-weight: 500; vertical-align: middle;
+}
+.nvl-card-role[data-lead="true"] {
+  border-color: currentColor; color: var(--dsw-alias-brand-primary, #4d6bfe);
+  background: var(--dsw-alias-brand-primary-bg, rgba(77, 107, 254, 0.10));
+}
+.nvl-character-search { display: flex; gap: 6px; padding: 4px 12px; flex: none; }
+.nvl-character-head > .nvl-title { min-width: 0; overflow-wrap: anywhere; }
+.nvl-character-head > .nvl-back, .nvl-character-head > .nvl-meta { flex: none; white-space: nowrap; }
+.nvl-character-head .nvl-card-role { box-sizing: border-box; max-width: calc(100% - 6px); }
+.nvl-appearance-help { flex: none; }
+.nvl-appearance-help > summary { cursor: pointer; }
+.nvl-appearance-help > div { margin-top: 4px; }
 .nvl-card-sum { color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 1.5; }
 .nvl-card-meta { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .nvl-graph { padding: 8px 4px 12px; }
@@ -1681,6 +1697,16 @@ window.__ModuleLoader__.load({
     // 两种看法共用一份数据：`/novel-api/characters` 同时给卡片（列表）和有向关系
     // （关系图）。关系不是我猜的，是人物卡里「## 关系」下 `- 名字：说明` 的行。
 
+    const missingCharacterRole = '未设定位'
+
+    function isLeadRank(rank) {
+      return rank === 1 || rank === 2
+    }
+
+    function CharacterRole({ role, rank }) {
+      return h('span', { className: 'nvl-card-role', 'data-lead': isLeadRank(rank) }, role || missingCharacterRole)
+    }
+
     function CharacterDetail({ name, onBack }) {
       const [state, setState] = useState({ status: 'loading', content: '', chars: 0, error: null })
       const novel = useNovel(30000)
@@ -1689,7 +1715,7 @@ window.__ModuleLoader__.load({
         let alive = true
         getJson(`${API}/character?name=${encodeURIComponent(name)}`)
           .then(value => {
-            if (alive) setState({ status: 'ready', content: value.content ?? '', chars: value.chars ?? 0, error: null })
+            if (alive) setState({ status: 'ready', content: value.content ?? '', role: value.role, rank: value.rank, chars: value.chars ?? 0, error: null })
           })
           .catch(error => {
             if (alive) setState({ status: 'error', content: '', chars: 0, error: error.message })
@@ -1704,9 +1730,9 @@ window.__ModuleLoader__.load({
         { className: 'nvl-reader' },
         h(
           'div',
-          { className: 'nvl-reader-head' },
+          { className: 'nvl-reader-head nvl-character-head' },
           h('button', { type: 'button', className: 'nvl-back', onClick: onBack }, '← 人物'),
-          h('span', { className: 'nvl-title' }, name),
+          h('span', { className: 'nvl-title' }, name, state.status === 'ready' ? h(CharacterRole, { role: state.role, rank: state.rank }) : null),
           h('span', { className: 'nvl-meta' }, `${state.chars} 字`),
         ),
         h(
@@ -1870,11 +1896,22 @@ window.__ModuleLoader__.load({
       const novel = useNovel(30000)
       const [mode, setMode] = useState('list')
       const [openName, setOpenName] = useState(null)
+      const [search, setSearch] = useState('')
+      const [roleFilter, setRoleFilter] = useState('')
 
       useBackStep(Boolean(openName), () => setOpenName(null))
       if (openName) return h(CharacterDetail, { name: openName, onBack: () => setOpenName(null) })
 
-      const cards = (data && data.characters) || []
+      const cards = [...(data?.characters || [])].sort((left, right) => (left.rank ?? 9) - (right.rank ?? 9))
+      const hasLead = cards.some(card => isLeadRank(card.rank))
+      const showListControls = mode === 'list' && cards.length > 0
+      const query = search.trim().toLowerCase()
+      const visibleCards = cards.filter(card => {
+        if (roleFilter === 'lead' && !isLeadRank(card.rank)) return false
+        if (roleFilter === 'missing' && card.role) return false
+        return !query || [card.name, card.id, card.role || missingCharacterRole, ...(card.aliases || [])]
+          .some(value => value?.toLowerCase().includes(query))
+      })
       const appearance = (data && data.appearance) || {}
       const graph = (data && data.graph) || { nodes: [], edges: [] }
 
@@ -1930,25 +1967,43 @@ window.__ModuleLoader__.load({
           ),
           h(CharacterGraph, { graph, onOpen: setOpenName }),
         )
+      } else if (!visibleCards.length) {
+        body = h('div', { className: 'nvl-empty', role: 'status' }, '没有匹配的人物')
       } else {
         body = h(
           'div',
           { className: 'nvl-body' },
-          ...cards.map(card =>
-            h(
+          ...visibleCards.map(card => {
+            const current = stateAt(card, upto)
+            const report = appearance[card.name]
+            return h(
               'button',
               { key: card.name, type: 'button', className: 'nvl-card', onClick: () => setOpenName(card.name) },
-              h('span', { className: 'nvl-card-name' }, card.name, stateAt(card, upto) && stateAt(card, upto).dead ? h('span', { className: 'nvl-card-dead' }, '殁') : null, appearance[card.name]?.due ? h('span', { className: 'nvl-card-due', title: appearance[card.name].last ? `上次可核实出场 ${appearance[card.name].last}，之后经过 ${appearance[card.name].gap} 个已写章（每 ${appearance[card.name].cadence} 章一次）` : `截至 ${appearance[card.name].cutoff} 无核实出场依据（每 ${appearance[card.name].cadence} 章一次）` }, '欠场') : null),
-              h('span', { className: 'nvl-card-sum' }, card.summary || '（没有摘要）'),
+              h(
+                'span',
+                { className: 'nvl-card-name' },
+                card.name,
+                h(CharacterRole, { role: card.role, rank: card.rank }),
+                current?.dead ? h('span', { className: 'nvl-card-dead' }, '殁') : null,
+                report?.due
+                  ? h('span', {
+                      className: 'nvl-card-due',
+                      title: report.last
+                        ? `上次可核实出场 ${report.last}，之后经过 ${report.gap} 个已写章（每 ${report.cadence} 章一次）`
+                        : `截至 ${report.cutoff} 无核实出场依据（每 ${report.cadence} 章一次）`,
+                    }, '欠场')
+                  : null,
+              ),
+              card.summary ? h('span', { className: 'nvl-card-sum' }, card.summary) : null,
               h(
                 'span',
                 { className: 'nvl-card-meta' },
                 `${card.chars} 字${card.relations && card.relations.length ? ` · 关系 ${card.relations.length}` : ''}` +
-                  (appearance[card.name]?.candidateLast ? ` · ${appearance[card.name].candidateLast} 有字面候选` : '') +
-                  (appearance[card.name]?.last ? ` · 核实 ${appearance[card.name].last}` : ''),
+                  (report?.candidateLast ? ` · ${report.candidateLast} 有字面候选` : '') +
+                  (report?.last ? ` · 核实 ${report.last}` : ''),
               ),
-            ),
-          ),
+            )
+          }),
         )
       }
 
@@ -1961,19 +2016,49 @@ window.__ModuleLoader__.load({
           h('select', { className: 'nvl-select', value: upto, onChange: event => setUpto(event.target.value), 'aria-label': '关系与人物戏份统计范围' },
             h('option', { value: '' }, '全部关系 / 最新已写章戏份'),
             (data?.chapterIds || []).map(id => h('option', { key: id, value: id }, `截至 ${id}`)))),
-        h('div', { className: 'nvl-hint' }, '核实出场只认当前正文仍有效的已确认「登场」记录；画像、转述外貌与章纲出场只是线索或计划，认知转述和姓名命中都不清零欠场。'),
+        h('details', { className: 'nvl-hint nvl-appearance-help' },
+          h('summary', null, '出场统计说明'),
+          h('div', null, '核实出场只认当前正文仍有效的已确认「登场」记录；画像、转述外貌与章纲出场只是线索或计划，认知转述和姓名命中都不清零欠场。')),
+        showListControls
+          ? h(
+              'div',
+              { className: 'nvl-character-search' },
+              h('input', {
+                type: 'search',
+                className: 'nvl-input',
+                value: search,
+                placeholder: '搜索姓名、别名、ID 或定位',
+                'aria-label': '搜索姓名、别名、ID 或定位',
+                onChange: event => setSearch(event.target.value),
+              }),
+              h('select', {
+                className: 'nvl-select',
+                value: roleFilter,
+                'aria-label': '按人物定位筛选',
+                onChange: event => setRoleFilter(event.target.value),
+              },
+              h('option', { value: '' }, '全部定位'),
+              h('option', { value: 'lead' }, '只看主角'),
+              h('option', { value: 'missing' }, '只看未设定位')),
+            )
+          : null,
+        showListControls && !hasLead
+          ? h('div', { className: 'nvl-hint' }, '人物卡尚未标记主角。可点下方「问 AI」对照总纲核对。')
+          : null,
         body,
         cards.length
           ? h(AskBar, {
               head: '人物讨论',
               book: novel && novel.data && novel.data.book ? novel.data.book.title : '',
-              context: `当前人物卡（名字｜摘要｜关系）：\n${cards
+              context: `当前人物卡（名字｜定位｜摘要｜关系）：\n${cards
                 .map(
                   card =>
-                    `${card.name}｜${card.summary || '（无摘要）'}｜${(card.relations || []).map(item => `${item.target}${item.label ? `(${item.label})` : ''}`).join('、') || '无'}`,
+                    `${card.name}｜${card.role || missingCharacterRole}｜${card.summary || '（无摘要）'}｜${(card.relations || []).map(item => `${item.target}${item.label ? `(${item.label})` : ''}`).join('、') || '无'}`,
                 )
                 .join('\n')}`,
-              fallback: '这套人物关系有什么问题？谁还缺动机、谁的戏被浪费了？',
+              fallback: hasLead
+                ? '这套人物关系有什么问题？谁还缺动机、谁的戏被浪费了？'
+                : '请读取总纲，核对谁是主角，并列出有明确依据、需要补填定位的人物卡，供我确认。',
               placeholder: '想问我什么？例如「老周这个角色是不是太工具」',
               hint: '带上人物清单发到主对话（Ctrl+Enter）',
             })

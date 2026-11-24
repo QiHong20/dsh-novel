@@ -20,8 +20,10 @@ import {
 } from './lib/beat-structure.js'
 import { extractIndexedParagraphs } from './lib/text.js'
 import { sceneCoverageProblem } from './lib/scene-review.js'
+import { cardIdentity } from './lib/character-card.js'
 
 export { APPEARANCE_FIELDS, CHAPTER_FIELDS, PSYCHOLOGY_FIELDS, ROLE_FIELDS, SCENE_FIELDS, hash, parseScenes }
+export { cardIdentity }
 export const BEAT_REQUEST_INVALID = 'BEAT_REQUEST_INVALID'
 export const HISTORY_REQUEST_INVALID = 'HISTORY_REQUEST_INVALID'
 export const HISTORY_SOURCE_CHANGED = 'HISTORY_SOURCE_CHANGED'
@@ -61,11 +63,6 @@ export function chapterOverview(text, chapter = '') {
     id: s.id, title: s.title, cast: s.cast, events: s.events, fields: s.fields,
     summary: ['冲突', '结果', '转折', '落点', '钩子'].filter(k => s.fields[k]).map(k => `${k}：${s.fields[k]}`).join('\n'),
   })), cast: [...new Set(scenes.flatMap(s => s.cast))], events: [...new Set(scenes.flatMap(s => s.events))] }
-}
-
-export function cardIdentity(text) {
-  const f = fields(text.split(/^## /m)[0])
-  return { id: f.ID || '', role: f.定位 || '', importance: f.重要程度 || '未设置' }
 }
 
 const pendingHistoryBinding = (record, reason, extra = {}) => ({

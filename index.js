@@ -31,7 +31,8 @@ import { CHAPTER_PREFLIGHT_PARAMETERS, chapterPreflightStatus, hasDraftProse, pr
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { cardIdentity, parseScenes, stageBook, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS, BEAT_REQUEST_INVALID, HISTORY_REQUEST_INVALID, HISTORY_SOURCE_CHANGED } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, deriveChapterStatus, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
-import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, matchesCharacterMention, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
+import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, parseCardHook, listCharacters, matchesCharacterMention, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
+import { rankForCardRole } from './lib/character-card.js'
 import { CHARACTERS_DIR } from './lib/book.js'
 import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
@@ -3213,7 +3214,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_outline',
-    description: '读或写这本书的总纲（工作区根目录的 outline.md）。不传 content 就是读取。',
+    description: '读或写这本书的总纲（工作区根目录的 outline.md）。不传 content 就是读取。生成总纲并建人物卡时，按总纲用 novel_card 为主角补齐「- 定位：主角 / 男主 / 女主」中的实际定位；有多位主角就分别填写。',
     parameters: {
       type: 'object',
       properties: { content: { type: 'string', description: '新的总纲全文；省略则只读取现有总纲' } },
@@ -3914,7 +3915,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_card',
-    description: '人物卡：name 读取；name+content 覆盖；不传参列出。顶部必填 - ID：稳定英文ID、- 定位：男主/女主/男二/女二/重要配角/反派等、- 重要程度：核心/重要/一般/临时。记录身份、长期目标、外貌锚点、性格（第一反应/底线）、说话习惯。作者秘密放 ## 作者侧秘密。人物 ID 不随姓名改变，出场与关系使用 ID 引用。动态认知、关系与成长用 novel_character_history 记录来源和生效场景，不用全局卡覆盖历史。格式参考 templates/character-card.md。' + PRESENTATION_RULES,
+    description: '人物卡：name 读取；name+content 覆盖；不传参列出。顶部必填 - ID：稳定英文ID、- 定位：主角/男主/女主/男二/女二/重要配角/反派等（按总纲填写）、- 重要程度：核心/重要/一般/临时。记录身份、长期目标、外貌锚点、性格（第一反应/底线）、说话习惯。作者秘密放 ## 作者侧秘密。人物 ID 不随姓名改变，出场与关系使用 ID 引用。动态认知、关系与成长用 novel_character_history 记录来源和生效场景，不用全局卡覆盖历史。格式参考 templates/character-card.md。' + PRESENTATION_RULES,
     parameters: {
       type: 'object',
       properties: {
@@ -3940,7 +3941,7 @@ export function apply(ctx, config) {
         if (value.mode === 'list') {
           return textRender(
             value.characters.length
-              ? `人物卡 ${value.characters.length} 张：\n` + value.characters.map(item => `- ${item.name}：${item.summary || '（无简介）'}`).join('\n')
+              ? `人物卡 ${value.characters.length} 张：\n` + value.characters.map(item => `- ${item.name}（${item.role || '未设定位'}）：${item.summary || '（无简介）'}`).join('\n')
               : '（还没有人物卡。写一张：novel_card({ name: "林小满", content: "# 林小满\\n..." })）',
           )
         }
@@ -6012,7 +6013,14 @@ export function apply(ctx, config) {
                 sendJson(res, 404, { error: 'no such character' })
                 return
               }
-              sendJson(res, 200, { name: url.searchParams.get('name'), ...cardIdentity(content), chars: countChars(content), content })
+              const identity = cardIdentity(content)
+              sendJson(res, 200, {
+                name: url.searchParams.get('name'),
+                ...identity,
+                rank: rankForCardRole(identity.role),
+                chars: countChars(content),
+                content,
+              })
               return
             }
             if (route === '/settings') {
