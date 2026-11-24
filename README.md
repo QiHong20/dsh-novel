@@ -381,7 +381,7 @@ novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<�
 
 ### 资料范围筛选（更新）
 
-`novel_material_scope` 提供 inspect → propose → confirm/revoke，针对人物卡和设定的全部非空原文行登记 stable/fact/knowledge/plan/private，按 from/until 故事时间、reveal 叙述顺序、observer 视角执行确定性筛选。候选不生效；原文或范围场景变化后失效。完整包不装入未标注自由文本，并报告缺项；目前须指定单场景，整章多场不合并权限。
+`novel_material_scope` 提供 inspect → propose → confirm/revoke，针对人物卡和设定的全部非空原文行登记 stable/fact/knowledge/plan/private，按 from/until 故事时间、reveal 叙述顺序、observer 视角执行确定性筛选。候选不生效；原文或范围场景变化后失效。完整包不装入未标注自由文本，并报告缺项；整章完整包以本章首场为“章首”边界装配，不合并后续场景权限。
 
 独立包状态改为三项分别展示：materialCoverage、boundaryCoverage、independentReview。语义审核仅返回 semanticSupported，不能再使 selfContained=true；因其他来源尚未全部纳入范围协议，当前 selfContained 保持 false。此前关于仅五项审核即可独立认证的说明以此为准。
 

@@ -3844,7 +3844,9 @@ export function apply(ctx, config) {
         prior = priorContext(boundaryBook, stage.scenes, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
         presentationSources = prior.excerpts
         missingMaterials.push(...prior.missing)
-        const target = selectedScene || (stage.scenes.length === 1 ? stage.scenes[0] : null)
+        // 整章完整包没有单场景边界时，用本章首场作为“章首”边界：只装入写本章开头前读者已可见的范围，
+        // 不把后续场景的 reveal/from 权限合并进来。多场章因此也能取完整包，权限仍按场保守截断。
+        const target = selectedScene || stage.scenes[0] || null
         for (const [folder, rows] of [['characters', characters], ['settings', settings]]) {
           for (const row of rows) {
             const source = `${folder}/${row.name}.md`
