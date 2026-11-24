@@ -372,9 +372,10 @@ test('书目只保存审稿引用，复核文件缺失或损坏时本章待复�
   const raw = JSON.parse(await fs.readFile(bookFile, 'utf8'))
   const chapter = raw.chapters[0]
   assert.equal(chapter.deaiReview, undefined)
-  assert.match(chapter.deaiReviewRef, /^deai-reviews\/[a-f0-9]{64}\.json$/u)
-  const reviewFile = path.join(current.root, chapter.deaiReviewRef)
+  assert.equal(chapter.deaiReviewRef.file, 'deai-reviews/0001-review-001.json')
+  const reviewFile = path.join(current.root, chapter.deaiReviewRef.file)
   const reviewText = await fs.readFile(reviewFile, 'utf8')
+  assert.equal(chapter.deaiReviewRef.sha256, createHash('sha256').update(reviewText).digest('hex'))
   assert.equal(JSON.parse(reviewText).status, 'recorded')
 
   await fs.writeFile(reviewFile, '损坏的复核文件')
@@ -382,9 +383,13 @@ test('书目只保存审稿引用，复核文件缺失或损坏时本章待复�
   await fs.unlink(reviewFile)
   await assertCurrentState(current, 'draft', 'pending')
   await current.call('novel_book', { title: '更名后' })
-  assert.equal(JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef, chapter.deaiReviewRef)
+  assert.deepEqual(JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef, chapter.deaiReviewRef)
   await fs.writeFile(reviewFile, reviewText)
   await assertCurrentState(current, 'final', 'recorded')
+  const blocked = conflictReview()
+  await registerReview(current.call, blocked.checks, { observations: blocked.observations })
+  assert.equal(JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef.file, 'deai-reviews/0001-review-002.json')
+  assert.equal(await fs.readFile(reviewFile, 'utf8'), reviewText)
 })
 
 test('新版审稿详情写入失败时保留旧书目和引用', async t => {
