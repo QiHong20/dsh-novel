@@ -353,3 +353,26 @@ chapters/0001.md   正文，一章一个文件
 作者明确要求本场必须体现的内容写在人物块「必须表现」；普通「心理内容」「描写重点」仍为可选表现建议，不要求增加独白或外貌扫描。「仅作者参考」、限知视角以及禁止提前兑现属于边界。
 
 写后读取 novel_deai_pack 的 presentationRequirements。对 required=true 的每一项提交 presentationReviews：原样带回 id/fingerprint，填写 verdict（supported/conflict/uncertain/not-applicable）、detail、counterargument 和本 sceneId 正文范围内的逐字 evidence。缺少必答项或跨场引文不能登记。必要项的 conflict/uncertain 阻塞定稿，即使六维 checks 都写 supported；不适用也必须有正文依据与具体解释。可选建议可以省略，不以清零为目标。正文或场景要求改变后重取包复核；工具只验证覆盖、引用和版本，不认证文学判断正确。
+
+
+## 独立完整包核对
+
+`ready` 只表示预算等装配条件通过，不表示资料充分。要声明完整包可独立写作，先以 full:true 取包并阅读全部材料，解决 missingMaterials 的硬缺项，再调用 novel_context_review。保持 chapter/scene/mode/budget 与取包一致，提交 packHash 及 checks 的 dependencies/timeline/knowledge/revelation/continuity，每项填写 verdict/detail/counterargument/quotes（包内逐字引文）。未核实项填 uncertain，有矛盾填 conflict，不以凑齐字段替代实际核对。
+
+工具重新装配验证包版本，冻结核对过的原文。重取同一包会返回 independentReview；selfContained=true 仅表示核对者已对该精确包登记全部 supported，不是工具自动认证语义正确。任何包内容变化都需要重新核对。完整包的核对不代替正文生成前的剧情预检或写后的审稿定稿流程。当前核对入口支持整章续写、整章改写和场景续写；局部改写包暂不提供独立认证入口。
+
+
+## 人物卡与设定范围整理（更新独立包语义）
+
+新增 novel_material_scope。inspect 指定 source（characters/名称.md 或 settings/名称.md），返回全部非空行与 sourceHash。按原文提出 entries：line/quote/reason，kind 为 stable 稳定资料、fact 已发生事实、knowledge 特定人物认知、plan 场景计划、private 不发给写作模型。非 private 条目明确 reveal（允许读者看到的场景）；fact/knowledge/plan 必须 from，知识另填 observer；until 为可选结束场景。同一行混合不同范围，先通过已有资料编辑工具拆行，不猜测。propose 覆盖全部非空行后，在已授权核对流程中 confirm。原文或场景时间／顺序变化会使标注失效。
+
+完整模式只装入已确认且目标位置允许的原文行，未标注资料直接留空并报缺项。现阶段按单场景（或仅一场的章节）使用；整章多场不混装不同时间权限。事实和认知只继承严格更早的故事时间，计划只用于指定场景且明确标注非事实。
+
+前述 selfContained=true 的语义已废止：语义核对通过仅表示 semanticSupported，不代替材料覆盖与边界覆盖。当前章纲、前文等来源尚未统一标注，全包 selfContained 保持 false。分别检查 materialCoverage、boundaryCoverage 与 independentReview。
+
+
+## 完整包的前文边界
+
+完整模式的相邻承接与人物姓名命中片段统一按正文分场筛选。只有正文哈希仍有效、覆盖完整、稳定 sceneId 及场景版本绑定均有效，而且故事时间严格早于所有目标场景的前文可以进入。来源段落保留完整，不跨场拼接；同章已写前场可承接，目标场和后场排除。
+
+旧复核没有 priorSceneBindings 时，先重新读取审稿包、核对并登记复核，不手填哈希伪造审核。若紧邻前场的故事时间不早于目标，完整包会排除并说明，不用其他场景冒充紧邻结尾。引文只证明此前正文写过，段内传闻、回忆、预告及其他人物的内心不自动成为目标人物已知；认知仍走人物历史。普通模式保持工具辅助检索，不能当作已隔离包。

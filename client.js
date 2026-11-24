@@ -2312,7 +2312,8 @@ window.__ModuleLoader__.load({
                 ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(retryBudget) }, `按最低预算 ${retryBudget} 重试`)
                 : null,
             value.missingRequired?.length ? h('p', { role: 'alert', className: 'nvl-err' }, `缺少必选文风：${value.missingRequired.map(item => item.label).join('、')}`) : null,
-            full ? h('p', { className: 'nvl-hint' }, value.selfContained ? '已满足独立生成检查' : '已选材料完整不等于资料齐全；以下缺项需核对后再写作。') : null,
+            full ? h('p', { className: 'nvl-hint' }, value.selfContained ? '当前包已登记独立使用核对（不代表自动语义认证）' : '已选材料完整不等于资料齐全；以下缺项需核对后再写作。') : null,
+            full && value.boundaryCoverage ? h('p', { className: 'nvl-hint' }, `材料覆盖：${value.materialCoverage || '待核对'}；人物／设定边界：${value.boundaryCoverage.authorMaterials}；前文边界：${value.boundaryCoverage.priorProse || '待核对'}；全包边界：${value.boundaryCoverage.package}；语义核对：${value.independentReview?.status || 'unreviewed'}`) : null,
             ...(value.missingMaterials || []).map((item, i) => h('p', { key: `material-${i}`, className: 'nvl-hint' }, item)),
             value.ledgerScope?.mode === 'historical' ? h('p', { className: 'nvl-hint' }, `旧章台账历史值缺失 ${value.ledgerMissing?.length || 0} 项；当前值未装配。`) : null,
             notice?.key === key ? h('p', { role: 'status', className: 'nvl-hint', 'data-tone': notice.ok ? 'ok' : 'err' }, notice.text) : null,

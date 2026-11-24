@@ -372,3 +372,18 @@ novel_write({ chapter: '0001', mode: 'patch', start: 0, end: 1000, baseHash: '<�
 
 
 完整模式支持显式设定依赖：场景写 `- 所需设定：设定名`，人物卡或设定写 `- 依赖设定：设定甲、设定乙`，递归补齐并报告缺失。完整模式载入全文风卡，隐藏标题明确标注的作者秘密和未来计划小节，并以本场边界代替跨章事件终局。`coverage` 和网页列出资料缺项；`selfContained` 仍保守为 false，未标记自由文本的时间边界尚不能自动认证。
+
+
+### 完整包独立使用核对
+
+新增 `novel_context_review`：针对 full:true 的精确包，逐项登记依赖、时间、认知、揭示和承接的有据判断。结构／资料硬缺项不可豁免；自由文本时间边界需人工或 AI 有据复核。提交当前 packHash 和五项 checks，工具重新取包核验并冻结文本；全部 supported 后，同包的 `independentReview.status` 为 reviewed、`selfContained` 为 true，但 `certifiesSemantics` 始终为 false。包内容变化后旧记录不适用；conflict/uncertain 返回 blocked。取包与核对需保持相同参数及执行上下文。
+
+
+### 资料范围筛选（更新）
+
+`novel_material_scope` 提供 inspect → propose → confirm/revoke，针对人物卡和设定的全部非空原文行登记 stable/fact/knowledge/plan/private，按 from/until 故事时间、reveal 叙述顺序、observer 视角执行确定性筛选。候选不生效；原文或范围场景变化后失效。完整包不装入未标注自由文本，并报告缺项；目前须指定单场景，整章多场不合并权限。
+
+独立包状态改为三项分别展示：materialCoverage、boundaryCoverage、independentReview。语义审核仅返回 semanticSupported，不能再使 selfContained=true；因其他来源尚未全部纳入范围协议，当前 selfContained 保持 false。此前关于仅五项审核即可独立认证的说明以此为准。
+
+
+完整包的前文现在统一经过分场与时序筛选，覆盖相邻场景结尾和人物姓名片段。正文复核登记保存 priorSceneBindings；正文／场景改动、缺少可靠分场或旧记录无绑定时，前文排除并列缺项。倒叙排除故事未来场景，同章已写前场可承接；保留完整段落，不用截断片段证明事实。boundaryCoverage.priorProse 显示筛选状态，这不认证段内传闻或预告的事实性，也不代表人物知道引文中的内容。

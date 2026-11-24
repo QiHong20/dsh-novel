@@ -1,3 +1,6 @@
+import { priorContext } from './lib/prior-context.js'
+import { manageMaterialScope, materialScopeParameters, scopedMaterial } from './lib/material-scope.js'
+import { CONTEXT_REVIEW_CHECKS, recordContextReview, contextReviewStatus } from './lib/context-review.js'
 import { settingDependencies, resolveSettingDependencies, scopedAuthorMaterial, coverageReport } from './lib/context-coverage.js'
 import { presentationRequirements, validatePresentationReviews } from './lib/presentation-review.js'
 import { manageBeatStorage } from './lib/beat-storage.js'
@@ -26,7 +29,7 @@ import { presentationContext, selectPresentationExcerpts, renderPresentationExce
 import { grill, renderGrill, GRILL_PARAMETERS } from './lib/grill.js'
 import { CHAPTER_PREFLIGHT_PARAMETERS, chapterPreflightStatus, hasDraftProse, preflightChapter, runChapterPreflight } from './lib/chapter-preflight.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { cardIdentity, parseScenes, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS, BEAT_REQUEST_INVALID, HISTORY_REQUEST_INVALID, HISTORY_SOURCE_CHANGED } from './stage.js'
+import { cardIdentity, parseScenes, stageBook, stageContext, updateHistory, historyParameters, moveScene, chapterOverview, editStageFields, PRESENTATION_RULES, presentationChecks, ROLE_FIELDS, SCENE_FIELDS, CHAPTER_FIELDS, BEAT_REQUEST_INVALID, HISTORY_REQUEST_INVALID, HISTORY_SOURCE_CHANGED } from './stage.js'
 import { BOOK_FILE, CHAPTERS_DIR, DEFAULT_CHAPTER_TARGET, clampInt, readText, readJson, writeFileAtomic, writeJson, normalizeFile, CHAPTER_STATUS, normalizeChapter, loadBook, chapterStats, deriveChapterStatus, persistBook, findChapter, chapterNumberOf, nextChapterId } from './lib/book.js'
 import { safeCharacterName, STATE_CODES, parseStates, stateAt, appearanceIndex, appearanceReport, ROLE_RANK, parseCardRole, cardRank, parseCardHook, listCharacters, matchesCharacterMention, parseRelations, characterGraph, readCharacter, writeCharacter, parseCardAliases } from './lib/people.js'
 import { CHARACTERS_DIR } from './lib/book.js'
@@ -1530,7 +1533,8 @@ function assembleNovelContext(value, budget) {
   add('presentationExcerpts', '人物与情绪承接原文候选', value.presentationExcerpts || '')
   value.settings.forEach((item, i) => add(`setting-${i}`, `设定：${item.name}`, item.content))
   value.spine.forEach((item, i) => add(`event-${i}`, `事件：${item.id} ${item.title}`, `因为：${item.because}\n所以：${item.so}`))
-  add('prevTail', '上一章结尾（节选）', value.prevTail.text)
+  add('prevTail', value.priorScope ? '已核实时间边界的前场承接（不等于人物已知）' : '上一章结尾（节选）', value.prevTail.text)
+  if (value.priorScope) add('priorScope', '前文适用范围', value.priorScope.policy + '\n' + value.priorScope.excluded.map(item => `${item.chapter}/${item.scene}：${item.reason}`).join('\n'), true)
   add('outline', '大纲参考（节选）', value.outline)
   if (value.ledgerScope?.mode === 'historical') {
     const gaps = (value.ledgerMissing ?? []).slice(0, 20).map(item => `- [${item.category}] ${item.item}${item.lastDeclaredChapter ? `（当前快照声明最近变更 @${item.lastDeclaredChapter}，不代表保存了旧值）` : ''}`)
@@ -3460,6 +3464,34 @@ export function apply(ctx, config) {
   })
 
   registerTool({
+    name: 'novel_material_scope',
+    description: '资料范围整理：inspect 读取人物卡／设定的逐行原文和 sourceHash；propose 按全部非空行提交 entries，kind=stable/fact/knowledge/plan/private，from/until 为故事生效场景，reveal 为允许读者看到的场景，knowledge 另需 observer，reason 说明依据。同一行混合不同范围先编辑拆行。confirm 在作者授权核对流程中确认当前候选；revoke 撤销。修改原文或时间边界后失效。完整包只使用已确认范围；不猜测旧资料的时间。',
+    parameters: materialScopeParameters,
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: args => manageMaterialScope(rootNow(), args),
+    presentCall: args => ({ card: 'generic', title: '资料范围整理', kind: !args.action || args.action === 'inspect' ? 'read' : 'write', rawInput: args }),
+  })
+
+  registerTool({
+    name: 'novel_context_review',
+    description: '对完整装配包登记独立使用核对。先取得 novel_context full:true 的 packHash，检查 dependencies（依赖齐全）、timeline（目标时间）、knowledge（人物认知）、revelation（揭示权限）、continuity（承接）。逐项提交 verdict/detail/counterargument/quotes，quotes 为包内逐字证据，不能把无检测告警当作通过。缺关键依据如实 conflict/uncertain。工具重取相同范围的完整包验证版本；结构和历史缺项不能靠声明绕过。通过后冻结包文本，表示核对者声明可独立使用，不认证语义正确。',
+    parameters: { type: 'object', additionalProperties: false, properties: {
+      chapter: { type: 'string' }, scene: { type: 'string' }, mode: { type: 'string', enum: ['continue', 'rewrite'] },
+      budget: { type: 'integer' }, packHash: { type: 'string' },
+      checks: { type: 'object', additionalProperties: false, properties: Object.fromEntries(CONTEXT_REVIEW_CHECKS.map(key => [key, {
+        type: 'object', additionalProperties: false, properties: { verdict: { type: 'string', enum: ['supported', 'conflict', 'uncertain'] }, detail: { type: 'string' }, counterargument: { type: 'string' }, quotes: { type: 'array', minItems: 1, items: { type: 'string' } } }, required: ['verdict', 'detail', 'counterargument', 'quotes'],
+      }])), required: CONTEXT_REVIEW_CHECKS },
+    }, required: ['chapter', 'packHash', 'checks'] },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: async (args, exec) => {
+      const { chapter, scene, mode, budget } = args
+      const pack = await toolDefs.get('novel_context').execute({ chapter, scene, mode, budget, full: true }, exec)
+      return recordContextReview(rootNow(), pack, args)
+    },
+    presentCall: args => ({ card: 'generic', title: '完整包独立使用核对', kind: 'write', rawInput: args }),
+  })
+
+  registerTool({
     name: 'novel_state_history',
     description: '通用世界状态历史。entity 注册非人物实体（entity/name/type）；人物沿用人物卡 ID。propose 提交 entity/property/value/scene/trigger/evidenceIndex/evidence，可带单位 unit、前置记录 previous、本场事件 event。属性由作品定义，无题材内置字段。仅接受同版本正文分场证据，候选不自动成为事实。confirm 在已获作者授权的核对流程中确认 id；revoke 撤销；inspect 查看失效原因。人物已知、误信和关系仍用 novel_character_history，不以世界事实代替认知。数值仅存储，不自动推算或换算。',
     parameters: stateParameters,
@@ -3678,7 +3710,7 @@ export function apply(ctx, config) {
       const cards = await listCharacters(rootNow())
       const picked = []
       for (const card of cards) {
-        if (matchesCharacterMention(prevTailText, card) || matchesCharacterMention(sceneText, card)) picked.push(card)
+        if (matchesCharacterMention(args.full ? '' : prevTailText, card) || matchesCharacterMention(sceneText, card)) picked.push(card)
       }
       for (const card of cards) {
         if (picked.length >= 3) break
@@ -3737,7 +3769,7 @@ export function apply(ctx, config) {
       const settingItems = await listSettings(rootNow())
       const settingHits = []
       for (const item of settingItems) {
-        if (matchesSettingMention(prevTailText, item.name) || matchesSettingMention(sceneText, item.name)) settingHits.push(item)
+        if (matchesSettingMention(args.full ? '' : prevTailText, item.name) || matchesSettingMention(sceneText, item.name)) settingHits.push(item)
       }
       const explicitSettings = settingDependencies(beatsText + '\n' + characters.map(c => c.content).join('\n'))
       const dependencies = await resolveSettingDependencies([...explicitSettings, ...settingHits.map(item => item.name)], settingItems, name => readSetting(rootNow(), name))
@@ -3791,7 +3823,7 @@ export function apply(ctx, config) {
       for (const chapter of chapters.slice(0, index)) {
         if (chapter.chars > 0) priorTexts.push({ id: chapter.id, title: chapter.title, text: (await readText(path.join(rootNow(), chapter.file))) ?? '' })
       }
-      const presentationSources = selectPresentationExcerpts(priorTexts, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
+      let presentationSources = selectPresentationExcerpts(priorTexts, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
       const preflight = await materialPreflight(rootNow(), current, { chapters: [...meta.chapters.filter(item => item.id !== current.id), current], beatsText, styleName, styleText: styleRaw ?? '' })
       if (chapterPreflight?.status === 'ready') {
         const latest = await chapterPreflightStatus(rootNow(), (await loadBook(rootNow())).meta, preflightTarget, false)
@@ -3801,7 +3833,29 @@ export function apply(ctx, config) {
       for (const view of states.views) {
         if (view.conflicts.length || view.invalid.length || view.missingEntities.length) missingMaterials.push(`${view.scene}：状态冲突、失效或实体缺失，需核对`)
       }
-      const coverage = coverageReport({ missing: missingMaterials, stage, settings, characters, historical: historicalLedger })
+      let prior = null
+      const materialBoundaries = []
+      if (args.full === true) {
+        const boundaryBook = await stageBook(rootNow(), index < chapters.length ? meta.chapters : [...meta.chapters, current])
+        prior = priorContext(boundaryBook, stage.scenes, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
+        presentationSources = prior.excerpts
+        missingMaterials.push(...prior.missing)
+        const target = selectedScene || (stage.scenes.length === 1 ? stage.scenes[0] : null)
+        for (const [folder, rows] of [['characters', characters], ['settings', settings]]) {
+          for (const row of rows) {
+            const source = `${folder}/${row.name}.md`
+            const result = await scopedMaterial(rootNow(), source, boundaryBook, target)
+            row.content = result.text
+            materialBoundaries.push({ source, ...result, text: undefined })
+            if (result.missing) missingMaterials.push(result.missing)
+          }
+        }
+      }
+      const coverage = coverageReport({ missing: missingMaterials, stage, settings: args.full ? [] : settings, characters: args.full ? [] : characters, historical: historicalLedger })
+      const boundaryStatus = args.full && materialBoundaries.every(item => item.status === 'scoped') ? 'selected-author-materials-scoped' : 'incomplete'
+      // Other free-text sources still need their own scope protocol; do not certify the entire package.
+      const scopeStatus = { authorMaterials: boundaryStatus, priorProse: prior?.status || 'legacy-unfiltered', package: 'incomplete', unscopedSources: ['章纲计划', '前文段内传闻及预告', '文风样本', '伏笔及台账自由文本'] }
+
       if (args.full === true) {
         preflight.memo = { ...preflight.memo, selected: [], index: [], present: false }
         // Cross-chapter event summaries can reveal the final outcome. Scene boundaries replace them in offline packs.
@@ -3811,7 +3865,8 @@ export function apply(ctx, config) {
           event.so = bindings.map(scene => `${scene.id}：允许 ${scene.fields.本场允许结果 || '待核对'}；禁止 ${scene.fields.禁止提前兑现 || '不得推定终局'}`).join('；') || '结果边界未明确。'
         }
       }
-      return assembleNovelContext({
+      const assembled = assembleNovelContext({
+        scopeStatus, materialBoundaries, priorScope: prior,
         coverage,
         full: args.full === true,
         missingMaterials: coverage.missing,
@@ -3826,7 +3881,7 @@ export function apply(ctx, config) {
         states,
         spine,
         outline: outlinePart,
-        prevTail: prev ? { id: prev.id, title: prev.title, text: prevTailText } : { id: '', title: '', text: '' },
+        prevTail: prior ? prior.tail : prev ? { id: prev.id, title: prev.title, text: prevTailText } : { id: '', title: '', text: '' },
         characters,
         settings,
         ledger: ledgerRows,
@@ -3845,6 +3900,8 @@ export function apply(ctx, config) {
         materialPreflight: preflight,
         ...(chapterPreflight ? { chapterPreflight } : {}),
       }, budget)
+      const independentReview = await contextReviewStatus(rootNow(), assembled)
+      return { ...assembled, independentReview, selfContained: false, materialCoverage: coverage.status, boundaryCoverage: scopeStatus, semanticReview: independentReview.status, certifiesSemantics: false }
     },
     presentCall: args => ({ card: 'generic', title: '取上下文装配包', kind: 'read', rawInput: args }),
   })
@@ -4865,6 +4922,7 @@ export function apply(ctx, config) {
         checks,
         observations: observationsInput,
         presentationReviews,
+        priorSceneBindings: Object.fromEntries((beatBoard.section?.scenes || []).map(scene => [scene.id, createHash('sha256').update(scene.raw).digest('hex')])),
         sources: evidence.sources,
         evidenceContexts: evidence.contexts,
         timeBudgets,
@@ -5737,6 +5795,11 @@ export function apply(ctx, config) {
                   ready: value.ready,
                   selfContained: value.selfContained,
                   coverage: value.coverage,
+                  independentReview: value.independentReview,
+                  materialCoverage: value.materialCoverage,
+                  boundaryCoverage: value.boundaryCoverage,
+                  materialBoundaries: value.materialBoundaries,
+                  priorScope: value.priorScope,
                   missingMaterials: value.missingMaterials,
                   omitted: value.omitted,
                   packHash: value.packHash,

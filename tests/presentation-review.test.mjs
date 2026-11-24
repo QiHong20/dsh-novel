@@ -63,6 +63,7 @@ test('真实审稿工具要求逐项回执、阻塞定稿，并随章纲变化�
   assert.equal(success.status, 'recorded')
   let meta = JSON.parse(await fs.readFile(path.join(root, 'book.json'), 'utf8'))
   assert.equal((await stageContext(root, meta.chapters, '0001')).presentationReview.reviewed, 1)
+  assert.match(meta.chapters[0].deaiReview.priorSceneBindings.first, /^[a-f0-9]{64}$/u)
   await fs.writeFile(path.join(root, 'beats.md'), plan.replace('他决定留在门边。', '他决定离开门边。'))
   const check = await call('novel_check', { chapter: '0001' })
   assert.equal(check.deaiReview.status, 'pending')
