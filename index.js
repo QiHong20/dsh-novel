@@ -91,14 +91,18 @@ function toLosslessJson(value, seen = new WeakSet()) {
   }
   if (seen.has(value)) return null
   seen.add(value)
-  if (Array.isArray(value)) return value.map(item => toLosslessJson(item, seen))
-  const copy = {}
-  for (const [key, item] of Object.entries(value)) {
-    if (item === undefined) continue
-    copy[key] = toLosslessJson(item, seen)
+  // Track only the current ancestry: sibling references are shared data, not cycles.
+  try {
+    if (Array.isArray(value)) return value.map(item => toLosslessJson(item, seen))
+    const copy = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (item === undefined) continue
+      copy[key] = toLosslessJson(item, seen)
+    }
+    return copy
+  } finally {
+    seen.delete(value)
   }
-  seen.delete(value)
-  return copy
 }
 
 /** 一次调用作用域里的书根（工具/路由各自解析，互不串书）。 */
