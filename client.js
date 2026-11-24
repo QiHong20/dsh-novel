@@ -949,6 +949,26 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 写手子代理的模型选择（provider + model），存在本机 localStorage。 */
+    const WRITER_KEY = 'dsh-novel:writer'
+
+    function readWriter() {
+      try {
+        const raw = JSON.parse(window.localStorage.getItem(WRITER_KEY) || '{}')
+        return { provider: String(raw.provider || ''), model: String(raw.model || '') }
+      } catch (error) {
+        return { provider: '', model: '' }
+      }
+    }
+
+    function saveWriter(next) {
+      try {
+        window.localStorage.setItem(WRITER_KEY, JSON.stringify({ provider: next.provider, model: next.model }))
+      } catch (error) {
+        // 存不进去只是不记住，不影响本次派单
+      }
+    }
+
     /** 截断长文本：塞进输入框的内容不宜过长，上下文只带最相关的一段。 */
     function clipText(text, max) {
       const flat = String(text ?? '').trim()
@@ -2233,6 +2253,7 @@ window.__ModuleLoader__.load({
       const [scene, setScene] = useState(route.scene ?? '')
       const [budget, setBudget] = useState(0)
       const [full, setFull] = useState(false)
+      const [writer, setWriter] = useState(readWriter)
       const [session, setSession] = useState(currentSessionId)
       const [refresh, setRefresh] = useState(0)
       const [state, setState] = useState(null)
@@ -2277,6 +2298,35 @@ window.__ModuleLoader__.load({
         else if (how === 'copied') report('装配包和写作任务已复制，可粘贴到主对话')
         else report('无法写入输入框或复制，可在预览中手动选中文字', false)
       }
+      const delegate = async () => {
+        if (!ready || session !== currentSessionId) return
+        const provider = writer.provider.trim()
+        const model = writer.model.trim()
+        if (!provider || !model) {
+          report('先填写手模型：provider 和 model 都要填，例如 deepseek / deepseek-chat', false)
+          return
+        }
+        const chapterId = route.chapter
+        const task = [
+          '【写手子代理】请用 subagent 派一个单章写手，参数必须原样使用，不得替换、不得省略：',
+          '',
+          'subagent({',
+          `  provider: ${JSON.stringify(provider)},`,
+          `  model: ${JSON.stringify(model)},`,
+          '  prompt: "…下面这份装配包全文 + 本章写作硬规矩…"',
+          '})',
+          '',
+          '硬规矩：',
+          `- 子代理只写第 ${chapterId} 章，正文只通过 novel_write 落盘，不改其他任何文件；`,
+          `- 写完自己跑 novel_check({ chapter: ${JSON.stringify(chapterId)}, aiTone: true })；有 style-drift 就按 novel_context({ chapter, mode: "rewrite", pass: "deai" }) 返工一次，最多两次；`,
+          '- 子代理只返回 {chars, issues, questions}，不要回正文全文；正文由它自己 novel_write 落盘；',
+          `- 你不得替换 provider/model（当前 ${provider} / ${model}）；若宿主不支持 subagent，明确报告"未派单"，不要假装已派。`,
+        ].join('\n')
+        const how = await sendToComposer(`${value.text}\n\n${task}`)
+        if (how === 'composer') report(`已放入输入框：派 ${provider} / ${model} 写第 ${chapterId} 章，按回车发送`)
+        else if (how === 'copied') report('装配包与派单指令已复制到剪贴板')
+        else report('无法写入输入框或复制，可在预览中手动选中文字', false)
+      }
       const changeScope = setter => event => {
         setBudget(0)
         setter(event.target.value)
@@ -2311,6 +2361,26 @@ window.__ModuleLoader__.load({
             ) : value.minimumBudget <= 200000 && retryBudget > 0 && budget !== retryBudget
                 ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(retryBudget) }, `按最低预算 ${retryBudget} 重试`)
                 : null,
+            ready ? h('div', { className: 'nvl-beats-foot' },
+              h('span', { className: 'nvl-meta' }, '写手模型'),
+              h('input', {
+                className: 'nvl-input',
+                style: { maxWidth: '34%' },
+                placeholder: 'provider',
+                'aria-label': '子代理 provider',
+                value: writer.provider,
+                onChange: event => { const next = { ...writer, provider: event.target.value }; setWriter(next); saveWriter(next) },
+              }),
+              h('input', {
+                className: 'nvl-input',
+                style: { maxWidth: '34%' },
+                placeholder: 'model',
+                'aria-label': '子代理 model',
+                value: writer.model,
+                onChange: event => { const next = { ...writer, model: event.target.value }; setWriter(next); saveWriter(next) },
+              }),
+              h('button', { type: 'button', className: 'nvl-ghost', onClick: () => void delegate() }, '派子代理写'),
+            ) : null,
             value.missingRequired?.length ? h('p', { role: 'alert', className: 'nvl-err' }, `缺少必选文风：${value.missingRequired.map(item => item.label).join('、')}`) : null,
             full ? h('p', { className: 'nvl-hint' }, value.selfContained ? '当前包已登记独立使用核对（不代表自动语义认证）' : '已选材料完整不等于资料齐全；以下缺项需核对后再写作。') : null,
             full && value.boundaryCoverage ? h('p', { className: 'nvl-hint' }, `材料覆盖：${value.materialCoverage || '待核对'}；人物／设定边界：${value.boundaryCoverage.authorMaterials}；前文边界：${value.boundaryCoverage.priorProse || '待核对'}；全包边界：${value.boundaryCoverage.package}；语义核对：${value.independentReview?.status || 'unreviewed'}`) : null,
