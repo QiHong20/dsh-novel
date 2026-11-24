@@ -2337,7 +2337,7 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = useState('continue')
       const [scene, setScene] = useState(route.scene ?? '')
       const [budget, setBudget] = useState(0)
-      const [full, setFull] = useState(false)
+      const [full, setFull] = useState(true)
       const [writer, setWriter] = useState(readWriter)
       const [session, setSession] = useState(currentSessionId)
       const [refresh, setRefresh] = useState(0)
@@ -2563,6 +2563,16 @@ window.__ModuleLoader__.load({
                           h('p', { className: 'nvl-hint' }, '当前为简版章纲要点；开写前请用 novel_beats 展开为结构化场景（### 场景 英文ID：标题）。'))
                       : h('p', { className: 'nvl-hint' }, '暂无章纲，请用 novel_beats 创建结构化场景。'))
                   : null,
+                h('details', { className: 'nvl-outline-sec' },
+                  h('summary', null, `状态线 · 章纲计划 ${(board?.stateTimeline?.[chapter.id] || []).map(item => `${item.name} ${item.value ?? '待核对'}`).join(' · ')}`),
+                  h('p', { className: 'nvl-hint' }, '场景结束生效；无变化时承接前章。计划值不代表正文已确认。'),
+                  !(board?.stateTimeline?.[chapter.id]?.length) ? h('p', { className: 'nvl-hint' }, '尚无状态记录。在场景填写“状态对象”和“状态变化”，例如：国力 3210 → 3090。') : null,
+                  ...(board?.stateTimeline?.[chapter.id] || []).map(item => h('div', { key: item.id },
+                    h('strong', null, `${item.name}：${item.value ?? '待核对'}${item.inherited ? '（沿用前次记录）' : ''}`),
+                    ...((item.changes.length ? item.changes : [item]).map((change, i) => h('div', { key: i },
+                      h('p', null, change.inherited ? '' : change.source),
+                      change.warning ? h('p', { className: 'nvl-err' }, change.warning) : null,
+                      button(`${change.chapter} · ${change.title}`, { chapter: change.chapter, scene: change.scene, tab: 'scene' }))))))),
                 h('div', { className: 'nvl-beats-foot' },
                   ...(needsNormalization ? [] : [
                     button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),

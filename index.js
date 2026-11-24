@@ -1,4 +1,5 @@
 import { priorContext } from './lib/prior-context.js'
+import { stateTimeline } from './lib/state-timeline.js'
 import { manageMaterialScope, materialScopeParameters, scopedMaterial } from './lib/material-scope.js'
 import { CONTEXT_REVIEW_CHECKS, recordContextReview, contextReviewStatus } from './lib/context-review.js'
 import { settingDependencies, resolveSettingDependencies, scopedAuthorMaterial, coverageReport } from './lib/context-coverage.js'
@@ -5776,6 +5777,7 @@ export function apply(ctx, config) {
                 }
               })
               sendJson(res, 200, {
+                stateTimeline: stateTimeline(chapterMatches),
                 present: board.present,
                 chapter: chapter ? { id: chapter.id, title: chapter.title } : null,
                 text: board.section ? board.section.body : '',
