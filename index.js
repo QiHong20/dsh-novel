@@ -1,3 +1,7 @@
+import { settingDependencies, resolveSettingDependencies, scopedAuthorMaterial, coverageReport } from './lib/context-coverage.js'
+import { presentationRequirements, validatePresentationReviews } from './lib/presentation-review.js'
+import { manageBeatStorage } from './lib/beat-storage.js'
+import { updateState, stateParameters, stateContext } from './lib/state-history.js'
 /**
  * dsh-novel —— 小说助手 · 宿主半边（Node / Cordis 侧）
  *
@@ -1460,7 +1464,7 @@ function assembleNovelContext(value, budget) {
   const scope = value.rewriteScope
   const scene = value.scene
   const voiceRule = '人物的临场反应与对话应贴合各自人物卡的性格、认知与说话习惯，避免千人一面。外貌锚点按现场需要自然呈现，不要求初登场一次用齐。'
-  const instructions = rewrite
+  const instructions = value.full ? `按本包章纲、人物认知与文风交付${rewrite ? '改写稿' : '正文'}。只处理指定范围；不调用插件工具，不改写资料。缺少关键依据时列出缺项，不补造事实。参考篇幅不是上限。${voiceRule}` : rewrite
     ? scope.partial
       ? `局部改写：只修改给出的范围。先核对事实、人物动作、信息点，再调整文风与各角色声口。用 novel_write({chapter:"${value.chapter.id}",mode:"patch",baseHash:"${scope.baseHash}",start:${scope.start},end:${scope.end},content:"修改后的片段"}) 保存，其余正文由插件保留。${voiceRule}`
       : `整章改写：先逐项核对事实、人物动作和信息点全部保留，再检查文风与各角色声口。优先局部修订；整章覆盖使用 novel_write 的 mode:"replace"，并传 baseHash:"${scope.baseHash}"。${voiceRule}`
@@ -1497,6 +1501,7 @@ function assembleNovelContext(value, budget) {
   }
   add('beats', '本章剧情计划（不是既成事实，原句不要求照抄）', value.beats.text, true)
   add('stage', '场景人物认知与计划边界', value.stage?.text || '', true)
+  add('states', '通用状态历史与迁移边界', value.states?.text || '', true)
   const interiorLines = value.beats && Array.isArray(value.beats.interiors) ? value.beats.interiors : []
   if (interiorLines.length) add('interiors', '可选心理材料（遵守视角，不按数量填充）', interiorLines.map(item => item.text).join('\n') + '\n可用联想、短回忆或间接叙述；仅作者参考不得直接写入内心。只有明确指定的保留心声原句才需逐字保留。', true)
   const cognitionRows = value.beats && Array.isArray(value.beats.cognition) ? value.beats.cognition : []
@@ -1553,7 +1558,8 @@ function assembleNovelContext(value, budget) {
   const required = blocks.filter(item => item.required)
   const optional = blocks.filter(item => !item.required)
   const optionalLabels = optional.slice(0, 20).map(item => item.id + '=' + item.label)
-  const footer = (value.full ? '\n\n完整模式：所有已选材料均为必要块；预算不足将拒绝提供写作包。资料充分性仍须核对。' : '') + '\n\n必要装配清单：' + required.map(item => item.id + '=' + item.label).join('；') + '\n可选条目可能因总预算不足而省略；用 novel_read、novel_style、novel_card、novel_setting 等补读。' + (value.style.requiredText !== undefined ? '\n文风可选规则与锚点按完整条目取舍；未装配明细见 style.omitted，完整卡用 novel_style 读取。' : '') + (optionalLabels.length ? '\n可选装配项：' + optionalLabels.join('；') + (optional.length > optionalLabels.length ? `；另有 ${optional.length - optionalLabels.length} 项见元数据` : '') : '')
+  const toolFooter = (value.full ? '\n\n完整模式：所有已选材料均为必要块；预算不足将拒绝提供写作包。资料充分性仍须核对。' : '') + '\n\n必要装配清单：' + required.map(item => item.id + '=' + item.label).join('；') + '\n可选条目可能因总预算不足而省略；用 novel_read、novel_style、novel_card、novel_setting 等补读。' + (value.style.requiredText !== undefined ? '\n文风可选规则与锚点按完整条目取舍；未装配明细见 style.omitted，完整卡用 novel_style 读取。' : '') + (optionalLabels.length ? '\n可选装配项：' + optionalLabels.join('；') + (optional.length > optionalLabels.length ? `；另有 ${optional.length - optionalLabels.length} 项见元数据` : '') : '')
+  const footer = value.full ? '\n\n必要装配清单：' + required.map(item => item.id + '=' + item.label).join('；') + '\n本包不认证资料已经齐全。根据覆盖缺项判断能否起稿；缺失依据直接报告，不调用工具或编造。' : toolFooter
   // 预算数字本身也在提示中；求固定点，保证返回的 minimumBudget 可直接重试。
   let minimum = size([head, ...required.map(item => item.text)].join('\n\n') + footer)
   for (let index = 0; index < 8; index += 1) {
@@ -3445,6 +3451,24 @@ export function apply(ctx, config) {
   })
 
   registerTool({
+    name: 'novel_beats_storage',
+    description: '章纲存储：inspect 只读展示迁移清单和 baseHash；作者要求迁移后 migrate 携带 baseHash，将旧 beats.md 无损拆为 beats/章ID.md，保留备份。旧文件之后仅作备份，不参与读取。resume 恢复失败的多文件事务；恢复后重新读取再编辑。无需迁移也可继续使用单文件。',
+    parameters: { type: 'object', additionalProperties: false, properties: { action: { type: 'string', enum: ['inspect', 'migrate', 'resume'] }, baseHash: { type: 'string' } } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: args => manageBeatStorage(rootNow(), args),
+    presentCall: args => ({ card: 'generic', title: '章纲分章存储', kind: !args.action || args.action === 'inspect' ? 'read' : 'write', rawInput: args }),
+  })
+
+  registerTool({
+    name: 'novel_state_history',
+    description: '通用世界状态历史。entity 注册非人物实体（entity/name/type）；人物沿用人物卡 ID。propose 提交 entity/property/value/scene/trigger/evidenceIndex/evidence，可带单位 unit、前置记录 previous、本场事件 event。属性由作品定义，无题材内置字段。仅接受同版本正文分场证据，候选不自动成为事实。confirm 在已获作者授权的核对流程中确认 id；revoke 撤销；inspect 查看失效原因。人物已知、误信和关系仍用 novel_character_history，不以世界事实代替认知。数值仅存储，不自动推算或换算。',
+    parameters: stateParameters,
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textRender(JSON.stringify(value, null, 2)) },
+    execute: args => updateState(rootNow(), args),
+    presentCall: args => ({ card: 'generic', title: '通用状态历史', kind: !args.action || args.action === 'inspect' ? 'read' : 'write', rawInput: args }),
+  })
+
+  registerTool({
     name: 'novel_character_history',
     description: '人物认知与有向关系历史。inspect 查看；propose 提交正文提取候选（character/scene 为稳定 ID，evidenceIndex 必须取自当前 novel_deai_pack 的正文段号，evidence 为该段逐字引文；kind 为已知/未知/误信/怀疑/关系/状态/登场/呈现，content 为内容、source 为信息来源；关系必填 target，可给 event、supersedes）。kind=登场 只记录人物本人在场景中实际出场，必须提交 onStage: true；只写到画像、转述外貌、旧物或其他间接信息时用 kind=呈现。工具使用同版本全文分场核对引文的实际场景；无法可靠归属时只保存待核对 candidate。confirm 需 character+id，仅在 binding=bound 且作者确认或已授权核对流程后调用；revoke 撤销。计划不能直接确认为事实，正文、分场或章纲变化后需重新提取。',
     parameters: historyParameters,
@@ -3597,11 +3621,12 @@ export function apply(ctx, config) {
       const prevTailText = tail(prevText, Math.max(300, Math.min(6000, Math.round(budget * 0.15))))
 
       const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
-      const outlinePart = outlineExcerpt(outlineText, current, Math.max(200, Math.min(900, Math.round(budget * 0.35))))
+      const outlinePart = args.full === true ? '' : outlineExcerpt(outlineText, current, Math.max(200, Math.min(900, Math.round(budget * 0.35))))
 
       // 章纲优先：有这一章的 beats 就按清单配额给它，大纲退成背景参考。
       const beats = await readBeats(rootNow(), current, [...meta.chapters.filter(item => item.id !== current.id), current])
       const stage = await stageContext(rootNow(), index < chapters.length ? meta.chapters : [...meta.chapters, current], current.id, args.scene)
+      const states = await stateContext(rootNow(), index < chapters.length ? meta.chapters : [...meta.chapters, current], stage.scenes)
       const selectedScene = args.scene ? stage.scenes[0] : null
       const contextBeats = contextBeatScope(beats.section, selectedScene)
       const beatsText = contextBeats.text
@@ -3672,7 +3697,7 @@ export function apply(ctx, config) {
             role: card.role || '',
             rank: card.rank || 9,
             hook: card.hook || '',
-            content: '作者侧稳定设定（不等于人物当前已知；当前认知以场景历史为准）：\n' + content.trim(),
+            content: '作者侧稳定设定（不等于人物当前已知；当前认知以场景历史为准）：\n' + (args.full === true ? scopedAuthorMaterial(content).text : content).trim(),
           })
         }
       }
@@ -3714,16 +3739,11 @@ export function apply(ctx, config) {
       for (const item of settingItems) {
         if (matchesSettingMention(prevTailText, item.name) || matchesSettingMention(sceneText, item.name)) settingHits.push(item)
       }
-      const settings = []
-      const voided = []
-      for (const item of settingHits.slice(0, args.full === true ? undefined : 4)) {
-        const content = await readSetting(rootNow(), item.name)
-        if (content !== null && SETTING_VOID_RE.test(content)) {
-          voided.push(item.name)
-          continue
-        }
-        if (content !== null) settings.push({ name: item.name, category: item.category, content: content.trim() })
-      }
+      const explicitSettings = settingDependencies(beatsText + '\n' + characters.map(c => c.content).join('\n'))
+      const dependencies = await resolveSettingDependencies([...explicitSettings, ...settingHits.map(item => item.name)], settingItems, name => readSetting(rootNow(), name))
+      const voided = dependencies.rows.filter(item => SETTING_VOID_RE.test(item.content)).map(item => item.name)
+      const settings = dependencies.rows.filter(item => !voided.includes(item.name)).slice(0, args.full === true ? undefined : Math.max(4, explicitSettings.length))
+        .map(item => ({ ...item, content: args.full === true ? scopedAuthorMaterial(item.content).text : item.content }))
 
       // 设定是「当下用不到」的那一类，模型最容易把它写成 outline 里的散文。这里主动拦一道。
       const contextWarnings = []
@@ -3748,6 +3768,7 @@ export function apply(ctx, config) {
       })
       const sceneKinds = [...new Set(sceneStyles.flatMap(item => item.kinds))]
       const styleAssembly = assembleStylePrompt(styleRaw, styleBudget, sceneKinds, sceneStyles)
+      if (args.full === true && styleRaw) Object.assign(styleAssembly, { text: styleRaw, requiredText: styleRaw, hasOptional: false, omitted: [] })
       const styleText = styleAssembly.text
 
       // 改写模式要带回这一章现有的正文：没有它，「按文风重写」就变成「重新写一遍」。
@@ -3776,9 +3797,24 @@ export function apply(ctx, config) {
         const latest = await chapterPreflightStatus(rootNow(), (await loadBook(rootNow())).meta, preflightTarget, false)
         if (latest.status !== 'ready' || latest.preflightId !== chapterPreflight.preflightId) chapterPreflight = { status: 'stale' }
       }
+      const missingMaterials = [...threadScope.missing, ...dependencies.missing, ...voided.map(name => `依赖设定已作废：${name}`), ...ledgerMissing.map(item => `历史台账缺失：${item.item}`)]
+      for (const view of states.views) {
+        if (view.conflicts.length || view.invalid.length || view.missingEntities.length) missingMaterials.push(`${view.scene}：状态冲突、失效或实体缺失，需核对`)
+      }
+      const coverage = coverageReport({ missing: missingMaterials, stage, settings, characters, historical: historicalLedger })
+      if (args.full === true) {
+        preflight.memo = { ...preflight.memo, selected: [], index: [], present: false }
+        // Cross-chapter event summaries can reveal the final outcome. Scene boundaries replace them in offline packs.
+        for (const event of spine) {
+          const bindings = stage.scenes.filter(scene => scene.events.includes(event.id))
+          event.because = bindings.map(scene => `${scene.id}：${scene.fields.本场推进 || '推进范围待核对'}`).join('；') || '仅章级关联，尚未明确本场推进，不可自行兑现。'
+          event.so = bindings.map(scene => `${scene.id}：允许 ${scene.fields.本场允许结果 || '待核对'}；禁止 ${scene.fields.禁止提前兑现 || '不得推定终局'}`).join('；') || '结果边界未明确。'
+        }
+      }
       return assembleNovelContext({
+        coverage,
         full: args.full === true,
-        missingMaterials: [...threadScope.missing, ...ledgerMissing.map(item => `历史台账缺失：${item.item}`)],
+        missingMaterials: coverage.missing,
         chapter: { id: current.id, title: current.title, target: current.target ?? meta.targetChars, status: current.status },
         beats: contextBeats,
         scene: selectedScene ? { id: selectedScene.id, title: selectedScene.title, opening: beats.section?.scenes[0]?.id === selectedScene.id } : null,
@@ -3787,6 +3823,7 @@ export function apply(ctx, config) {
         presentationSources,
         presentationExcerpts: renderPresentationExcerpts(presentationSources),
         stage,
+        states,
         spine,
         outline: outlinePart,
         prevTail: prev ? { id: prev.id, title: prev.title, text: prevTailText } : { id: '', title: '', text: '' },
@@ -3802,7 +3839,7 @@ export function apply(ctx, config) {
         settingsCount: settingItems.length,
         warnings: [...contextWarnings, ...stage.warnings],
         pass: deai ? 'deai' : '',
-        rewriteRules: `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
+        rewriteRules: args.full === true ? '只交付正文和缺失依据；不调用插件工具，不自行修改资料。事实不足时明确报告，不编造前因。遵守人物认知、场景推进与文风约束。' : `${DEAI_RULES}\n\n${DEAI_WORKFLOW}`,
         aiTone: deai ? tone.signals : [],
         rewriteScope: selected.scope,
         materialPreflight: preflight,
@@ -4209,6 +4246,7 @@ export function apply(ctx, config) {
           ] : []),
         ]
         const semanticCount = value.issues.filter(item => item.kind.startsWith('semantic-') || item.kind === 'deai-review-pending').length
+        if (value.presentationProgress) reviewLines.push(`表现核对：明确要求 ${value.presentationProgress.required}；建议 ${value.presentationProgress.optional}；已核对 ${value.presentationProgress.reviewed}；待核对或过期 ${value.presentationProgress.pending}；冲突 ${value.presentationProgress.conflicts}；依据不足 ${value.presentationProgress.uncertain}`)
         if (value.presentationReview?.length) reviewLines.push(`人物表现审阅清单：${value.presentationReview.length} 条场景要求（见 presentationReview 明细）。这是审稿依据，不是已发现错误，不要求清零；已有审稿记录也不会删除章纲要求。`)
         if (value.historyCoverage?.length) {
           const first = value.historyCoverage.filter(item => item.status === 'no-prior-scene').length
@@ -4264,6 +4302,7 @@ export function apply(ctx, config) {
       if (chapter) {
         const stage = await stageContext(rootNow(), meta.chapters, chapter.id)
         report.presentationReview = stage.reviews
+      report.presentationProgress = stage.presentationReview
         report.issues.push(...stage.warnings.map(detail => ({ kind: 'stage-reference', detail })))
         report.historyCoverage = stage.scenes.flatMap(scene => scene.characters.filter(person => person.gap).map(person => ({
           scene: scene.id, character: person.id, name: person.name, status: person.historyStatus,
@@ -4537,6 +4576,7 @@ export function apply(ctx, config) {
         for (const item of value.settingReferences ?? []) lines.push(`- ${item.name}：${item.summary}`)
         if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
         lines.push('', '## 各维度 supported 所需来源（须在对应 checks 中引用）')
+        for (const item of value.presentationRequirements ?? []) lines.push(`人物与场景核对 [${item.required ? '必答' : '建议'}] ${item.id}；fingerprint=${item.fingerprint}：${item.detail}`)
         for (const item of value.sourceRequirements ?? []) lines.push(`- ${item.aspect}：${item.source}:${item.name}${item.anchor ? '，请引用同类场景的锚点原文' : ''}`)
         if (value.style.text) {
           lines.push('', `## 文风样本与约束：${value.style.name}（styleHash: ${value.style.hash}）`, value.style.text)
@@ -4569,6 +4609,7 @@ export function apply(ctx, config) {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
         beatsHash: beats.baseHash,
+        presentationRequirements: presentationRequirements(beats.section?.scenes),
         rules: `${DEAI_RULES}\n\n${SCENE_REVIEW_RULES}\n\n${REVIEW_EVIDENCE_RULES}\n\n${DEAI_WORKFLOW}`,
         style: { name: style.name, text: readStyleCalibration(style.text).content, hash: style.hash },
         dialogueContext: { beats: beats.section?.body ?? '' },
@@ -4582,7 +4623,7 @@ export function apply(ctx, config) {
 
   registerTool({
     name: 'novel_deai_review',
-    description: '登记有证据的审稿结果。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。scenes 按正文顺序连续覆盖全文；本章有结构化章纲时每场必须用 sceneId 声明该段对应的稳定场景 ID，不能按下标假定顺序，人物历史据此绑定场景。打脸场正文已自然体现反应时可在对应场景提交 reaction 及本场逐字证据，并带回 novel_deai_pack 的 beatsHash；整章汇总不能代替逐场确认。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。干净的 recorded 只开放显式定稿资格，不自动把 draft 提升为 final；正文、引用资料或启用文风变化后资格失效。启用文风时须把取包返回的 styleHash 一并提交，取包后换卡或切换文风会拒绝登记。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
+    description: '登记有证据的审稿结果。presentationReviews 必须覆盖审稿包 presentationRequirements 的全部 required 项（id/fingerprint/verdict/detail/evidence/counterargument）；引用对应场景正文。建议项可省略，必要项冲突或依据不足独立阻塞 final，不能用六维 supported 覆盖。checks 汇总六项判断；observations 逐条区分确定矛盾、缺失依据和非阻塞表达偏好，无发现填 []。确认矛盾须声明同一对象、属性与时间范围。证据支持 threads/events 并回显来源角色，历史备忘不自动覆盖正文。timeBudgets 只核算时间记账。scenes 按正文顺序连续覆盖全文；本章有结构化章纲时每场必须用 sceneId 声明该段对应的稳定场景 ID，不能按下标假定顺序，人物历史据此绑定场景。打脸场正文已自然体现反应时可在对应场景提交 reaction 及本场逐字证据，并带回 novel_deai_pack 的 beatsHash；整章汇总不能代替逐场确认。已登记矛盾或依据不足、明示超时或无效记账依据阻塞 final；估算和未知耗时本身不自动阻塞，即使 checks 写 supported 也不能覆盖；引用校验不证明推论正确。干净的 recorded 只开放显式定稿资格，不自动把 draft 提升为 final；正文、引用资料或启用文风变化后资格失效。启用文风时须把取包返回的 styleHash 一并提交，取包后换卡或切换文风会拒绝登记。字段很多时先把 checks/observations/timeBudgets/scenes/paragraphs 写成一个 JSON 对象文件，用 payloadFile 传入，避免单次调用过长被截断。',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -4590,7 +4631,7 @@ export function apply(ctx, config) {
         baseHash: { type: 'string', description: '当前 novel_deai_pack 返回的整章哈希，发现矛盾也可登记' },
         styleHash: { type: 'string', description: '当前 novel_deai_pack 返回的 style.hash（启用名称＋卡片正文的指纹）；启用文风时必填，防止取包后换卡或切换到同内容另一张卡仍按旧审稿登记' },
         beatsHash: { type: 'string', description: '提交 scenes[].reaction 时必填：当前 novel_deai_pack 的 beatsHash；章纲取包后变化会拒绝登记' },
-        payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段；顶层也可带 baseHash，直接参数缺省时采用文件里的值（chapter 仍要直接传）。' },
+        payloadFile: { type: 'string', minLength: 1, description: '可选：把 checks/observations/presentationReviews/timeBudgets/scenes/paragraphs/resolutions 写成一个 JSON 对象文件（绝对路径或书稿目录相对路径），本工具读取后按同一套规则校验。字段特别多时用它，避免单次工具调用过长被截断；直接传的字段优先于文件里的同名字段；顶层也可带 baseHash，直接参数缺省时采用文件里的值（chapter 仍要直接传）。' },
         checks: {
           type: 'object', additionalProperties: false,
           properties: Object.fromEntries(Object.entries(DEAI_REVIEW_ASPECTS).map(([key, description]) => [key, {
@@ -4608,6 +4649,15 @@ export function apply(ctx, config) {
         resolutions: {
           type: 'object', additionalProperties: false, description: '上次已登记的阻塞项本次转为 supported/not-applicable 时，必须按对应维度说明如何修复或为何更正判断；证据使用本次 checks 的引文，不能静默删除旧问题。',
           properties: Object.fromEntries(Object.keys(DEAI_REVIEW_ASPECTS).map(key => [key, { type: 'string', minLength: 1 }])),
+        },
+        presentationReviews: {
+          type: 'array', description: '逐项回应审稿包 presentationRequirements 中所有 required 项；建议可省略。必须引用对应场景正文，不适用也须说明依据；指纹照抄取包值。',
+          items: { type: 'object', additionalProperties: false, properties: {
+            id: { type: 'string' }, fingerprint: { type: 'string' },
+            verdict: { type: 'string', enum: ['supported', 'conflict', 'uncertain', 'not-applicable'] },
+            detail: { type: 'string', minLength: 1 }, counterargument: { type: 'string', minLength: 1 },
+            evidence: { type: 'array', minItems: 1, items: REVIEW_EVIDENCE_SCHEMA },
+          }, required: ['id', 'fingerprint', 'verdict', 'detail', 'counterargument', 'evidence'] },
         },
         observations: {
           type: 'array', description: '逐条分类审稿发现，无发现填 []。确定矛盾、依据不足、表达偏好不能混成一个标签；偏好不阻塞。checks 的 conflict/uncertain 必须有对应观察支持。',
@@ -4748,6 +4798,7 @@ export function apply(ctx, config) {
       const pick = key => (args[key] === undefined ? payload[key] : args[key])
       const checks = pick('checks')
       const observationsInput = pick('observations')
+      const presentationReviews = pick('presentationReviews') ?? []
       const timeBudgets = pick('timeBudgets')
       const scenes = pick('scenes')
       const paragraphs = pick('paragraphs')
@@ -4770,6 +4821,7 @@ export function apply(ctx, config) {
       const sceneIds = beatBoard.section?.scenes.map(item => item.id) ?? []
       const sceneProblem = sceneReviewProblem(scenes, packed.totalItems, sceneIds)
       if (sceneProblem) throw new Error(`场景复核未通过：${sceneProblem}；未登记`)
+      const presentation = validatePresentationReviews(presentationRequirements(beatBoard.section?.scenes), presentationReviews, scenes, packed.items)
       const reactions = sceneReactionReviews(scenes, beatBoard.section)
       if (reactions.length && (!submittedBeatsHash || submittedBeatsHash !== beatBoard.baseHash)) throw new Error('章纲在取包后已变化或未提交 beatsHash；请重新调用 novel_deai_pack 取包后登记反应判断；未登记')
       const observations = reviewObservations(observationsInput, checks)
@@ -4781,10 +4833,10 @@ export function apply(ctx, config) {
       }
       let timing = calculateReviewTimeBudgets(timeBudgets, packed, checks)
       const reactionEvidence = reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference })))
-      const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence, ...reactionEvidence])
+      const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence, ...reactionEvidence, ...presentation.evidence])
       timing = calculateReviewTimeBudgets(timeBudgets, packed, checks, evidence.contexts)
       const coverage = await reviewSourceCoverage(root, meta, raw, checks, style)
-      const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
+      const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings, ...presentation.findings]
       if (!hasCompleteParagraphReviews(paragraphs, packed.totalItems)) throw new Error('必须逐段覆盖当前版本全文并说明保留理由或待解决问题，不能遗漏或重复；未登记')
       const byIndex = new Map(paragraphs.map(item => [item.index, item]))
       for (const item of packed.items) {
@@ -4812,6 +4864,7 @@ export function apply(ctx, config) {
         certifiesSemantics: false,
         checks,
         observations: observationsInput,
+        presentationReviews,
         sources: evidence.sources,
         evidenceContexts: evidence.contexts,
         timeBudgets,
@@ -5683,6 +5736,7 @@ export function apply(ctx, config) {
                   mode: value.mode,
                   ready: value.ready,
                   selfContained: value.selfContained,
+                  coverage: value.coverage,
                   missingMaterials: value.missingMaterials,
                   omitted: value.omitted,
                   packHash: value.packHash,
@@ -6202,6 +6256,7 @@ const REVIEW_EVIDENCE_RULES = [
   '计算前先核对变量含义、传递关系与适用条件：螺杆行程减少三成不自动等于表盘读数减少三成，不能未经设定支持套用倒数、线性或叠乘公式。圈数与行程比例可描述同一对象的不同属性，不能仅因量纲不同就判矛盾；也不能为保住既定结论反推修改原文数字。',
   '人物卡描述性格倾向，不是每场必须执行的动作清单；危急时敢拉闸不等于遇到锁死总闸也必须去拉。核对机会、认知、现场条件与替代行为，不为兑现标签新增动作。读数、观察、推断与记录来源分开：仪器不能直接读出的结论可能来自既有知识或其他证据，缺来源时指出缺口，不自动补造某份历史记录。',
   '没有单步耗时本身不是缺陷，允许用明示阶段时长覆盖阶段内动作，不要求小说逐步标时。时间审稿仍需核对窗口边界、动作顺序和串并行；有具体冲突或缺少影响判断的关键依据时指出对应区间与关系，不以动作数量多、缺少逐步数字直接阻塞，也不把算术相容扩大为动作可行。修改建议是候选，不宣称改变指称、观察或反应必然不改变事实。',
+  '审稿包 presentationRequirements 中 required 项必须逐条提交 presentationReviews：id/fingerprint/verdict/detail/evidence/counterargument，正文引文须位于对应 sceneId。建议项可省略，不强迫补描写。必要项 conflict/uncertain 阻塞定稿；正文或要求变化后重新核对。',
   '逐条发现填 observations，无发现填 []。每条提交 aspect/classification/detail/evidence/counterargument；classification 分 conflict（确定矛盾）、missing-basis（缺失依据）、preference（可选表达偏好）。conflict 另填 comparison 的 entity/property/timeScope，至少两条不同证据，说明同一对象、同一属性与可比较时间。checks 中的 conflict/uncertain 须有对应观察；表达偏好单列为非阻塞项。字段齐全不证明分类正确。',
   '来源有不同角色：chapter 是当前文本，setting 是声明规则，character 是人物资料，style 是表达约束，beats/outline/events 是剧情计划，threads 可能混有计划与历史备忘。人物说法不是自动的作者事实，计划不是既成事实，旧备忘不自动高于正文；来源差异先记 missing-basis，不自行决定修改哪份资料。',
   '判断矛盾前排除同名异物、属性不同、时间变化和正常观察。桩与链等不同物件的数量不能直接比较；“新”或留有指印不提供精确日期；角色可以说出自己的观察，不需要其他人先说过。工程推断须有依据，浮油本身不能证明下层物体不接水，两条通路也可能互补；缺少依据不能冒充确认矛盾。',
@@ -6631,6 +6686,7 @@ async function deaiReviewState(root, chapter, text, meta) {
     if (JSON.stringify(coverage.requirements) !== JSON.stringify(review.sourceCoverage)) return pending
     const timing = calculateReviewTimeBudgets(review.timeBudgets, packed, review.checks, review.evidenceContexts ?? [])
     const observations = reviewObservations(review.observations, review.checks)
+    const presentation = validatePresentationReviews(presentationRequirements(beatBoard.section?.scenes), review.presentationReviews ?? [], review.scenes, packed.items)
     const reactions = sceneReactionReviews(review.scenes, beatBoard.section)
     if (reactions.length) {
       if (!Array.isArray(review.reactionBindings)) return pending
@@ -6640,7 +6696,7 @@ async function deaiReviewState(root, chapter, text, meta) {
       }
       await validateReviewEvidence(root, chapter, packed, review.checks, reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference }))))
     }
-    validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings]
+    validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings, ...presentation.findings]
     sceneReactions = reactions
     preferenceNotes = observations.notes
     timingReports = timing.reports

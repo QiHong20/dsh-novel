@@ -1,7 +1,9 @@
+import { presentationRequirements, presentationReviewView } from './lib/presentation-review.js'
+import { readBeatStorage } from './lib/beat-storage.js'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { BEAT_SECTION_CHANGED, mutateBeatsFile, parseBeatSections } from './lib/beats.js'
+import { BEAT_SECTION_CHANGED, mutateBeatsFile, parseBeatSections, parseBeatEventRefs } from './lib/beats.js'
 import { beatHeading, normalizeBeatId, resolveBeatSection, scanBeatHeadings } from './lib/beat-match.js'
 import { BOOK_FILE, BEATS_FILE, findChapter, loadBook, writeFileAtomic } from './lib/book.js'
 import { withFileLock } from './lib/file-lock.js'
@@ -74,7 +76,7 @@ const pendingHistoryBinding = (record, reason, extra = {}) => ({
 })
 
 /** 用当前正文审稿分场把逐字段号绑定到稳定章纲场景；无法证明时保持待核对。 */
-function resolveHistorySceneBinding(chapters, scenes, sources, record, { requireStored = false } = {}) {
+export function resolveHistorySceneBinding(chapters, scenes, sources, record, { requireStored = false } = {}) {
   if (!Number.isInteger(record.evidenceIndex) || record.evidenceIndex < 1) {
     return pendingHistoryBinding(record, '记录缺少有效 evidenceIndex，请从当前审稿包重新提取')
   }
@@ -129,7 +131,7 @@ function resolveHistorySceneBinding(chapters, scenes, sources, record, { require
 }
 
 export async function stageBook(root, chapters) {
-  const beats = await read(path.join(root, 'beats.md'))
+  const beats = await readBeatStorage(root) ?? ''
   // 场景归属沿用章纲读写的同一套匹配规则：章 ID 优先，无 ID 旧标题只在唯一认领时回退。
   const sections = parseBeatSections(beats)
   const claimed = new Set()
@@ -137,7 +139,7 @@ export async function stageBook(root, chapters) {
     const resolved = resolveBeatSection(sections, chapter, chapters)
     if (resolved.kind !== 'matched') return []
     claimed.add(resolved.section)
-    return parseScenes(resolved.section.body, chapter.id)
+    return parseScenes(resolved.section.body, chapter.id).map(scene => ({ ...scene, chapterEvents: parseBeatEventRefs(resolved.section.body.split(/^### 场景 /m)[0]) }))
   })
   // 只回退书目中完全找不到对应章的数字小节；已登记章（含匹配歧义）保留诊断，不载入场景。
   const bookIds = new Set(chapters.map(chapter => normalizeBeatId(chapter.id)))
@@ -183,6 +185,8 @@ export async function stageBook(root, chapters) {
   for (const scene of scenes) {
     if (scene.time === null) warn(`${scene.id}：缺少整数时序，不能推断故事时间`, { chapter: scene.chapter, scene: scene.id })
     for (const id of scene.cast) if (!cards.some(c => c.id === id)) warn(`${scene.id}：人物引用不存在 ${id}`, { chapter: scene.chapter, scene: scene.id })
+    if (!scene.events.length && scene.chapterEvents?.length) warn(`${scene.id}：事件关联未明确；章级候选 ${scene.chapterEvents.join('、')} 仅供核对，不自动作为本场任务`, { chapter: scene.chapter, scene: scene.id, code: 'scene-event-unbound' })
+    if (scene.events.length && (!scene.fields.本场推进 || !scene.fields.本场允许结果)) warn(`${scene.id}：已关联事件但未明确本场推进／本场允许结果，不得直接兑现跨章终局`, { chapter: scene.chapter, scene: scene.id, code: 'scene-event-boundary-missing' })
     for (const id of scene.events) if (!events.has(id)) warn(`${scene.id}：事件引用不存在 ${id}`, { chapter: scene.chapter, scene: scene.id })
     for (const role of scene.roles) if (!scene.cast.includes(role.id)) warn(`${scene.id}：人物约束 ${role.id} 未列入出场`, { chapter: scene.chapter, scene: scene.id })
     for (const id of scene.cast) if (!scene.roles.some(r => r.id === id)) warn(`${scene.id}：${id} 缺少本场目标与认知约束`, { chapter: scene.chapter, scene: scene.id })
@@ -251,6 +255,7 @@ export async function stageContext(root, chapters, chapter, sceneId) {
   const warnings = scopedDiagnostics.map(d => d.detail)
   const reviews = scenes.flatMap(scene => presentationChecks(scene, book.cards))
   const eventIds = [...new Set(scenes.flatMap(s => s.events))]
+  const eventBindings = scenes.map(s => ({ scene: s.id, events: s.events, candidates: s.events.length ? [] : s.chapterEvents ?? [], progress: s.fields.本场推进 || '', allowed: s.fields.本场允许结果 || '', forbidden: s.fields.禁止提前兑现 || '' }))
   const events = eventIds.map(id => ({ id, ...book.eventNodes.find(e => e.id === id),
     scenes: scenes.filter(s => s.events.includes(id)).map(s => s.id),
     confirmed: book.records.filter(r => r.valid && r.event === id && scenes.some(s => s.time !== null && r.time <= s.time)),
@@ -259,11 +264,12 @@ export async function stageContext(root, chapters, chapter, sceneId) {
     '以下入场历史仅包含已确认且来源有效的事实。作者秘密不等于人物已知；误信不等于客观事实。',
     '场景约束和离场变化均为计划；同章前场计划也不得冒充已确认历史。缺失资料先核对正文。场内变化仅在触发之后生效。',
     PRESENTATION_RULES,
+    ...eventBindings.map(b => `事件关联 ${b.scene}：${b.events.join('、') || '未明确'}；本场推进：${b.progress || '待核对'}；允许结果：${b.allowed || '待核对'}；禁止提前兑现：${b.forbidden || '不得推定后续终局'}${b.candidates.length ? '；章级候选（不是本场任务）：' + b.candidates.join('、') : ''}`),
     ...views.map(s => `### ${s.id} ${s.title}（时序 ${s.time ?? '未明确'}；视角 ${s.viewpoint || '待明确'}；叙述方式 ${s.narration || '依作品文风，需核对'}）\n${s.characters.map(c =>
       `人物 ${c.name} (${c.id})｜${c.role}｜${c.importance}\n${c.gap}\n已确认入场历史：\n${c.history.map(r => `- [${r.kind}] ${r.content}${r.target ? `；对象：${r.target}` : ''}；来源：${r.source}；记录 ${r.id}；证据 ${r.chapter}/${r.scene}：${r.evidence}`).join('\n') || '（无）'}\n读者此前已见的呈现（不等于角色已知）：\n${c.presented.map(r => `- ${r.content}（${r.chapter}/${r.scene}）`).join('\n') || '未记录，不代表从未描写'}\n本场计划约束：\n${c.constraints || '未填写'}`).join('\n\n')}`),
     ...warnings.map(w => `⚠ ${w}`),
   ].join('\n\n') : ''
-  return { scenes: views, warnings, diagnostics: scopedDiagnostics, impacts: book.impacts, reviews, events,
+  return { scenes: views, presentationReview: presentationReviewView(presentationRequirements(scenes), chapters.find(c => c.id === chapter)?.deaiReview, hash(book.sources.get(chapter) || '')), eventBindings, warnings, diagnostics: scopedDiagnostics, impacts: book.impacts, reviews, events,
     records: book.records.filter(r => r.chapter === chapter), baseHash: book.baseHash, text }
 }
 

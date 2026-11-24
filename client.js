@@ -910,11 +910,42 @@ window.__ModuleLoader__.load({
           // 落到剪贴板
         }
       }
+      return (await copyText(text)) ? 'copied' : 'failed'
+    }
+
+    /**
+     * 复制到剪贴板。
+     * 浏览器只在「安全上下文」（https / localhost）暴露 navigator.clipboard；
+     * 局域网 http（如 192.168.x.x:18085）上它是 undefined，必须退回 execCommand。
+     */
+    async function copyText(text) {
+      const flat = String(text ?? '')
+      if (!flat) return false
       try {
-        await navigator.clipboard.writeText(text)
-        return 'copied'
+        if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(flat)
+          return true
+        }
       } catch (error) {
-        return 'failed'
+        // 权限被拒或非安全上下文：落到下面的兜底
+      }
+      try {
+        const area = document.createElement('textarea')
+        area.value = flat
+        area.setAttribute('readonly', 'readonly')
+        area.style.position = 'fixed'
+        area.style.top = '-1000px'
+        area.style.left = '0'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.focus()
+        area.select()
+        if (typeof area.setSelectionRange === 'function') area.setSelectionRange(0, flat.length)
+        const ok = document.execCommand('copy')
+        document.body.removeChild(area)
+        return ok
+      } catch (error) {
+        return false
       }
     }
 
@@ -2176,8 +2207,13 @@ window.__ModuleLoader__.load({
       else if (route.tab === 'allEvents') body = h(EventsPane)
       else if (route.tab === 'review') body = h('div', null,
         h('h3', null, '结构与来源问题'), ...(data.warnings || []).map((text, i) => h('p', { key: i }, text)),
-        h('h3', null, '表现安排 · 语义待核对，非自动错误'),
-        ...(data.reviews || []).map((item, i) => h('div', { key: i, className: 'nvl-beat-sec' }, h('p', null, item.detail), button(`${item.scene} / ${names[item.character] || item.character}`, () => onNavigate({ ...route, tab: 'person', person: item.character })))),
+        h('h3', null, '人物与场景要求核对'),
+        h('p', null, `明确要求 ${data.presentationReview?.required || 0} · 可选建议 ${data.presentationReview?.optional || 0} · 已核对 ${data.presentationReview?.reviewed || 0} · 待核对 ${data.presentationReview?.pending || 0} · 冲突 ${data.presentationReview?.conflicts || 0} · 依据不足 ${data.presentationReview?.uncertain || 0}`),
+        ...(data.presentationReview?.items || []).map(item => h('div', { key: item.id, className: 'nvl-beat-sec' },
+          h('p', null, `${item.required ? '明确要求' : '可选建议'} · ${{ pending: '待核对', optional: '可不采用', stale: '已过期，需重核', supported: '已核对符合', conflict: '已登记冲突', uncertain: '依据不足', 'not-applicable': '已说明不适用' }[item.status]}：${item.detail}`),
+          item.result ? h('p', null, `${item.result.detail}；反证：${item.result.counterargument}`) : null,
+          ...(item.result?.evidence || []).map((ref, i) => h('p', { key: i }, `第 ${ref.index} 段：${ref.quote}`)),
+          button(`${item.scene}${item.character ? ' / ' + (names[item.character] || item.character) : ''}`, () => onNavigate({ ...route, tab: item.character ? 'person' : 'scene', scene: item.scene, person: item.character })))),
         h('h3', null, '正文候选与待复核记录'), ...(data.records || []).filter(r => r.status === 'candidate' || (r.status === 'confirmed' && !r.valid)).map(recordView),
         ...(data.impacts || []).map(impact => h('p', { key: impact.record }, `可能受影响：${impact.content} → ${impact.scenes.map(s => `${s.chapter}/${s.id}`).join('、')}`)))
       else if (route.tab === 'scene') {
@@ -2228,12 +2264,8 @@ window.__ModuleLoader__.load({
       const report = (text, ok = true) => setNotice({ key, text, ok })
       const copy = async () => {
         if (!ready || session !== currentSessionId) return
-        try {
-          await navigator.clipboard.writeText(value.text)
-          report('已复制装配包，请核对资料覆盖边界')
-        } catch {
-          report('复制失败，可在预览中手动选中文字', false)
-        }
+        if (await copyText(value.text)) report('已复制装配包，请核对资料覆盖边界')
+        else report('复制失败，可在预览中手动选中文字', false)
       }
       const send = async () => {
         if (!ready || session !== currentSessionId) return
@@ -2280,6 +2312,8 @@ window.__ModuleLoader__.load({
                 ? h('button', { type: 'button', className: 'nvl-ghost', onClick: () => setBudget(retryBudget) }, `按最低预算 ${retryBudget} 重试`)
                 : null,
             value.missingRequired?.length ? h('p', { role: 'alert', className: 'nvl-err' }, `缺少必选文风：${value.missingRequired.map(item => item.label).join('、')}`) : null,
+            full ? h('p', { className: 'nvl-hint' }, value.selfContained ? '已满足独立生成检查' : '已选材料完整不等于资料齐全；以下缺项需核对后再写作。') : null,
+            ...(value.missingMaterials || []).map((item, i) => h('p', { key: `material-${i}`, className: 'nvl-hint' }, item)),
             value.ledgerScope?.mode === 'historical' ? h('p', { className: 'nvl-hint' }, `旧章台账历史值缺失 ${value.ledgerMissing?.length || 0} 项；当前值未装配。`) : null,
             notice?.key === key ? h('p', { role: 'status', className: 'nvl-hint', 'data-tone': notice.ok ? 'ok' : 'err' }, notice.text) : null,
             h('pre', { className: 'nvl-context-preview' }, value.text),
@@ -2377,7 +2411,7 @@ window.__ModuleLoader__.load({
                   ...(needsNormalization ? [] : [
                     button(`人物 ${overview?.cast?.length || 0}`, { chapter: chapter.id, tab: 'people' }),
                     button(`事件线 ${overview?.events?.length || 0}`, { chapter: chapter.id, tab: 'events' }),
-                    button(`表现核对 ${overview?.reviewCount || 0}`, { chapter: chapter.id, tab: 'review' }),
+                    button('表现核对', { chapter: chapter.id, tab: 'review' }),
                     button('章节目标', { chapter: chapter.id, tab: section ? 'chapter' : 'raw' }),
                     button('AI 装配包', { chapter: chapter.id, tab: 'context' }),
                   ]),

@@ -337,3 +337,19 @@ chapters/0001.md   正文，一章一个文件
 ## 正文生成委派
 
 章前预检通过并取得装配包后，新建写作子代理，原样传入冻结装配包。子代理只返回正文和缺失依据，不修改书稿；主代理负责审核、展示与保存。完整模式的已选资料不会静默省略，但不代表全部依赖已核实，须检查缺项及资料覆盖边界。工具辅助模式先统一补读再分发，避免不同模型收到不同依据。宿主不支持子代理或指定模型时明确报告，不声称已经委派或切换。实际模型必须由宿主调用参数指定，不能仅靠提示词保证。
+
+
+## 场景事件、通用状态与章纲存储
+
+场景关联事件后，填写「本场推进」「本场允许结果」和必要的「禁止提前兑现」。章级事件只提供候选，不自动作为每场任务。场景诊断提示关联缺失时先核对，不凭跨章事件的终局补写当前场景。
+
+人物认知、误信和关系继续使用 `novel_character_history`。世界对象的归属、位置、数量或可用性等状态使用 `novel_state_history`：先以 entity 注册非人物实体（人物沿用卡片 ID），再 propose 提交自定义 property/value、scene、trigger 与 evidenceIndex/evidence；已授权核对流程中 confirm。前置状态用 previous 引用有效记录。未知不写成零，不自行换算单位；计划不登记为事实。相关非出场对象可在场景写「状态对象：对象ID」。只有有正文分场依据的变化才可确认，来源或前置记录变化后重新提取核对。
+
+旧书继续使用 beats.md。需要逐章存储时先 `novel_beats_storage({action:"inspect"})` 审查清单，作者要求迁移后携带 baseHash 调用 migrate。迁移后 `beats/章ID.md` 为有效来源，旧 beats.md 仅为备份，继续使用既有章纲工具编辑，不直接修改备份。未完成事务用 resume 恢复，再重新读取后编辑。逻辑证据来源名 beats.md 继续表示工具聚合的章纲，以保持旧引用兼容。
+
+
+## 表现与场景要求的证据核对
+
+作者明确要求本场必须体现的内容写在人物块「必须表现」；普通「心理内容」「描写重点」仍为可选表现建议，不要求增加独白或外貌扫描。「仅作者参考」、限知视角以及禁止提前兑现属于边界。
+
+写后读取 novel_deai_pack 的 presentationRequirements。对 required=true 的每一项提交 presentationReviews：原样带回 id/fingerprint，填写 verdict（supported/conflict/uncertain/not-applicable）、detail、counterargument 和本 sceneId 正文范围内的逐字 evidence。缺少必答项或跨场引文不能登记。必要项的 conflict/uncertain 阻塞定稿，即使六维 checks 都写 supported；不适用也必须有正文依据与具体解释。可选建议可以省略，不以清零为目标。正文或场景要求改变后重取包复核；工具只验证覆盖、引用和版本，不认证文学判断正确。
