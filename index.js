@@ -5717,8 +5717,11 @@ export function apply(ctx, config) {
               return
             }
             if (route === '/character-history') {
-              const { meta } = await loadBook(rootNow())
-              sendJson(res, 200, await updateHistory(rootNow(), meta.chapters, { action: 'inspect' }))
+              const root = rootNow()
+              const { meta } = await loadBook(root)
+              const history = await updateHistory(root, meta.chapters, { action: 'inspect' })
+              const character = url.searchParams.get('character')?.trim()
+              sendJson(res, 200, character ? { records: history.records.filter(record => record.character === character) } : history)
               return
             }
             if (route === '/stage') {

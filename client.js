@@ -1708,22 +1708,10 @@ window.__ModuleLoader__.load({
     }
 
     function CharacterDetail({ name, onBack }) {
-      const [state, setState] = useState({ status: 'loading', content: '', chars: 0, error: null })
+      const { status, data: card, error, reload } = useJson(`/character?name=${encodeURIComponent(name)}`, 30000)
+      const [tab, setTab] = useState('card')
       const novel = useNovel(30000)
-
-      useEffect(() => {
-        let alive = true
-        getJson(`${API}/character?name=${encodeURIComponent(name)}`)
-          .then(value => {
-            if (alive) setState({ status: 'ready', content: value.content ?? '', role: value.role, rank: value.rank, chars: value.chars ?? 0, error: null })
-          })
-          .catch(error => {
-            if (alive) setState({ status: 'error', content: '', chars: 0, error: error.message })
-          })
-        return () => {
-          alive = false
-        }
-      }, [name])
+      const showHistory = tab === 'history'
 
       return h(
         'div',
@@ -1732,31 +1720,89 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'nvl-reader-head nvl-character-head' },
           h('button', { type: 'button', className: 'nvl-back', onClick: onBack }, '← 人物'),
-          h('span', { className: 'nvl-title' }, name, state.status === 'ready' ? h(CharacterRole, { role: state.role, rank: state.rank }) : null),
-          h('span', { className: 'nvl-meta' }, `${state.chars} 字`),
+          h('span', { className: 'nvl-title' }, name, card ? h(CharacterRole, { role: card.role, rank: card.rank }) : null),
+          card && !showHistory ? h('span', { className: 'nvl-meta' }, `${card.chars} 字`) : null,
         ),
-        h(
+        card ? h('div', { className: 'nvl-chapter-nav' },
+          h('div', { className: 'nvl-seg', role: 'group', 'aria-label': '人物详情视图' },
+            [{ value: 'card', label: '人物卡' }, { value: 'history', label: '人物历史' }].map(({ value, label }) =>
+              h('button', {
+                key: value,
+                type: 'button',
+                className: 'nvl-seg-btn',
+                'data-active': String(tab === value),
+                'aria-pressed': tab === value,
+                onClick: () => setTab(value),
+              }, label)))) : null,
+        showHistory && card?.id ? h(CharacterHistory, { key: card.id, character: card.id }) : h(
           'div',
           { className: 'nvl-reader-body' },
-          state.status === 'loading'
+          status === 'loading'
             ? '读取中…'
-            : state.status === 'error'
-              ? h('span', { className: 'nvl-err' }, `读取失败：${state.error}`)
-              : state.content
-                ? h(MarkdownView, { text: state.content, className: 'nvl-reader-md' })
-                : '（这张卡是空的）',
+            : status === 'error'
+              ? h('div', { className: 'nvl-err', role: 'alert' }, `读取失败：${error} `,
+                  h('button', { type: 'button', className: 'nvl-back', onClick: reload }, '重试'))
+              : showHistory
+                ? '人物卡尚未填写稳定 ID，无法关联历史记录。'
+                : card.content
+                  ? h(MarkdownView, { text: card.content, className: 'nvl-reader-md' })
+                  : '（这张卡是空的）',
         ),
-        state.status === 'ready'
+        card && !showHistory
           ? h(AskBar, {
               head: `人物卡讨论 ${name}`,
               book: novel && novel.data && novel.data.book ? novel.data.book.title : '',
-              context: clipText(state.content, 1000),
+              context: clipText(card.content ?? '', 1000),
               fallback: `${name} 这个人物有什么问题？动机、声音、还是出场时机？`,
               placeholder: '想问我什么？例如「她说的话不像这个人」',
               hint: '带上这张人物卡发到主对话（Ctrl+Enter）',
             })
           : null,
       )
+    }
+
+    function CharacterHistory({ character }) {
+      const { status, data, error, reload } = useJson(`/character-history?character=${encodeURIComponent(character)}`, 30000)
+      const [selectedChapter, setSelectedChapter] = useState('')
+      const [selectedStatus, setSelectedStatus] = useState('confirmed')
+      const records = data?.records || []
+      const chapters = [...new Set(records.map(record => record.chapter).filter(Boolean))]
+        .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+      const chapter = chapters.includes(selectedChapter) ? selectedChapter : ''
+      const labels = { confirmed: '已确认', candidate: '待核对', 'needs-review': '待复核', revoked: '已撤销' }
+      const visibleRecords = records
+        .map(record => ({ record, state: record.status === 'confirmed' && !record.valid ? 'needs-review' : record.status }))
+        .filter(({ record, state }) => (!chapter || record.chapter === chapter) && (!selectedStatus || state === selectedStatus))
+        .sort(({ record: left }, { record: right }) =>
+          (right.time ?? -Infinity) - (left.time ?? -Infinity) || (right.evidenceIndex ?? 0) - (left.evidenceIndex ?? 0))
+
+      let body
+      if (status === 'loading') body = h('p', { role: 'status' }, '读取人物历史中…')
+      else if (status === 'error') body = h('p', { className: 'nvl-err', role: 'alert' }, `读取人物历史失败：${error} `,
+        h('button', { type: 'button', className: 'nvl-back', onClick: reload }, '重试'))
+      else if (!records.length) body = h('p', { role: 'status' }, '该人物暂无历史记录。')
+      else if (!visibleRecords.length) body = h('p', { role: 'status' }, '当前筛选条件下没有历史记录。')
+      else body = visibleRecords.map(({ record, state }) =>
+        h('section', { key: record.id, className: 'nvl-beat-sec' },
+          h('strong', null, `${record.kind} · ${labels[state] || state}`),
+          h('div', { className: 'nvl-hint' }, `第 ${record.chapter} 章 · ${record.scene}`),
+          h('p', null, record.content),
+          h('details', null,
+            h('summary', null, '正文依据'),
+            h('p', null, `信息来源：${record.source}`),
+            h(BeatEvidence, { record }),
+            state === 'needs-review' && record.invalidReasons?.length
+              ? h('p', { className: 'nvl-err' }, `待复核原因：${record.invalidReasons.join('；')}`) : null)))
+
+      return h(React.Fragment, null,
+        records.length ? h('div', { className: 'nvl-chapter-nav' },
+          h('select', { className: 'nvl-select', value: chapter, 'aria-label': '按章节筛选人物历史', onChange: event => setSelectedChapter(event.target.value) },
+            h('option', { value: '' }, '全部章节'),
+            chapters.map(id => h('option', { key: id, value: id }, `第 ${id} 章`))),
+          h('select', { className: 'nvl-select', value: selectedStatus, 'aria-label': '按状态筛选人物历史', onChange: event => setSelectedStatus(event.target.value) },
+            h('option', { value: '' }, '全部状态'),
+            Object.entries(labels).map(([value, label]) => h('option', { key: value, value }, label)))) : null,
+        h('div', { className: 'nvl-reader-body' }, body))
     }
 
     /** 有多少条关系带时间标记（`- 名字 @0007：…`），用来提示这个图能按章看。 */
@@ -1900,7 +1946,7 @@ window.__ModuleLoader__.load({
       const [roleFilter, setRoleFilter] = useState('')
 
       useBackStep(Boolean(openName), () => setOpenName(null))
-      if (openName) return h(CharacterDetail, { name: openName, onBack: () => setOpenName(null) })
+      if (openName) return h(CharacterDetail, { key: `${currentSessionId}:${openName}`, name: openName, onBack: () => setOpenName(null) })
 
       const cards = [...(data?.characters || [])].sort((left, right) => (left.rank ?? 9) - (right.rank ?? 9))
       const hasLead = cards.some(card => isLeadRank(card.rank))
