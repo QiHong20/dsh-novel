@@ -1386,21 +1386,25 @@ function renderMaterialPreflight(value, compact = false) {
 /** 按最终提示文本计预算；Unicode 字符含空白，不等同于 token。 */
 function contextThreads(rows, chapters, chapter) {
   const order = chapters.map(item => String(item.id))
-  const target = order.indexOf(String(chapter))
-  const selected = [], missing = []
+  const targetIndex = order.indexOf(String(chapter))
+  const target = targetIndex < 0 ? order.length : targetIndex
+  const maxChapterId = order.reduce((max, id) => /^\d+$/u.test(id) ? Math.max(max, Number(id)) : max, -1)
+  const selected = [], missing = [], future = []
   for (const row of rows) {
+    const statusText = String(row.status ?? '').toLowerCase()
+    if (statusText === 'done' || statusText === 'closed') continue
     const planted = order.indexOf(row.planted)
-    if (planted < 0) { missing.push(`伏笔埋设位置未知：${row.thread}`); continue }
+    if (planted < 0) {
+      if (/^\d{4}$/u.test(row.planted) && Number(row.planted) > maxChapterId) future.push(row)
+      else missing.push(`伏笔埋设位置未知：${row.thread}`)
+      continue
+    }
     if (planted > target) continue
-    const recovered = order.indexOf(row.status)
-    const closed = !row.open || recovered >= 0
-    if (closed && recovered < 0) { missing.push(`伏笔实际回收位置未知：${row.thread}`); continue }
-    if (recovered >= 0 && recovered < target) continue
     const payoff = order.indexOf(row.payoff)
-    selected.push({ ...row, scope: planted === target ? '本章埋设计划，非既成事实' : recovered === target ? '本章回收记录，须核对触发位置' : payoff >= 0 && payoff < target ? '逾期未收，待处理' : payoff === target ? '本章计划回收' : '此前已埋，回收计划不等于已回收' })
+    selected.push({ ...row, scope: planted === target ? '本章埋设计划，非既成事实' : payoff >= 0 && payoff < target ? '逾期未收，待处理' : payoff === target ? '本章计划回收' : '此前已埋，回收计划不等于已回收' })
   }
   selected.sort((a, b) => Number(b.scope.includes('逾期') || b.scope.includes('本章')) - Number(a.scope.includes('逾期') || a.scope.includes('本章')))
-  return { rows: selected, missing }
+  return { rows: selected, missing, future }
 }
 
 function assembleNovelContext(value, budget) {
@@ -3593,10 +3597,7 @@ export function apply(ctx, config) {
         includedCount: ledgerRows.length,
         ...(historicalLedger ? { reason: chapters.slice(index + 1).some(item => item.written) ? 'target-before-written-frontier' : 'target-position-inside-written-chapter' } : {}),
       }
-      const threadScope = contextThreads(threads.rows, [...chapters.filter(item => item.id !== current.id), current].sort((a, b) => {
-        const position = id => id === current.id ? index : chapters.findIndex(item => item.id === id)
-        return position(a.id) - position(b.id)
-      }), current.id)
+      const threadScope = contextThreads(threads.rows, chapters, current.id)
       const threadRows = threadScope.rows.slice(0, args.full === true ? undefined : 10)
 
       // 相关设定：只在被正文/章纲/大纲点名时才带，避免把整本世界观灌进上下文。
@@ -3617,6 +3618,9 @@ export function apply(ctx, config) {
         contextWarnings.push(
           '这本书还没有任何设定条目（settings/ 是空的）：地名、规矩、物品、术语先用 novel_setting 建条目，只写在 outline.md 里等于没建。',
         )
+      }
+      if (threadScope.future.length) {
+        contextWarnings.push(`伏笔计划超出当前章节清单：${threadScope.future.map(row => row.thread).join('、')}；写到对应章时再核对，不计为缺项`)
       }
 
       // 文风：book.json 里 style 指向的那一套。形容词不够用，锚点原文和禁忌要一起进来，
@@ -3884,7 +3888,7 @@ export function apply(ctx, config) {
   registerTool({
     name: 'novel_threads',
     description:
-      '伏笔表（工作区 threads.md，一张四列表格）。不给参数 = 列出全部伏笔，并标出「计划回收章已经到了、但还没收」的；给 thread + planted = 登记一条新的；再给 payoff / status = 更新那一条（收回了就把 status 写 done，或写上回收章 id）。' +
+      '伏笔表（工作区 threads.md，一张四列表格）。不给参数 = 列出全部伏笔，并标出「计划回收章已经到了、但还没收」的；给 thread + planted = 登记一条新的；再给 payoff / status = 更新那一条（收回了就把 status 写 done 或 closed）。' +
       '\n\n【格式约定·表头固定四列】' +
       '\n| 伏笔 | 埋设 | 回收 | 状态 |' +
       '\n| 投币箱里多出的硬币 | 0001 | 0004 | open |' +

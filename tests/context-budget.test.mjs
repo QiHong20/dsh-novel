@@ -125,18 +125,51 @@ test('完整模式的事件不能被预算静默省略，包指纹可复现', ()
   assert.equal(result.selfContained, false)
 })
 
+const threadScopeStart = source.indexOf('function contextThreads(')
+const threadScopeEnd = source.indexOf('function assembleNovelContext(', threadScopeStart)
+const contextThreads = vm.runInNewContext(source.slice(threadScopeStart, threadScopeEnd) + '; contextThreads')
+
 test('伏笔按书目截断，保留逾期，未知实际回收日期不推断', () => {
-  const from = source.indexOf('function contextThreads(')
-  const to = source.indexOf('function assembleNovelContext(', from)
-  const scope = vm.runInNewContext(source.slice(from, to) + '; contextThreads')
   const chapters = ['z', 'a', 'q'].map(id => ({ id }))
-  const result = scope([
+  const result = contextThreads([
     { thread: '未来', planted: 'q', payoff: '', status: 'open', open: true },
     { thread: '逾期', planted: 'z', payoff: 'z', status: 'open', open: true },
     { thread: '未知回收', planted: 'z', payoff: 'q', status: 'done', open: false },
-    { thread: '后章回收', planted: 'z', payoff: 'q', status: 'q', open: true },
+    { thread: '已关闭', planted: '', payoff: '', status: 'CLOSED', open: false },
+    { thread: '后章回收', planted: 'z', payoff: 'q', status: 'open', open: true },
   ], chapters, 'a')
   assert.deepEqual(Array.from(result.rows, r => r.thread), ['逾期', '后章回收'])
   assert.match(result.rows[0].scope, /逾期/u)
-  assert.equal(result.missing.length, 1)
+  assert.equal(result.missing.length, 0)
+})
+
+test('超出章节清单的埋设计划单独提示，不装配也不算缺项', () => {
+  const chapters = Array.from({ length: 15 }, (_, index) => ({ id: String(index + 1).padStart(4, '0') }))
+  const thread = { thread: '后续埋设', planted: '0019', payoff: '0058', status: '', open: true }
+  const result = contextThreads([thread], chapters, '0006')
+  assert.equal(result.rows.length, 0)
+  assert.equal(result.missing.length, 0)
+  assert.deepEqual(Array.from(result.future), [thread])
+})
+
+for (const planted of ['0009', 'abc', '']) {
+  test(`找不到埋设章 ${JSON.stringify(planted)} 时仍报告缺项`, () => {
+    const chapters = ['0001', '0015', '0006'].map(id => ({ id }))
+    const result = contextThreads([{ thread: '埋设待核对', planted, status: 'open', open: true }], chapters, '0006')
+    assert.equal(result.rows.length, 0)
+    assert.deepEqual(Array.from(result.missing), ['伏笔埋设位置未知：埋设待核对'])
+    assert.equal(result.future.length, 0)
+  })
+}
+
+test('目标为尚未建章的下一章时仍装配此前伏笔，清单外的回收章保留为计划', () => {
+  const chapters = ['0001', '0015'].map(id => ({ id }))
+  const result = contextThreads([
+    { thread: '此前已埋', planted: '0015', payoff: '0016', status: 'open', open: true },
+    { thread: '下一章埋设', planted: '0016', payoff: '', status: 'open', open: true },
+  ], chapters, '0016')
+  assert.deepEqual(Array.from(result.rows, row => row.thread), ['此前已埋'])
+  assert.match(result.rows[0].scope, /回收计划/u)
+  assert.equal(result.missing.length, 0)
+  assert.deepEqual(Array.from(result.future, row => row.thread), ['下一章埋设'])
 })
