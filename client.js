@@ -368,6 +368,10 @@ window.__ModuleLoader__.load({
 .nvl-outline { flex: 1; min-height: 0; padding: 4px 12px 12px; overflow: auto; }
 .nvl-context-preview { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }
 .nvl-outline-sec { padding: 8px 0; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
+.nvl-scene-push { display: flex; gap: 6px; align-items: baseline; margin: 4px 0 2px; font-weight: 600; }
+.nvl-scene-hook { display: flex; gap: 6px; align-items: baseline; margin: 2px 0; color: var(--dsw-alias-brand-primary, #4d6bfe); }
+.nvl-scene-tag { flex: none; padding: 0 5px; border-radius: 4px; font-size: 11px; font-weight: 400; line-height: 16px; color: var(--dsw-alias-label-secondary); border: 1px solid var(--dsw-alias-border-l1); }
+.nvl-scene-line { margin: 2px 0; font-size: 12.5px; color: var(--dsw-alias-label-secondary); }
 .nvl-outline-sec:last-child { border-bottom: 0; }
 .nvl-outline-title { font-weight: 600; margin-bottom: 4px; }
 .nvl-outline-body { white-space: pre-wrap; line-height: 1.7; color: var(--dsw-alias-label-secondary); font-size: 13px; }
@@ -2535,6 +2539,14 @@ window.__ModuleLoader__.load({
         try { return window.localStorage.getItem('nvl:beats-pager') === 'page' ? 'page' : 'list' } catch { return 'list' }
       })
       const [pageIdx, setPageIdx] = useState(0)
+      // 章纲视图：卡片（按场景字段拆开）/ 原文（章节 Markdown）。存在本地。
+      const [view, setView] = useState(() => {
+        try { return window.localStorage.getItem('nvl:beats-view') === 'text' ? 'text' : 'card' } catch { return 'card' }
+      })
+      const pickView = next => {
+        setView(next)
+        try { window.localStorage.setItem('nvl:beats-view', next) } catch {}
+      }
       const pickPager = next => {
         setPager(next)
         try { window.localStorage.setItem('nvl:beats-pager', next) } catch {}
@@ -2576,7 +2588,10 @@ window.__ModuleLoader__.load({
             }, chapters.map((chapter, index) => h('option', { key: chapter.id, value: String(index) }, `${chapter.id} ${chapter.title}`))) : null,
             pager === 'page' ? h('span', { className: 'nvl-meta' }, `第 ${pageAt + 1}/${chapters.length} 章`) : null,
             pager === 'page' ? h('button', { type: 'button', className: 'nvl-ask-btn', disabled: pageAt <= 0, onClick: () => setPageIdx(Math.max(0, pageAt - 1)) }, '← 上一章') : null,
-            pager === 'page' ? h('button', { type: 'button', className: 'nvl-ask-btn', disabled: pageAt >= chapters.length - 1, onClick: () => setPageIdx(Math.min(chapters.length - 1, pageAt + 1)) }, '下一章 →') : null),
+            pager === 'page' ? h('button', { type: 'button', className: 'nvl-ask-btn', disabled: pageAt >= chapters.length - 1, onClick: () => setPageIdx(Math.min(chapters.length - 1, pageAt + 1)) }, '下一章 →') : null,
+            h('span', { className: 'nvl-meta', style: { marginLeft: 'auto' } }, '视图'),
+            h('button', { type: 'button', className: 'nvl-seg-btn', 'data-on': view === 'card', onClick: () => pickView('card') }, '卡片'),
+            h('button', { type: 'button', className: 'nvl-seg-btn', 'data-on': view === 'text', onClick: () => pickView('text') }, '原文')),
           h('div', { className: 'nvl-outline', ref: scroll },
             error ? h('p', null, error) : null,
             ...(board?.warnings || []).map((text, index) => h('p', { key: `warning-${index}`, role: 'alert', className: 'nvl-err' }, text)),
@@ -2596,13 +2611,34 @@ window.__ModuleLoader__.load({
                   rhythm?.hasBeats ? h('span', { className: 'nvl-mark', title: `连续断档 ${rhythm.gap} 章，阈值 ${board.rhythm.gapLimit}` }, `爽×${rhythm.payoff}${rhythm.hook ? ' 钩' : ''}`) : null),
                 rhythm?.breached ? h('p', { role: 'status', className: 'nvl-err' }, `⚠ 连续 ${rhythm.gap} 章无爽点标记，达到阈值 ${board.rhythm.gapLimit}`) : null,
                 needsNormalization ? h('p', { role: 'alert', className: 'nvl-err' }, match.warning) : null,
-                overview?.fields?.本章目标 ? h('p', null, `本章目标：${overview.fields.本章目标}`) : null,
-                ...(overview?.scenes || []).map(scene => h('div', { key: scene.id, className: 'nvl-outline-sec' },
-                  h('strong', null, scene.title), h(MarkdownView, { text: scene.summary || '尚未填写冲突与结果' }),
-                  needsNormalization ? null : button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
-                  ...(needsNormalization ? [] : scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id }))))),
-                overview?.fields?.收尾 ? h('p', null, `收尾：${overview.fields.收尾}`) : null,
-                !overview?.scenes?.length
+                view === 'text'
+                  ? (section?.text && section.text.trim()
+                      ? h('div', { className: 'nvl-outline-sec nvl-beat-raw' }, h(MarkdownView, { text: section.text }))
+                      : h('p', { className: 'nvl-hint' }, '这一章还没有章纲。'))
+                  : null,
+                view === 'card' && overview?.fields?.本章目标 ? h('p', null, `本章目标：${overview.fields.本章目标}`) : null,
+                ...(view === 'text' ? [] : (overview?.scenes || [])).map(scene => {
+                  const full = (section?.scenes || []).find(item => item.id === scene.id) || scene
+                  const fields = full.fields || {}
+                  const push = fields.本场推进 || ''
+                  const conflict = fields.冲突 || ''
+                  const landing = fields.落点 || ''
+                  const hook = fields.钩子 || ''
+                  const result = fields.结果 || ''
+                  return h('div', { key: scene.id, className: 'nvl-outline-sec' },
+                    h('strong', null, scene.title),
+                    push ? h('p', { className: 'nvl-scene-push' },
+                      h('span', { className: 'nvl-scene-tag' }, '本场推进'), push) : null,
+                    hook ? h('p', { className: 'nvl-scene-hook' },
+                      h('span', { className: 'nvl-scene-tag' }, '钩子'), hook) : null,
+                    conflict ? h('p', { className: 'nvl-scene-line' }, `冲突：${conflict}`) : null,
+                    result ? h('p', { className: 'nvl-scene-line' }, `结果：${result}`) : null,
+                    landing ? h('p', { className: 'nvl-scene-line' }, `落点：${landing}`) : null,
+                    !push && !conflict ? h(MarkdownView, { text: scene.summary || '尚未填写本场推进与冲突' }) : null,
+                    needsNormalization ? null : button('编辑场景', { chapter: chapter.id, tab: 'scene', scene: scene.id }),
+                    ...(needsNormalization ? [] : scene.cast.map(id => button(`人物 · ${characterNames[id] || id}`, { chapter: chapter.id, tab: 'person', person: id }))))}),
+                view === 'card' && overview?.fields?.收尾 ? h('p', null, `收尾：${overview.fields.收尾}`) : null,
+                view === 'card' && !overview?.scenes?.length
                   ? (section?.text && section.text.trim()
                       ? h('div', { className: 'nvl-outline-sec' },
                           h(MarkdownView, { text: section.text }),
