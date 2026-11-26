@@ -57,6 +57,7 @@ const PLUGIN_REVISION = 'rhythm-appearance-v7'
 
 const REVIEW_SOURCE_ROLES = {
   chapter: { role: 'written-content', label: '当前正文', policy: '核对叙述、对白和推断各自声称了什么；人物说法不自动成为作者事实。' },
+  'prior-chapter': { role: 'written-content', label: '前章正文', policy: '核对前文明确发生的事件、时间基点与说话时点；人物说法仍须结合上下文。' },
   setting: { role: 'declared-rule', label: '声明的世界规则', policy: '作为机制约束；与正文不一致时先指出差异，不自行补造例外。' },
   character: { role: 'character-profile', label: '人物资料', policy: '约束认知、行为与声口；外貌锚点不要求一次用齐。' },
   style: { role: 'expression-constraint', label: '表达约束', policy: '约束表达方式，不改变情节和机制；与计划原句冲突时优先保留计划意图而非照抄措辞。' },
@@ -67,6 +68,7 @@ const REVIEW_SOURCE_ROLES = {
   ledger: { role: 'state-ledger', label: '动态状态台账', policy: '人工维护的当前状态快照，不保存历史版本；仅能直接约束从当前写作进度向后的续写。回改旧章须查目标章及其前文或已有逐字依据，不能用当前值证明当时状态。' },
 }
 
+const STORY_TIME_RULE = '时间线纪律：章纲「故事时间」与台账里的“第几日”仅为作者坐标。正文与对白默认使用自然相对时间（如次日、两日后、五日之内），设定明确允许文内计日时可使用对应日序。写相对天数须核对前文的时间基点与差值，台账仅作适用范围内的参考。'
 const MATERIAL_INPUT_RULES = '生成前先核对材料角色：正文是当前表述，设定是声明规则，人物卡是资料，文风是表达约束，章纲/大纲/事件线是计划，threads 是伏笔计划与可能过时的备忘。来源差异不自动证明谁错；作者明确裁决优先，裁决不明时指出分歧，不擅自覆盖资料。计划原句默认不要求照抄，保留意图与情绪并按文风表达。候选冲突需要模型核对，工具不自动认证兼容性。'
 
 
@@ -1353,7 +1355,7 @@ async function materialPreflight(root, chapter, known = {}) {
     chapter: { id: chapter.id, title: chapter.title },
     status: missingSources.length || literalCandidates.length || restrictions.semantic.length && beatsText.trim() || memo.selected.length ? 'needs-model-review' : 'no-automatic-candidates',
     certifiesConsistency: false,
-    policy: MATERIAL_INPUT_RULES,
+    policy: `${MATERIAL_INPUT_RULES}\n${STORY_TIME_RULE}`,
     sourceRoles: REVIEW_SOURCE_ROLES,
     literalCandidates,
     missingSources,
@@ -4441,6 +4443,7 @@ export function apply(ctx, config) {
           settingReferences: { type: 'array', items: { type: 'object', additionalProperties: true } },
           sourceRequirements: { type: 'array', items: { type: 'object', additionalProperties: true } },
           materialPreflight: { type: 'object', additionalProperties: true },
+          timelineContext: { type: 'object', additionalProperties: true },
         },
       },
       render: (_args, value) => {
@@ -4458,6 +4461,15 @@ export function apply(ctx, config) {
         }
         lines.push('仅以代称出场或尚未匹配的角色，请用 novel_card 补读人物卡；不要由缺少卡片推断人物没有声口约束。')
         lines.push('', `## 本章场景与认知约束（beatsHash: ${value.beatsHash}）`, value.dialogueContext?.beats || '（无章纲：以完整正文中已发生的事实为依据，不补造场景或人物动机。）')
+        const timeline = value.timelineContext
+        if (timeline && (timeline.previousChapter || timeline.currentScenes.length || timeline.ledgerTime.length)) {
+          lines.push('', '## 跨章时间线锚点参考（作者坐标，非正文照抄用语）')
+          if (timeline.previousChapter) lines.push(`核对跨章天数时，先用 novel_read({chapter:"${timeline.previousChapter}"}) 查前章正文，逐字引用实际时间基点。章纲时间只表示计划。`)
+          for (const scene of timeline.previousScenes) lines.push(`- 上一章 ${scene.chapter}/${scene.id}（时序 ${scene.time ?? '未明确'}）：${scene.storyTime || '未标注故事时间'}`)
+          for (const scene of timeline.currentScenes) lines.push(`- 本章 ${scene.chapter}/${scene.id}（时序 ${scene.time ?? '未明确'}）：${scene.storyTime || '未标注故事时间'}`)
+          if (timeline.ledgerTime.length) lines.push(REVIEW_SOURCE_ROLES.ledger.policy)
+          for (const row of timeline.ledgerTime) lines.push(`- 台账[时间] ${row.item}：${row.state}${row.chapter ? `（@${row.chapter}${row.note ? `｜${row.note}` : ''}）` : row.note ? `（${row.note}）` : ''}`)
+        }
         lines.push('', '## 设定索引（涉及机制、能量路径或身体反应时，用 novel_setting 读取相关完整条目）')
         for (const item of value.settingReferences ?? []) lines.push(`- ${item.name}：${item.summary}`)
         if (!value.settingReferences?.length) lines.push('（无设定条目：不能用想象的新机制补救原文矛盾。）')
@@ -4491,6 +4503,18 @@ export function apply(ctx, config) {
       const packed = extractDeaiPack(raw, cards)
       const beats = await readBeats(rootNow(), chapter, meta.chapters)
       const style = await activeStyleSnapshot(rootNow(), meta)
+      const chapterIndex = meta.chapters.indexOf(chapter)
+      const previousChapter = meta.chapters[chapterIndex - 1]
+      const previousBeats = resolveBeatSection(beats.sections, previousChapter, meta.chapters)
+      const mapSceneTime = (chapterId, scenes = []) => scenes.map(({ id, title, time, storyTime }) => ({ chapter: chapterId, id, title, time, storyTime }))
+      const laterChapters = new Set(meta.chapters.slice(chapterIndex + 1).map(item => item.id))
+      const ledger = await loadLedger(rootNow())
+      const timelineContext = {
+        previousChapter: previousChapter?.id ?? '',
+        previousScenes: previousBeats.kind === 'matched' ? mapSceneTime(previousChapter.id, previousBeats.section.scenes) : [],
+        currentScenes: mapSceneTime(chapter.id, beats.section?.scenes),
+        ledgerTime: ledger.rows.filter(item => item.category === '时间' && item.active && !laterChapters.has(item.chapter)),
+      }
       return {
         chapter: { id: chapter.id, title: chapter.title },
         ...packed,
@@ -4499,6 +4523,7 @@ export function apply(ctx, config) {
         rules: `${DEAI_RULES}\n\n${SCENE_REVIEW_RULES}\n\n${REVIEW_EVIDENCE_RULES}\n\n${DEAI_WORKFLOW}`,
         style: { name: style.name, text: readStyleCalibration(style.text).content, hash: style.hash },
         dialogueContext: { beats: beats.section?.body ?? '' },
+        timelineContext,
         settingReferences: (await listSettings(rootNow())).map(item => ({ name: item.name, summary: item.summary })),
         sourceRequirements: (await reviewSourceCoverage(rootNow(), meta, raw)).requirements,
         materialPreflight: await materialPreflight(rootNow(), chapter, { chapters: meta.chapters, beatsText: beats.section?.body ?? '', styleName: style.name, styleText: style.text }),
@@ -4719,7 +4744,7 @@ export function apply(ctx, config) {
       }
       let timing = calculateReviewTimeBudgets(timeBudgets, packed, checks)
       const reactionEvidence = reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference })))
-      const evidence = await validateReviewEvidence(root, chapter, packed, checks, [...timing.evidence, ...observations.evidence, ...reactionEvidence, ...presentation.evidence])
+      const evidence = await validateReviewEvidence(root, meta.chapters, chapter, packed, checks, [...timing.evidence, ...observations.evidence, ...reactionEvidence, ...presentation.evidence])
       timing = calculateReviewTimeBudgets(timeBudgets, packed, checks, evidence.contexts)
       const coverage = await reviewSourceCoverage(root, meta, raw, checks, style)
       const validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings, ...presentation.findings]
@@ -6148,7 +6173,7 @@ const REVIEW_EVIDENCE_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
     source: { type: 'string', enum: Object.keys(REVIEW_SOURCE_ROLES) },
-    name: { type: 'string', description: 'character/setting/style 的实际条目名，不能填写路径；其他来源省略' },
+    name: { type: 'string', description: 'prior-chapter 填前文章 ID；character/setting/style 填实际条目名；其他来源省略' },
     index: { type: 'integer', minimum: 1, description: 'chapter 来源必填，使用审稿包的段号；其他来源省略' },
     quote: { type: 'string', minLength: 1, description: '逐字短引文，不能用省略号拼接或把推断写成原文' },
   },
@@ -6166,6 +6191,7 @@ const REVIEW_EVIDENCE_RULES = [
   '跨场追踪关键物件的位置与状态：持有、佩戴、装填、文字是否已填写、温度以及交接。重点核对已填单据变空白、脱下物件再次佩戴、卡住物件直接被携带等跳变；不要求为所有日常动作逐步报幕，省略是否影响读懂仍由模型判断。',
   '证据审稿：checks 每项填写 verdict/detail/evidence/counterargument。verdict 取 supported（有依据支持）、conflict（确认矛盾）、uncertain（依据不足）、not-applicable（不适用）。发现问题也可以登记，conflict/uncertain 会保存为阻塞项，不能用空泛肯定句替代判断。',
   '每项至少引用一条当前正文，格式 {source:"chapter",index:段号,quote:"逐字短引文"}；确认矛盾至少提供两条不同引文。可另引 beats/outline/events/threads；人物、设定、文风用 {source:"character"或"setting"或"style",name:"实际条目名",quote:"逐字短引文"}，先读取相应资料。工具会核对原文和段号并绑定来源版本，回显来源角色，不据此认证权威。',
+  '跨章时间核对用 {source:"prior-chapter",name:"前文章 ID",quote:"逐字短引文"} 引用实际时间基点；核对同一事件及起算时点，再计算天数差。章纲时间是计划，台账是当前快照，单凭二者不能确认历史事实。若前文依据不足，在 timing 中如实登记。',
   'counterargument 写最可能推翻当前结论的原文、缺失依据或替代解释及处理结果。连接、状态与危险禁令要比较前后证据；时间只能使用已有单位和数量，不把常识估算当设定，不编造距离、长度、级数或耗时。修法是提案，不是现成事实；影响后文需读后文，未读不得宣称无影响。',
   '问题顺序固定为连续性与技术因果、时间、事实与信息缺失、对白、叙述及句段。外貌锚点数量、词频、没有打断的独白本身不构成硬伤；没有明确要求不得当强制修改项。上下文缺失记 uncertain，不能补造设定后提交 supported。',
   'timeBudgets 必填，无明确窗口用 []；有窗口时提交 label/unit/availableText/evidence/phases。availableText 必须是引文中的同单位时间，如“六息”。每阶段提交 parallel/evidence/tasks，每任务提交 label/basis/evidence；stated 要有 duration 和逐字 durationText，estimated 的 duration 只能作估算，unknown 不填数字。阶段顺序相加，并行取最长值；不自动换算单位。估算或未知只限定记账范围，不自动证明正文有缺陷；不得用它们认证物理可行，也不单凭它们阻塞。',
@@ -6193,7 +6219,7 @@ const DEAI_WORKFLOW = '生成前使用 novel_context 获取装配包，不需要
 
 const DEAI_REVIEW_ASPECTS = {
   continuity: '结合 scenes 动作链核对人物与设备位置、转场路线、工具来源、状态变化前因、技术因果和安全禁令，确认读者能连续还原现场，不能用脑补步骤消解矛盾。',
-  timing: '核对倒计时与动作、观察、解释、交涉是否相容，指出具体段落依据；无倒计时也检查场景时间。',
+  timing: '核对场内倒计时与动作、观察、解释、交涉是否相容。跨场或跨章时，对照前文逐字依据核对起算点与相对天数，并检查正文或对白中的日序是否有文内计日依据。指出具体段落，无倒计时也检查场景时间。',
   voice: '对照场景、人物认知、关系与说话目的，检查对白是否当场听得懂、是否为了狠话而生硬压缩，检查角色是否雷同；逐段提交 dialogue 判断，未匹配人物卡时先补读。',
   narration: '引用同类场景的锚点原文和本章段落，比较叙述距离、旁白声调、人物判断与反应怎样参与信息揭示。符合章纲限知视角只是叙述权限核对，还需说明是否迁移了样本的表达方式。检查参考专名、事件和独特原句混入，守住所需的解释和设定依据，证据不足时如实登记。',
   rhythm: '引用同类场景的锚点原文和本章段落，比较旁白句段怎样铺开和收短、对白在哪些时点加速、揭示前后怎样停顿。只有短问短答或没有套话不足以判为贴合。句长和标点偏差用于定位，结合现场压力判断。',
@@ -6317,11 +6343,12 @@ function renderReviewStatus(status, findings) {
 
 /** 只解析同一单位的明示表达，不进行单位换算或估计动作耗时。 */
 function reviewTimeValue(literal, unit) {
-  const text = String(literal ?? '').replace(/\s+/gu, '')
+  const text = String(literal ?? '').replace(/\s+/gu, '').replace(/个半(时辰|小时)$/u, '个$1半')
   const suffix = text.endsWith('半') && text !== `半${unit}` ? 0.5 : 0
   const body = suffix ? text.slice(0, -1) : text
   if (!unit || !body.endsWith(unit)) return NaN
-  const amount = body.slice(0, -unit.length)
+  const rawAmount = body.slice(0, -unit.length)
+  const amount = ['时辰', '小时'].includes(unit) ? rawAmount.replace(/个$/u, '') : rawAmount
   if (amount === '半') return suffix ? NaN : 0.5
   if (/^\d+(?:\.\d+)?$/u.test(amount)) return Number(amount) + suffix
   if (!/^[零〇一二两三四五六七八九十百千万]+$/u.test(amount)) return NaN
@@ -6377,7 +6404,8 @@ function calculateReviewTimeBudgets(budgets, packed, checks, contexts = []) {
   }
   const quoted = (literal, references) => references.some(reference => typeof reference?.quote === 'string' && reference.quote.includes(literal))
   if (!budgets.length && checks?.timing?.verdict === 'supported') {
-    const pattern = /(?:还剩|只剩|剩下|撑不过|限时|最多)\s*[零〇一二两三四五六七八九十百千万\d.]+\s*(?:息|秒|分钟|小时|天|刻钟)|[零〇一二两三四五六七八九十百千万\d.]+\s*(?:息|秒|分钟|小时|天|刻钟)(?:之内|以内)/u
+    const duration = String.raw`(?:[零〇一二两三四五六七八九十百千万]+|\d+(?:\.\d+)?|半)\s*(?:(?:个\s*半?\s*)?(?:时辰|小时)|息|秒|分钟|天|日(?!元)|刻钟)\s*半?`
+    const pattern = new RegExp(String.raw`(?:还剩|只剩|剩下|撑不过|限时|最多)\s*${duration}|${duration}(?:之内|以内)`, 'u')
     const candidates = (packed?.items ?? []).filter(item => pattern.test(item.text))
     if (candidates.length) {
       const references = candidates.map(item => ({ source: 'chapter', index: item.index, quote: item.text }))
@@ -6473,9 +6501,15 @@ async function reviewSourceCoverage(root, meta, raw, checks, styleSnapshot) {
   return { requirements, findings }
 }
 
-async function readReviewSource(root, chapter, reference) {
+async function readReviewSource(root, chapters, chapter, reference) {
   switch (reference.source) {
     case 'chapter': return await readText(path.join(root, chapter.file))
+    case 'prior-chapter': {
+      const priorIndex = chapters.findIndex(item => item.id === reference.name)
+      const currentIndex = chapters.findIndex(item => item.id === chapter.id)
+      if (priorIndex < 0 || priorIndex >= currentIndex) throw new Error('prior-chapter.name 必须填写当前章之前的章节 ID；未登记')
+      return await readText(path.join(root, chapters[priorIndex].file))
+    }
     case 'beats': return await readText(path.join(root, BEATS_FILE))
     case 'outline': return await readText(path.join(root, OUTLINE_FILE))
     case 'threads': return await readText(path.join(root, THREADS_FILE))
@@ -6515,7 +6549,7 @@ function reviewEvidenceContext(text, start, end) {
 }
 
 /** 校验引文并提取上下文，不替代语义相关性判断。 */
-async function validateReviewEvidence(root, chapter, packed, checks, additional = []) {
+async function validateReviewEvidence(root, chapters, chapter, packed, checks, additional = []) {
   const checkProblems = reviewCheckProblems(checks)
   if (checkProblems.length) throw new Error(`checks 不完整：${checkProblems.join('；')}；未登记`)
   const cache = new Map()
@@ -6524,11 +6558,11 @@ async function validateReviewEvidence(root, chapter, packed, checks, additional 
   const references = Object.keys(DEAI_REVIEW_ASPECTS).flatMap(aspect => checks[aspect].evidence.map(reference => ({ aspect, reference }))).concat(additional)
   for (const { aspect, reference } of references) {
     if (!reference || typeof reference.quote !== 'string' || !reference.quote.trim()) throw new Error('引用必须包含逐字原文')
-    const named = ['character', 'setting', 'style'].includes(reference.source)
-    if (named ? typeof reference.name !== 'string' || !reference.name.trim() : reference.name !== undefined) throw new Error('人物、设定、文风引用必须填写条目名，其他来源不要填写 name；未登记')
+    const named = ['character', 'setting', 'style', 'prior-chapter'].includes(reference.source)
+    if (named ? typeof reference.name !== 'string' || !reference.name.trim() : reference.name !== undefined) throw new Error('前章正文须填写章节 ID，人物、设定、文风须填写条目名，其他来源省略 name；未登记')
     const key = JSON.stringify([reference.source, reference.name ?? ''])
     if (!cache.has(key)) {
-      const text = await readReviewSource(root, chapter, reference)
+      const text = await readReviewSource(root, chapters, chapter, reference)
       if (text === null) throw new Error(`审稿引用来源不存在：${key}；未登记`)
       const hash = createHash('sha256').update(text).digest('hex')
       if (reference.source === 'chapter' && hash !== packed.baseHash) throw new Error('正文已变化，请重新取审稿包；未登记')
@@ -6582,7 +6616,7 @@ async function deaiReviewState(root, chapter, text, meta) {
       if (stored !== style.hash && stored !== style.contentHash) return pending
     }
     for (const reference of review.sources) {
-      const current = reference.source === 'chapter' ? text : await readReviewSource(root, chapter, reference)
+      const current = reference.source === 'chapter' ? text : await readReviewSource(root, meta.chapters, chapter, reference)
       if (current === null || createHash('sha256').update(current).digest('hex') !== reference.hash) return pending
     }
     const coverage = await reviewSourceCoverage(root, meta, text, review.checks)
@@ -6597,7 +6631,7 @@ async function deaiReviewState(root, chapter, text, meta) {
         const binding = review.reactionBindings.find(item => item.sceneId === scene.sceneId)
         if (!binding || binding.beatHash !== scene.beatHash || binding.startIndex !== scene.startIndex || binding.endIndex !== scene.endIndex) return pending
       }
-      await validateReviewEvidence(root, chapter, packed, review.checks, reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference }))))
+      await validateReviewEvidence(root, meta.chapters, chapter, packed, review.checks, reactions.flatMap(scene => scene.reaction.evidence.map(reference => ({ aspect: 'rhythm', reference }))))
     }
     validationFindings = [...timing.findings, ...coverage.findings, ...observations.findings, ...presentation.findings]
     sceneReactions = reactions

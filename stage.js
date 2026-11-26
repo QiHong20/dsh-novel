@@ -262,7 +262,7 @@ export async function stageContext(root, chapters, chapter, sceneId) {
     '场景约束和离场变化均为计划；同章前场计划也不得冒充已确认历史。缺失资料先核对正文。场内变化仅在触发之后生效。',
     PRESENTATION_RULES,
     ...eventBindings.map(b => `事件关联 ${b.scene}：${b.events.join('、') || '未明确'}；本场推进：${b.progress || '待核对'}；允许结果：${b.allowed || '待核对'}；禁止提前兑现：${b.forbidden || '不得推定后续终局'}${b.candidates.length ? '；章级候选（不是本场任务）：' + b.candidates.join('、') : ''}`),
-    ...views.map(s => `### ${s.id} ${s.title}（时序 ${s.time ?? '未明确'}；视角 ${s.viewpoint || '待明确'}；叙述方式 ${s.narration || '依作品文风，需核对'}）\n${s.characters.map(c =>
+    ...views.map(s => `### ${s.id} ${s.title}（时序 ${s.time ?? '未明确'}${s.storyTime ? `；故事时间 ${s.storyTime}` : ''}；视角 ${s.viewpoint || '待明确'}；叙述方式 ${s.narration || '依作品文风，需核对'}）\n${s.characters.map(c =>
       `人物 ${c.name} (${c.id})｜${c.role}｜${c.importance}\n${c.gap}\n已确认入场历史：\n${c.history.map(r => `- [${r.kind}] ${r.content}${r.target ? `；对象：${r.target}` : ''}；来源：${r.source}；记录 ${r.id}；证据 ${r.chapter}/${r.scene}：${r.evidence}`).join('\n') || '（无）'}\n读者此前已见的呈现（不等于角色已知）：\n${c.presented.map(r => `- ${r.content}（${r.chapter}/${r.scene}）`).join('\n') || '未记录，不代表从未描写'}\n本场计划约束：\n${c.constraints || '未填写'}`).join('\n\n')}`),
     ...warnings.map(w => `⚠ ${w}`),
   ].join('\n\n') : ''
