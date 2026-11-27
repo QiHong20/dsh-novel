@@ -39,14 +39,29 @@ test('正文改动、场景改动和旧分场缺少版本绑定均不继承', ()
   }
 })
 
-test('同章前场可承接，目标及后场不进入；预算不足不截断段落', () => {
+test('同章前场可承接，目标及后场不进入', () => {
   const book = fixture()
   const result = priorContext(book, [book.scenes[1]], ['甲'])
   assert.equal(result.tail.scene, 'early')
   assert.ok(!JSON.stringify(result.excerpts).includes('三十日后'))
-  const tiny = priorContext(book, [book.scenes[1]], ['甲'], 1)
-  assert.equal(tiny.tail.text, '')
-  assert.ok(tiny.missing.length > 0)
+})
+
+test('完整候选超过两万字符仍保留，并整段装配较长的相邻前场结尾', () => {
+  const book = fixture()
+  const earlier = ['甲找到钥匙。'.repeat(2000), '甲检查钥匙。'.repeat(2000)]
+  const ending = '甲终于打开门。'.repeat(1000)
+  const text = [...earlier, ending].join('\n\n')
+  book.sources.set('0001', text)
+  const review = book.chapters[0].deaiReview
+  review.baseHash = hash(text)
+  review.scenes[0].endIndex = 2
+  review.scenes[1].startIndex = 3
+  review.scenes[1].endIndex = 3
+
+  const result = priorContext(book, [book.scenes[2]], ['甲'])
+  assert.deepEqual(result.excerpts.map(item => item.text), earlier)
+  assert.equal(result.tail.text, ending)
+  assert.deepEqual(result.missing, [])
 })
 
 test('缺少分场的已写前章必须报告，即使人物姓名没有命中', () => {

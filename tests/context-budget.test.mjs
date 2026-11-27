@@ -125,6 +125,31 @@ test('完整模式的事件不能被预算静默省略，包指纹可复现', ()
   assert.equal(result.selfContained, false)
 })
 
+test('完整模式按总预算装配超过两万字符的前文候选，超限只返回预算提示', () => {
+  const text = '甲收好钥匙。'.repeat(4000)
+  const excerpts = [{ text }]
+  const tail = { id: '0001', title: '前章', text: '他关上门。' }
+  const value = {
+    ...fixture('原文'), full: true,
+    priorScope: { policy: '按前场时间筛选', excluded: [], excerpts, tail },
+    presentationSources: excerpts,
+    presentationExcerpts: text,
+    prevTail: tail,
+  }
+  const blocked = assemble(value, 22000)
+  assert.equal(blocked.ready, false)
+  assert.ok(!blocked.prompt.includes(text))
+  assert.equal(blocked.priorScope.excerpts.length, 0)
+  assert.equal(blocked.priorScope.tail.text, '')
+  assert.equal(blocked.presentationSources.length, 0)
+  assert.equal(blocked.prevTail.text, '')
+  const ready = assemble(value, blocked.minimumBudget)
+  assert.equal(ready.ready, true)
+  assert.ok(ready.prompt.includes(text))
+  assert.ok(ready.prompt.includes(tail.text))
+  assert.equal(ready.budgetUsed, ready.budget)
+})
+
 const threadScopeStart = source.indexOf('function contextThreads(')
 const threadScopeEnd = source.indexOf('function assembleNovelContext(', threadScopeStart)
 const contextThreads = vm.runInNewContext(source.slice(threadScopeStart, threadScopeEnd) + '; contextThreads')

@@ -1521,12 +1521,21 @@ function assembleNovelContext(value, budget) {
       ? ` 缺少 ${missingRequired.length} 条必选文风${labels.length ? `（如 ${labels.join('、')}${labels.length < missingRequired.length ? ' 等' : ''}）` : ''}，完整缺项见 missingRequired 元数据。`
       : ''
     const compact = `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。${missingNote}未提供残缺正文，不可据此覆盖整章。${retry}${budget >= 400 ? `；长章可用 novel_context({chapter:"${value.chapter.id}",mode:"rewrite",rewriteStart:0,rewriteLimit:1000,budget:6000}) 分段改写` : ''}。`
-    const scoped = !rewrite && value.stage?.scenes?.length
+    const scoped = value.full
+      ? `完整装配包需要 ${minimum} 字符，当前预算为 ${budget}。${missingNote}${minimum <= 200000 ? '请按最低预算重新装配。' : '已超过 200000 字符上限。可缩小场景范围，或关闭完整模式后分次核对前文。'}`
+      : !rewrite && value.stage?.scenes?.length
       ? `上下文预算不足：必要内容需 ${minimum} 字符，当前 ${budget}。${missingNote}${minimum <= 200000 ? '请增加预算' : '请缩短或拆分必选资料'}，或用 novel_context({chapter:"${value.chapter.id}",scene:"${value.stage.scenes[0].id}",budget:20000}) 按场景装配；不得忽略人物认知边界。`
       : compact
     const prompt = size(compact) <= budget ? compact : `上下文预算不足：需 ${minimum} 字符，当前 ${budget}；完整缺项见 missingRequired，未提供残缺正文。`
     const guidance = size(scoped) <= budget ? scoped : prompt
-    return { ...value, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), budgetUnit: 'unicode-code-points', ready: false, selfContained: false, minimumBudget: minimum, requiredItems, missingRequired, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
+    const emptyTail = { id: '', title: '', text: '' }
+    const priorProse = value.priorScope ? {
+      prevTail: emptyTail,
+      priorScope: { ...value.priorScope, excerpts: [], tail: emptyTail },
+      presentationSources: [],
+      presentationExcerpts: '',
+    } : {}
+    return { ...value, ...priorProse, chapterText: '', prompt: guidance, budget, budgetUsed: size(guidance), budgetUnit: 'unicode-code-points', ready: false, selfContained: false, minimumBudget: minimum, requiredItems, missingRequired, included: [], omitted: blocks.map(({ id, label }) => ({ id, label, reason: '必要内容超出预算，本次未装配' })) }
   }
   for (const block of required) {
     parts.push(block.text)
@@ -3656,12 +3665,16 @@ export function apply(ctx, config) {
 
       const selected = rewriteSelection(rawChapter, args.rewriteStart, args.rewriteLimit)
       if (rewrite) chapterText = selected.text
-      // Chapter order, not filenames, defines the cutoff: never retrieve target or future prose.
-      const priorTexts = []
-      for (const chapter of chapters.slice(0, index)) {
-        if (chapter.chars > 0) priorTexts.push({ id: chapter.id, title: chapter.title, text: (await readText(path.join(rootNow(), chapter.file))) ?? '' })
+      const characterNames = characters.map(c => c.name)
+      let presentationSources = []
+      if (args.full !== true) {
+        // 工具辅助模式按章节顺序检索目标章之前的正文。
+        const priorTexts = []
+        for (const chapter of chapters.slice(0, index)) {
+          if (chapter.chars > 0) priorTexts.push({ id: chapter.id, title: chapter.title, text: (await readText(path.join(rootNow(), chapter.file))) ?? '' })
+        }
+        presentationSources = selectPresentationExcerpts(priorTexts, characterNames, Math.min(20000, Math.round(budget * 0.3)))
       }
-      let presentationSources = selectPresentationExcerpts(priorTexts, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
       const preflight = await materialPreflight(rootNow(), current, { chapters: [...meta.chapters.filter(item => item.id !== current.id), current], beatsText, styleName, styleText: styleRaw ?? '' })
       const missingMaterials = [...threadScope.missing, ...dependencies.missing, ...voided.map(name => `依赖设定已作废：${name}`), ...ledgerMissing.map(item => `历史台账缺失：${item.item}`)]
       for (const view of states.views) {
@@ -3671,7 +3684,7 @@ export function apply(ctx, config) {
       const materialBoundaries = []
       if (args.full === true) {
         const boundaryBook = await stageBook(rootNow(), index < chapters.length ? meta.chapters : [...meta.chapters, current])
-        prior = priorContext(boundaryBook, stage.scenes, characters.map(c => c.name), Math.min(20000, Math.round(budget * 0.3)))
+        prior = priorContext(boundaryBook, stage.scenes, characterNames)
         presentationSources = prior.excerpts
         missingMaterials.push(...prior.missing)
         // 整章完整包没有单场景边界时，用本章首场作为“章首”边界：只装入写本章开头前读者已可见的范围，
