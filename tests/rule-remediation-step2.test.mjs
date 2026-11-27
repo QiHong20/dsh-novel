@@ -372,7 +372,7 @@ test('书目只保存审稿引用，复核文件缺失或损坏时本章待复�
   const raw = JSON.parse(await fs.readFile(bookFile, 'utf8'))
   const chapter = raw.chapters[0]
   assert.equal(chapter.deaiReview, undefined)
-  assert.equal(chapter.deaiReviewRef.file, 'deai-reviews/0001-review-001.json')
+  assert.equal(chapter.deaiReviewRef.file, 'deai-reviews/0001-review.json')
   const reviewFile = path.join(current.root, chapter.deaiReviewRef.file)
   const reviewText = await fs.readFile(reviewFile, 'utf8')
   assert.equal(chapter.deaiReviewRef.sha256, createHash('sha256').update(reviewText).digest('hex'))
@@ -388,8 +388,12 @@ test('书目只保存审稿引用，复核文件缺失或损坏时本章待复�
   await assertCurrentState(current, 'final', 'recorded')
   const blocked = conflictReview()
   await registerReview(current.call, blocked.checks, { observations: blocked.observations })
-  assert.equal(JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef.file, 'deai-reviews/0001-review-002.json')
-  assert.equal(await fs.readFile(reviewFile, 'utf8'), reviewText)
+  const updated = JSON.parse(await fs.readFile(bookFile, 'utf8')).chapters[0].deaiReviewRef
+  const updatedText = await fs.readFile(reviewFile, 'utf8')
+  assert.equal(updated.file, chapter.deaiReviewRef.file)
+  assert.equal(updated.sha256, createHash('sha256').update(updatedText).digest('hex'))
+  assert.equal(JSON.parse(updatedText).status, 'blocked')
+  assert.deepEqual(await fs.readdir(path.dirname(reviewFile)), [path.basename(reviewFile)])
 })
 
 test('新版审稿详情写入失败时保留旧书目和引用', async t => {
@@ -411,6 +415,31 @@ test('新版审稿详情写入失败时保留旧书目和引用', async t => {
     fs.writeFile = originalWrite
   }
   assert.equal(await fs.readFile(bookFile, 'utf8'), before)
+  await assertCurrentState(current, 'final', 'recorded')
+})
+
+test('书目写入失败时恢复被覆盖的审稿详情', async t => {
+  const current = await fixture(t)
+  await finalize(current.call)
+  const bookFile = path.join(current.root, 'book.json')
+  const before = await fs.readFile(bookFile, 'utf8')
+  const reviewFile = path.join(current.root, JSON.parse(before).chapters[0].deaiReviewRef.file)
+  const beforeReview = await fs.readFile(reviewFile, 'utf8')
+  const originalWrite = fs.writeFile
+  fs.writeFile = (file, ...args) => {
+    if (String(file).startsWith(`${bookFile}.tmp-`)) {
+      return Promise.reject(new Error('模拟书目写入失败'))
+    }
+    return originalWrite(file, ...args)
+  }
+  try {
+    const blocked = conflictReview()
+    await assert.rejects(registerReview(current.call, blocked.checks, { observations: blocked.observations }), /模拟书目写入失败/u)
+  } finally {
+    fs.writeFile = originalWrite
+  }
+  assert.equal(await fs.readFile(bookFile, 'utf8'), before)
+  assert.equal(await fs.readFile(reviewFile, 'utf8'), beforeReview)
   await assertCurrentState(current, 'final', 'recorded')
 })
 
