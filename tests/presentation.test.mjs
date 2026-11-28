@@ -37,3 +37,16 @@ test('检索优先近期且相邻原文不重复', () => {
   assert.equal(rows[0].chapter, '2')
   assert.equal(rows.filter(r => r.chapter === '2').length, 1)
 })
+
+test('只回看最近两章，更早的原文不进候选', () => {
+  const chapters = [
+    { id: '0001', text: '甲在很早以前来过一次。' },
+    { id: '0002', text: '甲当时还没钱。' },
+    { id: '0003', text: '甲掏出了钱。' },
+  ]
+  const rows = selectPresentationExcerpts(chapters, ['甲'])
+  assert.deepEqual([...new Set(rows.map(row => row.chapter))], ['0003', '0002'])
+  assert.ok(rows.every(row => row.chapter !== '0001'))
+  assert.deepEqual([...new Set(selectPresentationExcerpts(chapters, ['甲'], 12000, 1).map(row => row.chapter))], ['0003'])
+  assert.equal(selectPresentationExcerpts(chapters, ['甲'], 12000, 0).length > 0, true, '0 表示不限章数')
+})

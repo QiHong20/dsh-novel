@@ -38,7 +38,7 @@ import { CHARACTER_EXT } from './lib/book.js'
 import { characterSummary } from './lib/people.js'
 import { DEAD_WORDS, ALIVE_CLAUSE } from './lib/people.js'
 import { parseCadence } from './lib/people.js'
-import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, resolveBeatSection, beatsCoverageFromSections, beatCoverage, calculateBeatRhythm, beatReactionCandidates, payoffBudget } from './lib/beats.js'
+import { parseBeatSections, parseBeatShifts, parseBeatReactions, parseBeatCognition, parseBeatInteriors, parseBeatMarks, beatHeading, matchBeatSection, parseBeatInfos, parseBeatEventRefs, readBeats, writeBeats, writeBeatsBatch, deleteBeats, dropBeatsScenes, backupBeatsFile, resolveBeatSection, beatsCoverageFromSections, beatCoverage, calculateBeatRhythm, beatReactionCandidates, payoffBudget } from './lib/beats.js'
 import { BEATS_FILE, parseSceneCadence } from './lib/book.js'
 import { BEAT_MARK, BEAT_MARK_COLON, BEAT_MARK_TAIL, BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED, BEAT_STRUCTURE_INVALID } from './lib/beats.js'
 import { OUTLINE_FILE } from './lib/book.js'
@@ -4820,6 +4820,8 @@ export function apply(ctx, config) {
       properties: {
         chapter: { type: 'string', description: '章节 id 或标题；写 content 时必填' },
         content: { type: 'string', description: '这一章的章纲全文（Markdown 列表）；给了就写入' },
+        delete: { type: 'boolean', description: '删掉这一章的整节章纲（chapter 必填）；别的章一个字不动' },
+        dropScenes: { type: 'array', items: { type: 'string' }, description: '只删这一章里的这几场（场景 id）；其余场原样保留' },
       },
       additionalProperties: false,
     },
@@ -4829,6 +4831,10 @@ export function apply(ctx, config) {
         additionalProperties: true,
         properties: {
           written: { type: 'boolean' },
+          deleted: { type: 'boolean' },
+          dropped: { type: 'array', items: { type: 'string' } },
+          removed: { type: 'object', additionalProperties: true },
+          backup: { type: 'string' },
           chapter: { type: 'object', additionalProperties: true },
           beats: { type: 'object', additionalProperties: true },
           coverage: { type: 'object', additionalProperties: true },
@@ -4851,6 +4857,12 @@ export function apply(ctx, config) {
         if (value.error) {
           const details = (value.issues ?? []).map(item => `- ${item.message}`).join('\n')
           return textRender(`章纲未写入：${value.error}${details ? `\n${details}` : ''}`)
+        }
+        if (value.deleted) {
+          const what = value.dropped?.length
+            ? `删掉了 ${value.dropped.length} 场（${value.dropped.join('、')}）`
+            : `删掉了整节（原 ${value.removed?.chars ?? 0} 字）`
+          return textRender(`${value.chapter.id} ${value.chapter.title}：${what}。${value.backup ? `\n旧文件备份：${value.backup}` : ''}\n${tail}${rhythmTail}`)
         }
         if (value.written) {
           return textRender(`已写入 ${value.chapter.id} ${value.chapter.title} 的章纲（${value.beats.chars} 字）。${warningText}\n${tail}${rhythmTail}`)
@@ -4889,6 +4901,46 @@ export function apply(ctx, config) {
       if (args.chapter && !chapter) throw new Error(`没有这一章「${args.chapter}」；先 novel_status 看章节 id`)
 
       const outlineText = (await readText(path.join(rootNow(), OUTLINE_FILE))) ?? ''
+      const dropScenes = Array.isArray(args.dropScenes)
+        ? args.dropScenes.map(item => String(item).trim()).filter(Boolean)
+        : []
+      if (args.delete === true || dropScenes.length) {
+        if (!chapter) throw new Error('删章纲要给 chapter（哪一章）')
+        if (args.delete === true && dropScenes.length) throw new Error('delete 和 dropScenes 只能给一个：整节删还是删几场？')
+        let removed
+        if (args.delete === true) {
+          const backup = await backupBeatsFile(rootNow())
+          try { removed = await deleteBeats(rootNow(), chapter, meta.chapters) }
+          catch (error) { return { ...beatFailure(error), chapter: { id: chapter.id, title: chapter.title } } }
+          const board = await readBeats(rootNow(), chapter, meta.chapters)
+          return {
+            written: false,
+            deleted: true,
+            baseHash: removed.baseHash,
+            chapter: { id: chapter.id, title: chapter.title },
+            removed: { heading: removed.heading, chars: removed.chars },
+            backup,
+            coverage: beatsCoverageFromSections(chapters, board.sections),
+            warnings: [`已删除 ${chapter.id} ${chapter.title} 的整节章纲（原 ${removed.chars} 字）；旧文件备份在 ${backup}`],
+            sections: board.sections.map(section => ({ id: section.id, heading: section.heading, chars: section.chars })),
+          }
+        }
+        const backup = await backupBeatsFile(rootNow())
+        try { removed = await dropBeatsScenes(rootNow(), chapter, dropScenes, meta.chapters) }
+        catch (error) { return { ...beatFailure(error), chapter: { id: chapter.id, title: chapter.title } } }
+        const board = await readBeats(rootNow(), chapter, meta.chapters)
+        return {
+          written: false,
+          deleted: true,
+          dropped: removed.removed,
+          baseHash: removed.baseHash,
+          chapter: { id: chapter.id, title: chapter.title },
+          backup,
+          coverage: beatsCoverageFromSections(chapters, board.sections),
+          warnings: [`已从 ${chapter.id} ${chapter.title} 删掉 ${removed.removed.length} 场：${removed.removed.join('、')}；旧文件备份在 ${backup}`],
+          sections: board.sections.map(section => ({ id: section.id, heading: section.heading, chars: section.chars })),
+        }
+      }
       if (hasContent) {
         let written
         try { written = await writeBeats(rootNow(), chapter, args.content, meta.chapters) }
@@ -4952,8 +5004,12 @@ export function apply(ctx, config) {
     },
     presentCall: args => ({
       card: 'generic',
-      title: args.content ? `写章纲 ${args.chapter ?? ''}`.trim() : '读章纲',
-      kind: typeof args.content === 'string' ? 'write' : 'read',
+      title: args.delete === true
+        ? `删章纲 ${args.chapter ?? ''}`.trim()
+        : Array.isArray(args.dropScenes) && args.dropScenes.length
+          ? `删场景 ${args.chapter ?? ''}`.trim()
+          : args.content ? `写章纲 ${args.chapter ?? ''}`.trim() : '读章纲',
+      kind: args.delete === true || Array.isArray(args.dropScenes) ? 'write' : typeof args.content === 'string' ? 'write' : 'read',
       rawInput: args,
     }),
   })
@@ -5374,6 +5430,51 @@ export function apply(ctx, config) {
                   }
                   try { sendJson(res, 200, await editStageFields(rootNow(), payload)) }
                   catch (error) {
+                    const failure = beatFailure(error)
+                    sendJson(res, [BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error.code) ? 409 : 400, failure)
+                  }
+                  return
+                }
+                if (payload.delete === true || (Array.isArray(payload.dropScenes) && payload.dropScenes.length)) {
+                  if (typeof payload.chapter !== 'string' || !payload.chapter.trim()) {
+                    sendJson(res, 400, { error: '需要 chapter（哪一章）' })
+                    return
+                  }
+                  if (payload.delete === true && Array.isArray(payload.dropScenes) && payload.dropScenes.length) {
+                    sendJson(res, 400, { error: 'delete 和 dropScenes 只能给一个：整节删还是删几场？' })
+                    return
+                  }
+                  const deleting = await loadBook(rootNow())
+                  const target = findChapter(deleting.meta.chapters, payload.chapter)
+                  if (!target) {
+                    sendJson(res, 404, { error: `没有这一章「${payload.chapter}」` })
+                    return
+                  }
+                  const baseHash = typeof payload.baseHash === 'string' && payload.baseHash ? payload.baseHash : undefined
+                  try {
+                    const backup = await backupBeatsFile(rootNow())
+                    if (payload.delete === true) {
+                      const removed = await deleteBeats(rootNow(), target, deleting.meta.chapters, baseHash)
+                      sendJson(res, 200, {
+                        ok: true,
+                        deleted: true,
+                        chapter: { id: target.id, title: target.title },
+                        removed: { heading: removed.heading, chars: removed.chars },
+                        baseHash: removed.baseHash,
+                        backup,
+                      })
+                      return
+                    }
+                    const removed = await dropBeatsScenes(rootNow(), target, payload.dropScenes, deleting.meta.chapters, baseHash)
+                    sendJson(res, 200, {
+                      ok: true,
+                      deleted: true,
+                      dropped: removed.removed,
+                      chapter: { id: target.id, title: target.title },
+                      baseHash: removed.baseHash,
+                      backup,
+                    })
+                  } catch (error) {
                     const failure = beatFailure(error)
                     sendJson(res, [BEAT_SECTION_AMBIGUOUS, BEAT_SECTION_CHANGED].includes(error.code) ? 409 : 400, failure)
                   }
